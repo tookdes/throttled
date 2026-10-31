@@ -172,6 +172,25 @@ class ProfileControlTests(unittest.TestCase):
         self.assertEqual(len(write.call_args_list), 2)
         self.assertTrue(all(not (call.args[1] & 1) for call in write.call_args_list))
 
+    def test_set_turbo_skips_identical_register_value(self):
+        throttled = load_throttled()
+        with mock.patch.object(throttled, "_ensure_msr_module", return_value=["/dev/cpu/0/msr"]):
+            with mock.patch.object(throttled, "readmsr", return_value=0):
+                with mock.patch.object(throttled, "writemsr") as write:
+                    throttled.set_turbo(True)
+        write.assert_not_called()
+
+    def test_set_bdprochot_respects_lock_bit(self):
+        throttled = load_throttled()
+        locked_enabled = (1 << throttled.BD_PROCHOT_LOCK_BIT) | 1
+        with mock.patch.object(throttled, "_ensure_msr_module", return_value=["/dev/cpu/0/msr"]):
+            with mock.patch.object(throttled, "readmsr", return_value=locked_enabled):
+                with mock.patch.object(throttled, "writemsr") as write:
+                    with mock.patch.object(throttled, "warning") as warning:
+                        throttled.set_bdprochot(False)
+        write.assert_not_called()
+        self.assertIn("locked", warning.call_args.args[0])
+
     def test_load_config_validates_hwp_epp_and_new_booleans(self):
         throttled = load_throttled()
         cases = (
