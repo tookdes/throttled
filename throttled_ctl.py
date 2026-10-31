@@ -663,16 +663,20 @@ def command_monitor(args, msr):
             elapsed = time.monotonic() - start
             pkg_w = package_watts(energy0, energy1, elapsed, rapl_units["energy_j"])
 
-            print(f"Package {pkg_w:.2f} W | base {base_mhz:.0f} MHz | interval {elapsed:.3f}s")
-            print(f"{'CPU':>3} {'Ratio':>5} {'MHz':>7} {'Effect':>7} {'C0%':>6} {'Temp':>6}  Limits")
+            pkg_limit_raw = msr.read(0, "MSR_PERF_LIMIT_REASONS")
+            pkg_limits = decode_perf_limit_reasons(pkg_limit_raw)["active"]
+            pkg_limit_text = ",".join(pkg_limits) if pkg_limits else "OK"
+            print(
+                f"Package {pkg_w:.2f} W | base {base_mhz:.0f} MHz | interval {elapsed:.3f}s "
+                f"| Limits {pkg_limit_text}"
+            )
+            print(f"{'CPU':>3} {'Ratio':>5} {'MHz':>7} {'Effect':>7} {'C0%':>6} {'Temp':>6}")
             for cpu in msr.cpus():
                 perf = msr.read(cpu, "IA32_PERF_STATUS")
                 ratio = (perf >> 8) & 0xFF
                 mhz = ratio * 100
                 therm = msr.read(cpu, "IA32_THERM_STATUS")
                 temp = core_temperature(therm, tjmax)
-                limit_raw = msr.read(cpu, "MSR_CORE_PERF_LIMIT_REASONS")
-                limits = decode_perf_limit_reasons(limit_raw)["active"]
                 eff = effective_mhz(
                     before[cpu][0],
                     before[cpu][1],
@@ -682,8 +686,7 @@ def command_monitor(args, msr):
                 )
                 c0 = c0_percent(before[cpu][1], after[cpu][1], elapsed, base_mhz)
                 temp_text = "n/a" if temp is None else f"{temp}C"
-                limit_text = ",".join(limits) if limits else "OK"
-                print(f"{cpu:>3} {ratio:>5} {mhz:>7} {eff:>7.0f} {c0:>6.1f} {temp_text:>6}  {limit_text}")
+                print(f"{cpu:>3} {ratio:>5} {mhz:>7} {eff:>7.0f} {c0:>6.1f} {temp_text:>6}")
 
             iteration += 1
             if args.count and iteration >= args.count:
@@ -695,15 +698,12 @@ def command_monitor(args, msr):
 
 
 def command_limits(args, msr):
-    any_limit = False
-    for cpu in msr.cpus():
-        raw = msr.read(cpu, "MSR_CORE_PERF_LIMIT_REASONS")
-        decoded = decode_perf_limit_reasons(raw)
-        active = ",".join(decoded["active"]) if decoded["active"] else "-"
-        logged = ",".join(decoded["logged"]) if decoded["logged"] else "-"
-        print(f"cpu{cpu}: active={active} | logged={logged} | raw=0x{raw:016x}")
-        any_limit = any_limit or bool(decoded["active"])
-    return 1 if args.fail_on_active and any_limit else 0
+    raw = msr.read(0, "MSR_PERF_LIMIT_REASONS")
+    decoded = decode_perf_limit_reasons(raw)
+    active = ",".join(decoded["active"]) if decoded["active"] else "-"
+    logged = ",".join(decoded["logged"]) if decoded["logged"] else "-"
+    print(f"package: active={active} | logged={logged} | raw=0x{raw:016x}")
+    return 1 if args.fail_on_active and decoded["active"] else 0
 
 
 def command_turbo_ratio(args, msr):
