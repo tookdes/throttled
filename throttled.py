@@ -1896,6 +1896,23 @@ def _power_thread(state, exit_event):
         with config_lock:
             power_source = power['source']
 
+        # Reconcile privileged TPL backends immediately after reload, even when
+        # the new config disables the daemon. This shrinks privileges before
+        # the Enabled=False write barrier continues the loop.
+        if config_reloaded:
+            has_tpl = any('MSR_PKG_POWER_LIMIT' in regs.get(profile, {}) for profile in POWER_PROFILES)
+            if not has_tpl:
+                mmio_powercap = None
+                if mchbar_mmio is not None:
+                    mchbar_mmio.close()
+                    mchbar_mmio = None
+            else:
+                if mmio_powercap is None:
+                    mmio_powercap = find_mmio_package_zone()
+                if mchbar_mmio is None:
+                    pkg_baseline = readmsr('MSR_PKG_POWER_LIMIT', cpu=0)
+                    mchbar_mmio = open_mchbar_power_limit_mmio(expected_msr=pkg_baseline)
+
         # Enabled=False is a hard write barrier, including the iteration that
         # observes an enabled -> disabled autoreload transition.
         if not config_is_enabled(config):
@@ -1913,20 +1930,6 @@ def _power_thread(state, exit_event):
         source_changed = power_source != applied_source
         if source_changed:
             log(f'[I] Power source changed: {applied_source:s} -> {power_source:s}')
-
-        if config_reloaded:
-            has_tpl = any('MSR_PKG_POWER_LIMIT' in regs.get(profile, {}) for profile in POWER_PROFILES)
-            if not has_tpl:
-                mmio_powercap = None
-                if mchbar_mmio is not None:
-                    mchbar_mmio.close()
-                    mchbar_mmio = None
-            else:
-                if mmio_powercap is None:
-                    mmio_powercap = find_mmio_package_zone()
-                if mchbar_mmio is None:
-                    pkg_baseline = readmsr('MSR_PKG_POWER_LIMIT', cpu=0)
-                    mchbar_mmio = open_mchbar_power_limit_mmio(expected_msr=pkg_baseline)
 
         hwp_epp = _hwp_epp(config, power_source)
         event_hwp_due = hwp_epp is not None and (
