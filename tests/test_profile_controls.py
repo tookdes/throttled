@@ -44,6 +44,19 @@ class ProfileControlTests(unittest.TestCase):
         self.assertEqual(throttled._hwp_epp(config, "AC"), 32)
         self.assertEqual(throttled._hwp_epp(config, "BATTERY"), 180)
 
+    def test_missing_power_profile_is_safe_for_new_controls(self):
+        throttled = load_throttled()
+        config = make_config({'AC': {'HWP_Mode': True, 'Disable_Turbo': False}})
+
+        self.assertEqual(throttled._hwp_epp(config, 'BATTERY'), throttled.HWP_DEFAULT_VALUE)
+        self.assertIsNone(throttled._turbo_setting(config, 'BATTERY'))
+        self.assertIsNone(throttled._bdprochot_setting(config, 'BATTERY'))
+
+        throttled.power['source'] = None
+        self.assertIsNone(throttled._hwp_epp(config))
+        self.assertIsNone(throttled._turbo_setting(config))
+        self.assertIsNone(throttled._bdprochot_setting(config))
+
     def test_hwp_epp_keeps_legacy_hwp_mode_semantics(self):
         throttled = load_throttled()
         config = make_config({"AC": {"HWP_Mode": True}})
