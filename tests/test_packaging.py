@@ -29,9 +29,11 @@ class PackagingTests(unittest.TestCase):
             expected = (
                 'etc/throttled.conf',
                 'usr/bin/throttled',
+                'usr/bin/throttlectl',
                 'usr/lib/systemd/system/throttled.service',
                 'usr/lib/throttled/mmio.py',
                 'usr/lib/throttled/throttled.py',
+                'usr/lib/throttled/throttled_ctl.py',
                 'usr/lib/throttled/throttled_probe.py',
                 'usr/lib/throttled/throttled_version.py',
                 'usr/share/doc/throttled/copyright',
