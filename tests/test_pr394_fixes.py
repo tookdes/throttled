@@ -306,7 +306,7 @@ class PR394FixTests(unittest.TestCase):
                     opened = throttled.open_mchbar_power_limit_mmio(expected_msr=0x2222)
 
         self.assertIsNone(opened)
-        mmio.assert_called_once_with(0xFED159A0, 8)
+        mmio.assert_called_once_with(0xFED159A0, 8, readonly=True)
         mapping.close.assert_called_once_with()
         self.assertIn('preflight mismatch', warning.call_args.args[0])
     def test_mchbar_reader_retries_a_complete_pair_after_either_ecam_read_fails(self):
