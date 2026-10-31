@@ -56,7 +56,7 @@ MSR = {
     "MSR_PKG_POWER_LIMIT": 0x610,
     "MSR_PKG_ENERGY_STATUS": 0x611,
     "MSR_CONFIG_TDP_CONTROL": 0x64B,
-    "MSR_CORE_PERF_LIMIT_REASONS": 0x64F,
+    "MSR_PERF_LIMIT_REASONS": 0x64F,
     "IA32_PM_ENABLE": 0x770,
     "IA32_HWP_CAPABILITIES": 0x771,
     "IA32_HWP_REQUEST_PKG": 0x772,
@@ -967,7 +967,7 @@ def probe_machine(msr):
         turbo["ratios"] = decode_turbo_ratio_limit(turbo_raw)
     report["turbo"] = turbo
 
-    limits_raw, limits_error = try_read(msr, 0, "MSR_CORE_PERF_LIMIT_REASONS")
+    limits_raw, limits_error = try_read(msr, 0, "MSR_PERF_LIMIT_REASONS")
     report["limits"] = {"error": limits_error} if limits_error else decode_perf_limit_reasons(limits_raw)
 
     report["fivr"] = {
