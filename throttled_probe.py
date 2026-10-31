@@ -121,7 +121,7 @@ PCI_HOST_BRIDGE_SYSFS_PATH = Path("/sys/bus/pci/devices/0000:00:00.0")
 
 # MSR 0x64F layout for Skylake/Kaby/Coffee/Whiskey Lake (Intel SDM
 # Table 2-39). Do not substitute the Haswell/Broadwell 0x690 layout.
-CORE_PERF_LIMIT_BITS = {
+PACKAGE_PERF_LIMIT_BITS = {
     0: "PROCHOT",
     1: "Thermal",
     4: "Residency-Regulation",
@@ -345,8 +345,8 @@ def decode_turbo_ratio_limit(raw, max_cores=8):
 
 
 def decode_perf_limit_reasons(raw):
-    active = [name for number, name in CORE_PERF_LIMIT_BITS.items() if bit(raw, number)]
-    logged = [name for number, name in CORE_PERF_LIMIT_BITS.items() if bit(raw, number + 16)]
+    active = [name for number, name in PACKAGE_PERF_LIMIT_BITS.items() if bit(raw, number)]
+    logged = [name for number, name in PACKAGE_PERF_LIMIT_BITS.items() if bit(raw, number + 16)]
     return {"raw": raw, "active": active, "logged": logged}
 
 
@@ -675,8 +675,6 @@ def _safe_restore_value(msr, cpu, name, current, saved):
         raise ProbeError("MSR_TEMPERATURE_TARGET TCC offset is locked")
     if name == "MSR_CONFIG_TDP_CONTROL" and bit(current, 31):
         raise ProbeError("MSR_CONFIG_TDP_CONTROL is locked")
-    if name == "MSR_POWER_CTL" and bit(current, 23):
-        raise ProbeError(f"MSR_POWER_CTL is locked on cpu{cpu}")
     if name == "MSR_TURBO_RATIO_LIMIT":
         platform = msr.read(0, "MSR_PLATFORM_INFO")
         if not bit(platform, 28):
@@ -753,54 +751,56 @@ def apply_restore_plan(msr, plan):
     return results
 
 
-def _open_snapshot_mchbar(snapshot, current_msr_raw):
+def _open_snapshot_mchbar(snapshot):
+    """Open a snapshot-captured direct MCHBAR backend without requiring live MMIO==MSR.
+
+    Live writes require equality because they must not deepen an unexplained
+    split-brain state. Restore is different: its purpose is to repair exactly
+    that state. Safety comes from snapshot identity, the shared PCI allow-list,
+    and a valid enabled MCHBAR base.
+    """
     direct = (snapshot.get("power_backends") or {}).get("direct_mchbar") or {}
     if not direct.get("available") or not direct.get("matches_msr"):
-        return None, None
+        return None, None, "direct MCHBAR was not validated/captured by the snapshot"
 
     identity = read_host_bridge_identity()
     if identity is None:
-        raise ProbeError("snapshot captured direct MCHBAR but current host bridge identity is unavailable")
+        return None, None, "current host bridge identity is unavailable"
     vendor, device = identity
     if vendor != direct.get("vendor_id") or device != direct.get("device_id"):
-        raise ProbeError(
+        return (
+            None,
+            None,
             f"snapshot host bridge {direct.get('vendor_id')}:{direct.get('device_id')} "
-            f"does not match current {vendor}:{device}"
+            f"does not match current {vendor}:{device}",
         )
+    if vendor != 0x8086 or device not in MCHBAR_ADDRESS_MASKS_BY_PCI_DEVICE:
+        return None, None, "current host bridge is not in the validated MCHBAR allow-list"
+
     base = read_mchbar_base(device)
     if base is None or MMIO is None:
-        raise ProbeError("snapshot captured direct MCHBAR but current validated mapping is unavailable")
+        return None, None, "current validated MCHBAR mapping is unavailable"
 
     address = base + MCHBAR_PACKAGE_POWER_LIMIT_OFFSET
     mapping = None
     try:
         with MMIO(address, MCHBAR_PACKAGE_POWER_LIMIT_SIZE, readonly=True) as probe_mapping:
             current_raw = probe_mapping.read64(0)
-        if current_raw != current_msr_raw:
-            raise ProbeError(
-                f"refusing direct MCHBAR restore because current MMIO {current_raw:#x} "
-                f"does not match current MSR {current_msr_raw:#x}"
-            )
 
         mapping = MMIO(address, MCHBAR_PACKAGE_POWER_LIMIT_SIZE)
         rw_raw = mapping.read64(0)
-        if rw_raw != current_msr_raw:
+        if rw_raw != current_raw:
             mapping.close()
-            mapping = None
-            raise ProbeError(
-                f"direct MCHBAR changed after read-only preflight: MMIO {rw_raw:#x}, "
-                f"MSR {current_msr_raw:#x}"
+            return None, None, (
+                f"direct MCHBAR changed during restore preflight: "
+                f"read-only={current_raw:#x}, read-write={rw_raw:#x}"
             )
-    except ProbeError:
-        if mapping is not None:
-            mapping.close()
-        raise
     except (MMIOError, OSError, AttributeError) as exc:
         if mapping is not None:
             mapping.close()
-        raise ProbeError(f"unable to open current direct MCHBAR for restore: {exc}") from exc
+        return None, None, f"unable to open current direct MCHBAR: {exc}"
 
-    return mapping, current_raw
+    return mapping, current_raw, None
 
 
 def _restore_direct_mchbar(mapping, saved_raw):
@@ -810,88 +810,131 @@ def _restore_direct_mchbar(mapping, saved_raw):
         saved_raw & PKG_POWER_PROGRAMMABLE_MASK
     ):
         raise ProbeError("direct MCHBAR package power limit is locked; cannot restore managed fields")
-    if current != target:
-        mapping.write64(0, target)
-    readback = mapping.read64(0)
-    if (readback & PKG_POWER_PROGRAMMABLE_MASK) != (saved_raw & PKG_POWER_PROGRAMMABLE_MASK):
-        raise ProbeError(
-            "direct MCHBAR restore verify failed for package-power managed fields"
-        )
+
+    try:
+        if current != target:
+            mapping.write64(0, target)
+        readback = mapping.read64(0)
+        if (readback & PKG_POWER_PROGRAMMABLE_MASK) != (
+            saved_raw & PKG_POWER_PROGRAMMABLE_MASK
+        ):
+            raise ProbeError(
+                "direct MCHBAR restore verify failed for package-power managed fields"
+            )
+    except (ProbeError, MMIOError, OSError) as exc:
+        rollback_error = None
+        try:
+            now = mapping.read64(0)
+            rollback_target = (now & ~PKG_POWER_PROGRAMMABLE_MASK) | (
+                current & PKG_POWER_PROGRAMMABLE_MASK
+            )
+            if rollback_target != now:
+                mapping.write64(0, rollback_target)
+            verify = mapping.read64(0)
+            if (verify & PKG_POWER_PROGRAMMABLE_MASK) != (
+                current & PKG_POWER_PROGRAMMABLE_MASK
+            ):
+                rollback_error = "rollback verify mismatch"
+        except (MMIOError, OSError) as rollback_exc:
+            rollback_error = str(rollback_exc)
+        suffix = f"; rollback issue: {rollback_error}" if rollback_error else "; backend rollback verified"
+        raise ProbeError(f"direct MCHBAR restore failed: {exc}{suffix}") from exc
 
 
 def apply_full_restore(msr, plan, snapshot):
-    """Restore MSRs plus every package-power backend captured by snapshot v2."""
-    current_msr_raw = msr.read(0, "MSR_PKG_POWER_LIMIT")
-    rollback_plan = [(cpu, name, msr.read(cpu, name)) for cpu, name, _ in plan]
-
+    """Restore every recoverable backend independently and report partial recovery."""
     backends = snapshot.get("power_backends") or {}
     saved_powercap = backends.get("kernel_mmio")
-    powercap_zone = None
-    powercap_before = None
+    direct_saved = backends.get("direct_mchbar") or {}
+
+    status = {
+        "msr": {"status": "pending"},
+        "kernel_mmio": {
+            "status": "not-captured" if saved_powercap is None else "pending"
+        },
+        "direct_mchbar": {
+            "status": "not-captured"
+            if not (direct_saved.get("available") and direct_saved.get("matches_msr"))
+            else "pending"
+        },
+    }
+
+    # Minimum recovery path: managed MSR fields remain transactional.
+    apply_restore_plan(msr, plan)
+    status["msr"] = {"status": "restored"}
+
     if saved_powercap is not None:
         powercap_zone = find_mmio_package_zone()
         if powercap_zone is None:
-            raise ProbeError("snapshot captured intel-rapl-mmio but the current kernel exposes no matching zone")
-        powercap_before = powercap_zone.snapshot()
+            status["kernel_mmio"] = {
+                "status": "unavailable",
+                "reason": "snapshot captured intel-rapl-mmio but no matching zone is currently exposed",
+            }
+        else:
+            try:
+                restored_powercap = powercap_zone.restore(saved_powercap)
+                for role in ("pl1", "pl2"):
+                    expected = saved_powercap.get(role)
+                    actual = restored_powercap.get(role)
+                    if expected is None:
+                        continue
+                    if actual is None:
+                        raise ProbeError(f"restored powercap {role.upper()} constraint disappeared")
+                    for field in ("power_limit_uw", "time_window_us"):
+                        if expected.get(field) is not None and actual.get(field) != expected.get(field):
+                            raise ProbeError(
+                                f"powercap {role.upper()} {field} restore mismatch: "
+                                f"expected {expected.get(field)}, read {actual.get(field)}"
+                            )
+                status["kernel_mmio"] = {"status": "restored"}
+            except (ProbeError, PowercapError) as exc:
+                status["kernel_mmio"] = {"status": "failed", "reason": str(exc)}
 
-    direct_mapping, direct_before = _open_snapshot_mchbar(snapshot, current_msr_raw)
-    direct_saved = backends.get("direct_mchbar") or {}
-    direct_target = direct_saved.get("pkg_power_limit_raw") if direct_mapping is not None else None
-
+    direct_mapping = None
     try:
-        apply_restore_plan(msr, plan)
-
-        if powercap_zone is not None:
-            restored_powercap = powercap_zone.restore(saved_powercap)
-            for role in ("pl1", "pl2"):
-                expected = saved_powercap.get(role)
-                actual = restored_powercap.get(role)
-                if expected is None:
-                    continue
-                if actual is None:
-                    raise ProbeError(f"restored powercap {role.upper()} constraint disappeared")
-                for field in ("power_limit_uw", "time_window_us"):
-                    if expected.get(field) is not None and actual.get(field) != expected.get(field):
-                        raise ProbeError(
-                            f"powercap {role.upper()} {field} restore mismatch: "
-                            f"expected {expected.get(field)}, read {actual.get(field)}"
-                        )
-
-        if direct_mapping is not None:
-            _restore_direct_mchbar(direct_mapping, direct_target)
-
-        target_msr = int(snapshot["package_msrs"]["MSR_PKG_POWER_LIMIT"]["value"], 16)
-        msr_readback = msr.read(0, "MSR_PKG_POWER_LIMIT")
-        if (msr_readback & PKG_POWER_PROGRAMMABLE_MASK) != (target_msr & PKG_POWER_PROGRAMMABLE_MASK):
-            raise ProbeError("package power MSR managed fields changed during backend restore")
-
-        if direct_mapping is not None:
-            direct_readback = direct_mapping.read64(0)
-            if (direct_readback & PKG_POWER_PROGRAMMABLE_MASK) != (
-                target_msr & PKG_POWER_PROGRAMMABLE_MASK
-            ):
-                raise ProbeError("restored direct MCHBAR managed fields do not match restored MSR")
-    except (ProbeError, PowercapError, OSError) as exc:
-        rollback_errors = []
-        if powercap_zone is not None and powercap_before is not None:
-            try:
-                powercap_zone.restore(powercap_before)
-            except PowercapError as rollback_exc:
-                rollback_errors.append(f"powercap: {rollback_exc}")
-        if direct_mapping is not None and direct_before is not None:
-            try:
-                _restore_direct_mchbar(direct_mapping, direct_before)
-            except (ProbeError, OSError) as rollback_exc:
-                rollback_errors.append(f"MCHBAR: {rollback_exc}")
-        try:
-            apply_restore_plan(msr, rollback_plan)
-        except ProbeError as rollback_exc:
-            rollback_errors.append(f"MSR: {rollback_exc}")
-        suffix = f"; rollback issues: {'; '.join(rollback_errors)}" if rollback_errors else "; rollback attempted"
-        raise ProbeError(f"full snapshot restore failed: {exc}{suffix}") from exc
+        direct_mapping, direct_before, direct_error = _open_snapshot_mchbar(snapshot)
+        if status["direct_mchbar"]["status"] == "pending":
+            if direct_mapping is None:
+                status["direct_mchbar"] = {
+                    "status": "unavailable",
+                    "reason": direct_error or "direct MCHBAR is unavailable",
+                }
+            else:
+                try:
+                    _restore_direct_mchbar(
+                        direct_mapping,
+                        direct_saved["pkg_power_limit_raw"],
+                    )
+                    status["direct_mchbar"] = {"status": "restored"}
+                except ProbeError as exc:
+                    status["direct_mchbar"] = {
+                        "status": "failed",
+                        "reason": str(exc),
+                    }
     finally:
         if direct_mapping is not None:
             direct_mapping.close()
+
+    target_msr = int(snapshot["package_msrs"]["MSR_PKG_POWER_LIMIT"]["value"], 16)
+    msr_readback = msr.read(0, "MSR_PKG_POWER_LIMIT")
+    if (msr_readback & PKG_POWER_PROGRAMMABLE_MASK) != (
+        target_msr & PKG_POWER_PROGRAMMABLE_MASK
+    ):
+        status["msr"] = {
+            "status": "failed",
+            "reason": "package power MSR managed fields changed during backend restore",
+        }
+
+    backend_statuses = [
+        item["status"]
+        for key, item in status.items()
+        if key != "msr" and item["status"] != "not-captured"
+    ]
+    status["complete"] = (
+        status["msr"]["status"] == "restored"
+        and all(value == "restored" for value in backend_statuses)
+    )
+    return status
 
 
 def probe_machine(msr):
