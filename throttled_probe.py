@@ -511,26 +511,29 @@ def collect_snapshot(msr, cpu, dmi):
             registers[name] = {"value": f"0x{value:016x}"} if error is None else {"error": error}
         snapshot["per_cpu_msrs"][str(logical_cpu)] = registers
 
-    errors = snapshot_completeness_errors(snapshot, current_cpus)
+    msr_errors = snapshot_msr_completeness_errors(snapshot, current_cpus)
+    backend_errors = snapshot_backend_completeness_errors(snapshot)
+    errors = msr_errors + backend_errors
     direct = snapshot["power_backends"].get("direct_mchbar") or {}
     snapshot["recovery"] = {
-        "msr_complete": not errors,
+        "msr_complete": not msr_errors,
+        "backend_metadata_complete": not backend_errors,
         "kernel_mmio_captured": snapshot["power_backends"].get("kernel_mmio") is not None,
         "tpl_control_complete": bool(
             direct.get("available")
             and direct.get("matches_msr") is True
             and isinstance(direct.get("pkg_power_limit_raw"), int)
+            and isinstance(direct.get("vendor_id"), int)
+            and isinstance(direct.get("device_id"), int)
         ),
     }
-    # "complete" means the managed MSR snapshot is structurally restorable.
-    # TPL Enable/Clamp recovery is graded separately in snapshot["recovery"].
     snapshot["complete"] = not errors
     snapshot["errors"] = errors
     return snapshot
 
 
-def snapshot_completeness_errors(snapshot, current_cpus):
-    """Return every missing/unreadable control register in a stock snapshot."""
+def snapshot_msr_completeness_errors(snapshot, current_cpus):
+    """Return missing/unreadable managed MSR state only."""
     errors = []
     package_msrs = snapshot.get("package_msrs")
     if not isinstance(package_msrs, dict):
@@ -559,11 +562,16 @@ def snapshot_completeness_errors(snapshot, current_cpus):
                 errors.append(f"cpu{cpu} {name}: missing entry")
             elif "value" not in item:
                 errors.append(f"cpu{cpu} {name}: {item.get('error', 'missing value')}")
+    return errors
 
+
+def snapshot_backend_completeness_errors(snapshot):
+    """Return malformed package-power backend metadata errors."""
+    errors = []
     backends = snapshot.get("power_backends")
     if not isinstance(backends, dict):
-        errors.append("power_backends is missing or is not an object")
-        return errors
+        return ["power_backends is missing or is not an object"]
+
     if "kernel_mmio" not in backends:
         errors.append("power_backends.kernel_mmio is missing")
     elif backends["kernel_mmio"] is not None:
@@ -584,7 +592,17 @@ def snapshot_completeness_errors(snapshot, current_cpus):
         elif direct.get("available") and direct.get("matches_msr") is True:
             if not isinstance(direct.get("pkg_power_limit_raw"), int):
                 errors.append("captured validated direct MCHBAR raw value is missing")
+            if not isinstance(direct.get("vendor_id"), int) or not isinstance(direct.get("device_id"), int):
+                errors.append("captured validated direct MCHBAR PCI identity is missing")
     return errors
+
+
+def snapshot_completeness_errors(snapshot, current_cpus):
+    """Return all errors that make a schema-v2 snapshot unsafe to consume."""
+    return (
+        snapshot_msr_completeness_errors(snapshot, current_cpus)
+        + snapshot_backend_completeness_errors(snapshot)
+    )
 
 
 def validate_snapshot_completeness(snapshot, current_cpus):
