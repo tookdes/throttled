@@ -19,6 +19,7 @@ import math
 import os
 import subprocess
 import sys
+import time
 
 from throttled_powercap import PowercapError, find_mmio_package_zone
 from throttled_probe import (
@@ -28,7 +29,7 @@ from throttled_probe import (
     TARGET_DMI_PRODUCT,
     bit,
     cpu_target_status,
-    decode_hwp_request,
+    decode_perf_limit_reasons,
     decode_pkg_power_limit,
     decode_rapl_units,
     format_report,
@@ -44,6 +45,8 @@ HWP_EPP_SHIFT = 24
 HWP_EPP_MASK = 0xFF << HWP_EPP_SHIFT
 HWP_PACKAGE_CONTROL_BIT = 42
 SPEEDSTEP_ENABLE_BIT = 16
+PERF_TARGET_RATIO_SHIFT = 8
+PERF_TARGET_RATIO_MASK = 0xFF << PERF_TARGET_RATIO_SHIFT
 CLOCK_MODULATION_ENABLE_BIT = 4
 
 FIVR_PLANES = {"core": 0, "gpu": 1, "cache": 2, "uncore": 3, "analogio": 4}
@@ -187,6 +190,42 @@ def force_clock_modulation_full(raw):
     # Clearing the on-demand clock-modulation enable bit gives 100% duty cycle
     # while preserving reserved/duty-cycle fields.
     return set_bit(raw, CLOCK_MODULATION_ENABLE_BIT, False)
+
+
+def update_perf_target_ratio(raw, ratio):
+    if not 1 <= ratio <= 0xFF:
+        raise ControlError(f"multiplier ratio must be in the range 1..255, got {ratio}")
+    return replace_field(raw, PERF_TARGET_RATIO_MASK, PERF_TARGET_RATIO_SHIFT, ratio)
+
+
+def counter_delta(before, after, width=64):
+    return (after - before) % (1 << width)
+
+
+def effective_mhz(aperf0, mperf0, aperf1, mperf1, base_mhz):
+    dm = counter_delta(mperf0, mperf1)
+    if dm == 0:
+        return 0.0
+    return counter_delta(aperf0, aperf1) / dm * base_mhz
+
+
+def c0_percent(mperf0, mperf1, elapsed, base_mhz):
+    if elapsed <= 0 or base_mhz <= 0:
+        return 0.0
+    active_ticks = counter_delta(mperf0, mperf1)
+    return max(0.0, min(100.0, active_ticks / (base_mhz * 1_000_000 * elapsed) * 100.0))
+
+
+def core_temperature(raw_therm, tjmax):
+    if not bit(raw_therm, 31):
+        return None
+    return tjmax - ((raw_therm >> 16) & 0x7F)
+
+
+def package_watts(energy0, energy1, elapsed, energy_unit):
+    if elapsed <= 0:
+        return 0.0
+    return counter_delta(energy0, energy1, 32) * energy_unit / elapsed
 
 
 def update_turbo_ratios(raw, ratios):
@@ -461,6 +500,99 @@ def command_clock_mod(args, msr):
     return 0
 
 
+def command_multiplier(args, msr):
+    validate_write_environment(args)
+    platform = msr.read(0, "MSR_PLATFORM_INFO")
+    min_ratio = (platform >> 48) & 0xFF
+    max_non_turbo = (platform >> 8) & 0xFF
+    if not args.force_ratio and not min_ratio <= args.ratio <= max(0x50, max_non_turbo):
+        raise ControlError(
+            f"multiplier {args.ratio}x is outside the conservative detected range "
+            f"{min_ratio}..{max(0x50, max_non_turbo)}; use --force-ratio if intentional"
+        )
+
+    writes = []
+    for cpu in msr.cpus():
+        raw = msr.read(cpu, "IA32_PERF_CTL")
+        writes.append((cpu, "IA32_PERF_CTL", update_perf_target_ratio(raw, args.ratio)))
+    apply_transaction(msr, writes)
+    print(f"IA32_PERF_CTL target multiplier set to {args.ratio}x and verified.")
+    return 0
+
+
+def sample_monitor_counters(msr):
+    counters = {}
+    for cpu in msr.cpus():
+        counters[cpu] = (
+            msr.read(cpu, "IA32_APERF"),
+            msr.read(cpu, "IA32_MPERF"),
+        )
+    energy = msr.read(0, "MSR_PKG_ENERGY_STATUS")
+    return counters, energy
+
+
+def command_monitor(args, msr):
+    interval = args.interval
+    platform = msr.read(0, "MSR_PLATFORM_INFO")
+    base_ratio = (platform >> 8) & 0xFF
+    base_mhz = base_ratio * 100.0
+    temp_target = msr.read(0, "MSR_TEMPERATURE_TARGET")
+    tjmax = (temp_target >> 16) & 0xFF or 100
+    rapl_units = decode_rapl_units(msr.read(0, "MSR_RAPL_POWER_UNIT"))
+
+    iteration = 0
+    try:
+        while True:
+            before, energy0 = sample_monitor_counters(msr)
+            start = time.monotonic()
+            time.sleep(interval)
+            after, energy1 = sample_monitor_counters(msr)
+            elapsed = time.monotonic() - start
+            pkg_w = package_watts(energy0, energy1, elapsed, rapl_units["energy_j"])
+
+            print(f"Package {pkg_w:.2f} W | base {base_mhz:.0f} MHz | interval {elapsed:.3f}s")
+            print(f"{'CPU':>3} {'Ratio':>5} {'MHz':>7} {'Effect':>7} {'C0%':>6} {'Temp':>6}  Limits")
+            for cpu in msr.cpus():
+                perf = msr.read(cpu, "IA32_PERF_STATUS")
+                ratio = (perf >> 8) & 0xFF
+                mhz = ratio * 100
+                therm = msr.read(cpu, "IA32_THERM_STATUS")
+                temp = core_temperature(therm, tjmax)
+                limit_raw = msr.read(cpu, "MSR_CORE_PERF_LIMIT_REASONS")
+                limits = decode_perf_limit_reasons(limit_raw)["active"]
+                eff = effective_mhz(
+                    before[cpu][0],
+                    before[cpu][1],
+                    after[cpu][0],
+                    after[cpu][1],
+                    base_mhz,
+                )
+                c0 = c0_percent(before[cpu][1], after[cpu][1], elapsed, base_mhz)
+                temp_text = "n/a" if temp is None else f"{temp}C"
+                limit_text = ",".join(limits) if limits else "OK"
+                print(f"{cpu:>3} {ratio:>5} {mhz:>7} {eff:>7.0f} {c0:>6.1f} {temp_text:>6}  {limit_text}")
+
+            iteration += 1
+            if args.count and iteration >= args.count:
+                break
+            print()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+def command_limits(args, msr):
+    any_limit = False
+    for cpu in msr.cpus():
+        raw = msr.read(cpu, "MSR_CORE_PERF_LIMIT_REASONS")
+        decoded = decode_perf_limit_reasons(raw)
+        active = ",".join(decoded["active"]) if decoded["active"] else "-"
+        logged = ",".join(decoded["logged"]) if decoded["logged"] else "-"
+        print(f"cpu{cpu}: active={active} | logged={logged} | raw=0x{raw:016x}")
+        any_limit = any_limit or bool(decoded["active"])
+    return 1 if args.fail_on_active and any_limit else 0
+
+
 def command_turbo_ratio(args, msr):
     validate_write_environment(args)
     platform = msr.read(0, "MSR_PLATFORM_INFO")
@@ -707,6 +839,24 @@ def build_parser():
     bd = sub.add_parser("bd-prochot", help="enable or disable bidirectional PROCHOT")
     bd.add_argument("state", type=parse_on_off, metavar="on|off")
     bd.set_defaults(handler=command_bd_prochot)
+
+    multiplier = sub.add_parser("multiplier", help="set IA32_PERF_CTL target multiplier")
+    multiplier.add_argument("ratio", type=parse_ratio, metavar="RATIO")
+    multiplier.add_argument(
+        "--force-ratio",
+        action="store_true",
+        help="bypass conservative detected multiplier range checks",
+    )
+    multiplier.set_defaults(handler=command_multiplier)
+
+    limits = sub.add_parser("limits", help="show ThrottleStop-style core performance limit reasons")
+    limits.add_argument("--fail-on-active", action="store_true", help="return status 1 while any limit is active")
+    limits.set_defaults(handler=command_limits)
+
+    monitor = sub.add_parser("monitor", help="live Ratio/Effective MHz/C0%/temperature/limit monitor")
+    monitor.add_argument("--interval", type=positive_finite, default=1.0, metavar="SECONDS")
+    monitor.add_argument("--count", type=int, default=0, metavar="N", help="stop after N samples (0 = until Ctrl-C)")
+    monitor.set_defaults(handler=command_monitor)
 
     speedstep = sub.add_parser("speedstep", help="enable or disable legacy SpeedStep/EIST")
     speedstep.add_argument("state", type=parse_on_off, metavar="on|off")
