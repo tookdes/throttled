@@ -1480,12 +1480,13 @@ def apply_package_power_limit(write_value, mmio_powercap=None, mchbar_mmio=None)
                 )
     except (OSError, PowercapError) as e:
         rollback_errors = []
-        if direct_changed and mchbar_mmio is not None and direct_before is not None:
+        if mchbar_mmio is not None and direct_before is not None:
             try:
-                mchbar_mmio.write64(0, direct_before)
+                if mchbar_mmio.read64(0) != direct_before:
+                    mchbar_mmio.write64(0, direct_before)
                 if mchbar_mmio.read64(0) != direct_before:
                     rollback_errors.append('MCHBAR verify mismatch')
-            except OSError as rollback_error:
+            except (OSError, MMIOError) as rollback_error:
                 rollback_errors.append(f'MCHBAR: {rollback_error}')
         if powercap_before is not None and mmio_powercap is not None:
             try:
