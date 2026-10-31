@@ -64,7 +64,10 @@ selector WRMSR before reading the result.
 6. attempts to restore pre-write state if a multi-register transaction fails.
 
 FIVR/IccMax use their mailbox-specific rollback path because the mailbox cannot
-be treated like a normal directly readable register.
+be treated like a normal directly readable register. Explicit CLI writes and
+configured daemon profile writes both persist the full pre-change plane state
+under `/var/lib/throttled/oc-backups/`; daemon multi-plane failures also
+reverse already changed planes before propagating the error.
 
 ### Package power
 
@@ -195,7 +198,7 @@ they are observed on the physical 830 G6:
 
 - exact DMI product string and CPUID stepping;
 - whether `intel-rapl-mmio` is exposed by the installed kernel;
-- whether the statically validated Whiskey Lake `0x3E34/0x3E35` direct MCHBAR fallback is actually needed on this BIOS/kernel;
+- whether the statically validated Whiskey Lake `0x3E34/0x3E35` direct MCHBAR mirror is readable and matches MSR 0x610 on this BIOS/kernel;
 - MSR_PKG_POWER_LIMIT lock state;
 - whether HWP package control is active;
 - whether Turbo Ratio writes are accepted or firmware-locked;
