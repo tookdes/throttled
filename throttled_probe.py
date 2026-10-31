@@ -744,24 +744,35 @@ def _open_snapshot_mchbar(snapshot, current_msr_raw):
     if base is None or MMIO is None:
         raise ProbeError("snapshot captured direct MCHBAR but current validated mapping is unavailable")
 
+    address = base + MCHBAR_PACKAGE_POWER_LIMIT_OFFSET
     mapping = None
     try:
-        mapping = MMIO(
-            base + MCHBAR_PACKAGE_POWER_LIMIT_OFFSET,
-            MCHBAR_PACKAGE_POWER_LIMIT_SIZE,
-        )
-        current_raw = mapping.read64(0)
+        with MMIO(address, MCHBAR_PACKAGE_POWER_LIMIT_SIZE, readonly=True) as probe_mapping:
+            current_raw = probe_mapping.read64(0)
+        if current_raw != current_msr_raw:
+            raise ProbeError(
+                f"refusing direct MCHBAR restore because current MMIO {current_raw:#x} "
+                f"does not match current MSR {current_msr_raw:#x}"
+            )
+
+        mapping = MMIO(address, MCHBAR_PACKAGE_POWER_LIMIT_SIZE)
+        rw_raw = mapping.read64(0)
+        if rw_raw != current_msr_raw:
+            mapping.close()
+            mapping = None
+            raise ProbeError(
+                f"direct MCHBAR changed after read-only preflight: MMIO {rw_raw:#x}, "
+                f"MSR {current_msr_raw:#x}"
+            )
+    except ProbeError:
+        if mapping is not None:
+            mapping.close()
+        raise
     except (MMIOError, OSError, AttributeError) as exc:
         if mapping is not None:
             mapping.close()
         raise ProbeError(f"unable to open current direct MCHBAR for restore: {exc}") from exc
 
-    if current_raw != current_msr_raw:
-        mapping.close()
-        raise ProbeError(
-            f"refusing direct MCHBAR restore because current MMIO {current_raw:#x} "
-            f"does not match current MSR {current_msr_raw:#x}"
-        )
     return mapping, current_raw
 
 
