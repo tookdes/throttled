@@ -214,6 +214,65 @@ flags : fpu hwp hwp_epp hwp_act_window hwp_pkg_req
         self.assertEqual(msr.values[(0, "MSR_PKG_POWER_LIMIT")], 0x1111)
         zone.restore.assert_called_once_with(saved_powercap)
 
+    def test_full_restore_repairs_msr_mchbar_divergence(self):
+        msr = FakeMsr({(0, "MSR_PKG_POWER_LIMIT"): 0x3333})
+        plan = [(0, "MSR_PKG_POWER_LIMIT", 0x1111)]
+        snapshot = {
+            "package_msrs": {"MSR_PKG_POWER_LIMIT": {"value": "0x0000000000001111"}},
+            "power_backends": {
+                "kernel_mmio": None,
+                "direct_mchbar": {
+                    "available": True,
+                    "matches_msr": True,
+                    "pkg_power_limit_raw": 0x1111,
+                },
+            },
+        }
+        state = {"value": 0x2222}
+        mapping = mock.Mock()
+        mapping.read64.side_effect = lambda offset: state["value"]
+        mapping.write64.side_effect = lambda offset, value: state.__setitem__("value", value)
+
+        with mock.patch.object(
+            probe,
+            "_open_snapshot_mchbar",
+            return_value=(mapping, 0x2222, None),
+        ):
+            result = probe.apply_full_restore(msr, plan, snapshot)
+
+        self.assertEqual(msr.values[(0, "MSR_PKG_POWER_LIMIT")], 0x1111)
+        self.assertEqual(state["value"], 0x1111)
+        self.assertEqual(result["direct_mchbar"]["status"], "restored")
+        self.assertTrue(result["complete"])
+        mapping.close.assert_called_once_with()
+
+    def test_full_restore_keeps_msr_recovery_when_direct_mchbar_is_unavailable(self):
+        msr = FakeMsr({(0, "MSR_PKG_POWER_LIMIT"): 0x3333})
+        plan = [(0, "MSR_PKG_POWER_LIMIT", 0x1111)]
+        snapshot = {
+            "package_msrs": {"MSR_PKG_POWER_LIMIT": {"value": "0x0000000000001111"}},
+            "power_backends": {
+                "kernel_mmio": None,
+                "direct_mchbar": {
+                    "available": True,
+                    "matches_msr": True,
+                    "pkg_power_limit_raw": 0x1111,
+                },
+            },
+        }
+
+        with mock.patch.object(
+            probe,
+            "_open_snapshot_mchbar",
+            return_value=(None, None, "devmem blocked"),
+        ):
+            result = probe.apply_full_restore(msr, plan, snapshot)
+
+        self.assertEqual(msr.values[(0, "MSR_PKG_POWER_LIMIT")], 0x1111)
+        self.assertEqual(result["msr"]["status"], "restored")
+        self.assertEqual(result["direct_mchbar"]["status"], "unavailable")
+        self.assertFalse(result["complete"])
+
     def test_safe_restore_preserves_unmanaged_temperature_target_bits(self):
         current = (100 << 16) | (5 << 24) | (1 << 40)
         saved = (95 << 16) | (10 << 24)
