@@ -88,6 +88,45 @@ class ControlEncodingTests(unittest.TestCase):
         self.assertAlmostEqual(abs(represented - 28.0), min(abs(value - 28.0) for value in candidates))
 
 
+    def test_speedstep_and_clock_modulation_preserve_unrelated_bits(self):
+        raw = 0xA5A5A5A5A5A5A5A5
+        enabled = ctl.update_speedstep(raw, True)
+        disabled = ctl.update_speedstep(enabled, False)
+        self.assertTrue(ctl.bit(enabled, ctl.SPEEDSTEP_ENABLE_BIT))
+        self.assertFalse(ctl.bit(disabled, ctl.SPEEDSTEP_ENABLE_BIT))
+        self.assertEqual(
+            disabled & ~(1 << ctl.SPEEDSTEP_ENABLE_BIT),
+            raw & ~(1 << ctl.SPEEDSTEP_ENABLE_BIT),
+        )
+
+        full = ctl.force_clock_modulation_full(raw | (1 << ctl.CLOCK_MODULATION_ENABLE_BIT))
+        self.assertFalse(ctl.bit(full, ctl.CLOCK_MODULATION_ENABLE_BIT))
+        self.assertEqual(
+            full & ~(1 << ctl.CLOCK_MODULATION_ENABLE_BIT),
+            raw & ~(1 << ctl.CLOCK_MODULATION_ENABLE_BIT),
+        )
+
+    def test_turbo_ratio_update_preserves_unspecified_bytes(self):
+        raw = 0x28292A2B2C2D2E2F
+        updated = ctl.update_turbo_ratios(raw, {1: 0x31, 4: 0x30})
+        self.assertEqual(updated & 0xFF, 0x31)
+        self.assertEqual((updated >> 24) & 0xFF, 0x30)
+        self.assertEqual((updated >> 8) & 0xFFFF, (raw >> 8) & 0xFFFF)
+        self.assertEqual((updated >> 32) & 0xFFFFFFFF, (raw >> 32) & 0xFFFFFFFF)
+
+    def test_fivr_encoding_round_trip(self):
+        for mv in (0, -50, -80, -125, -999, -1000):
+            ticks = ctl.fivr_mv_to_ticks(mv)
+            raw = ctl.encode_fivr_write_ticks("core", ticks)
+            self.assertEqual(ctl.fivr_ticks_from_response(raw), ticks)
+            self.assertAlmostEqual(ctl.fivr_ticks_to_mv(ticks), ticks / ctl.FIVR_TICKS_PER_MV)
+
+    def test_iccmax_encoder_floors_to_quarter_amp_grid(self):
+        self.assertEqual(ctl.iccmax_to_field(100), 400)
+        self.assertEqual(ctl.iccmax_to_field(105.4), 421)
+        self.assertEqual(ctl.encode_iccmax_write_field("core", 400) & 0x3FF, 400)
+
+
 class TransactionTests(unittest.TestCase):
     def test_transaction_writes_and_verifies(self):
         msr = FakeMsr({(0, "A"): 1, (1, "A"): 1})
@@ -106,6 +145,24 @@ class TransactionTests(unittest.TestCase):
         self.assertEqual(msr.values[(0, "A")], 1)
         self.assertEqual(msr.values[(1, "A")], 1)
 
+    def test_transaction_rolls_back_after_verify_mismatch(self):
+        class VerifyMismatchMsr(FakeMsr):
+            def __init__(self):
+                super().__init__({(0, "A"): 1})
+                self.fail_verify = True
+
+            def read(self, cpu, register):
+                value = self.values[(cpu, register)]
+                if self.fail_verify and self.write_count == 1:
+                    self.fail_verify = False
+                    return value ^ 1
+                return value
+
+        msr = VerifyMismatchMsr()
+        with self.assertRaises(ctl.ControlError):
+            ctl.apply_transaction(msr, [(0, "A", 2)])
+        self.assertEqual(msr.values[(0, "A")], 1)
+
 
 class ParserTests(unittest.TestCase):
     def test_epp_range(self):
@@ -120,6 +177,19 @@ class ParserTests(unittest.TestCase):
         parsed = parser.parse_args(["power", "--pl1", "25", "--tau1", "28"])
         self.assertEqual(parsed.pl1, 25)
         self.assertEqual(parsed.tau1, 28)
+
+    def test_nested_fivr_and_iccmax_parsers(self):
+        parser = ctl.build_parser()
+        fivr = parser.parse_args(["fivr", "set", "--core", "-80", "--cache", "-80"])
+        self.assertEqual(fivr.core, -80)
+        self.assertEqual(fivr.cache, -80)
+
+        icc = parser.parse_args(["iccmax", "set", "--core", "100"])
+        self.assertEqual(icc.core, 100)
+
+        ratio = parser.parse_args(["turbo-ratio", "--1c", "41", "--4c", "38"])
+        self.assertEqual(ratio.ratio1, 41)
+        self.assertEqual(ratio.ratio4, 38)
 
 
 if __name__ == "__main__":
