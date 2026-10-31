@@ -6,7 +6,7 @@ claim of generic Intel laptop support.
 ## Target
 
 - HP EliteBook 830 G6
-- Intel Whiskey Lake-U target CPUID: family 6, model 142, stepping 11
+- Intel Whiskey Lake-U target CPUIDs: family 6, model 142, stepping 11 (806EB) or 12 (806EC)
 - Linux with the `msr` driver
 - direct register writes require root and must not be blocked by kernel lockdown
 
