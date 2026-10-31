@@ -449,6 +449,37 @@ class PR394FixTests(unittest.TestCase):
         self.assertIs(state['config'], new_config)
         self.assertIs(state['regs'], new_regs)
 
+    def test_autoreload_disabling_tpl_closes_existing_rw_mchbar_mapping(self):
+        throttled = load_throttled()
+        old_config = make_config(autoreload=True)
+        new_config = make_config(autoreload=True)
+        new_config.set('GENERAL', 'Enabled', 'False')
+        state = {
+            'config': old_config,
+            'regs': {
+                'AC': {'MSR_PKG_POWER_LIMIT': 0x8000},
+                'BATTERY': {},
+            },
+        }
+        mapping = mock.Mock()
+
+        with mock.patch.object(throttled, 'find_mmio_package_zone', return_value=None):
+            with mock.patch.object(throttled, 'readmsr', return_value=0x8000):
+                with mock.patch.object(
+                    throttled,
+                    'open_mchbar_power_limit_mmio',
+                    return_value=mapping,
+                ):
+                    with mock.patch.object(throttled, 'get_config_write_time', side_effect=[1, 2]):
+                        with mock.patch.object(
+                            throttled,
+                            'reload_config',
+                            return_value=(new_config, {'AC': {}, 'BATTERY': {}}),
+                        ):
+                            throttled._power_thread(state, StopAfterWait())
+
+        mapping.close.assert_called_once_with()
+
     def test_sleep_callback_reads_current_config_and_regs_from_state(self):
         throttled = load_throttled()
         updated_config = make_config()
