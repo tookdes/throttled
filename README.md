@@ -199,11 +199,11 @@ sudo throttlectl iccmax restore /var/lib/throttled/oc-backups/iccmax-....json
 The daemon and CLI therefore do not treat a successful powercap write as a
 complete TPL update.
 
-- watts/Tau prefer the kernel `intel-rapl-mmio` interface;
-- Enable/Clamp, or systems without a usable kernel MMIO zone, require the
-  direct package-power MCHBAR mirror;
-- direct MCHBAR is opened for writes only after a same-run **read-only
-  MMIO == MSR_PKG_POWER_LIMIT** preflight on an allow-listed host bridge;
+- every synchronized TPL update requires the direct package-power MCHBAR
+  mirror to pass a same-run **read-only MMIO == MSR_PKG_POWER_LIMIT**
+  preflight on an allow-listed host bridge;
+- when available, `intel-rapl-mmio` is additionally used for watts/Tau so
+  kernel min/max bounds are enforced;
 - a kernel powercap rejection is rolled back rather than bypassed with a raw
   `/dev/mem` write;
 - if no safe MMIO backend exists the daemon skips the TPL update. The CLI only
@@ -228,9 +228,13 @@ sudo python3 throttled_probe.py --restore-snapshot /root/830g6-stock.json
 sudo python3 throttled_probe.py --restore-snapshot /root/830g6-stock.json --apply-restore
 ```
 
-The apply step preflights every captured backend before changing state and
-transactionally restores/verifies managed MSR fields, captured kernel MMIO
-watts/Tau, and a validated direct MCHBAR mirror. FIVR/IccMax remain outside the
+The apply step always attempts the transactional managed-MSR recovery first,
+then restores captured kernel MMIO and direct MCHBAR backends independently.
+Unlike live TPL writes, recovery deliberately does **not** require the current
+MCHBAR value to equal the current MSR value: repairing that split-brain state
+is the purpose of restore. If a captured backend is unavailable, the command
+reports a partial recovery and exits non-zero instead of discarding recovery
+that already succeeded on the other backends. FIVR/IccMax remain outside the
 strict snapshot because querying them requires WRMSR; their automatic OC
 recovery files provide the separate recovery path.
 
@@ -254,7 +258,7 @@ Update_Rate_s: 5
 # PL1_Tdp_W: 25
 # PL1_Duration_s: 28
 # PL2_Tdp_W: 44
-# PL2_Duration_S: 0.002
+# PL2_Duration_s: 0.002
 # Trip_Temp_C: 90
 
 [BATTERY]
