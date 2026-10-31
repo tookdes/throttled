@@ -33,6 +33,17 @@ class FakeMsr:
         return sorted({cpu for cpu, _ in self.values})
 
 
+class RestoreDaemonGuardTests(unittest.TestCase):
+    def test_restore_refuses_active_daemon_by_default(self):
+        with mock.patch.object(probe, "daemon_is_active", return_value=True):
+            with self.assertRaises(probe.ProbeError):
+                probe.ensure_restore_daemon_stopped(False)
+
+    def test_restore_daemon_race_requires_explicit_override(self):
+        with mock.patch.object(probe, "daemon_is_active", return_value=True):
+            probe.ensure_restore_daemon_stopped(True)
+
+
 class ProbeDecodeTests(unittest.TestCase):
     def test_parse_cpuinfo(self):
         cpu = probe.parse_cpuinfo(
@@ -332,22 +343,41 @@ flags : fpu hwp hwp_epp hwp_act_window hwp_pkg_req
         self.assertEqual(result["msr"]["status"], "restored")
         self.assertEqual(msr.write_count, 1)
 
-    def test_package_restore_reports_secondary_cpu_view_mismatch(self):
+    def test_package_restore_rolls_back_and_stops_backends_on_cpu_view_mismatch(self):
         msr = FakeMsr({
             (0, "MSR_PKG_POWER_LIMIT"): 0x3333,
             (1, "MSR_PKG_POWER_LIMIT"): 0x2222,
         })
         plan = [(0, "MSR_PKG_POWER_LIMIT", 0x1111)]
+        saved_powercap = {
+            "pl1": {"power_limit_uw": 15000000, "time_window_us": 28000000},
+            "pl2": {"power_limit_uw": 44000000, "time_window_us": 2440},
+        }
         snapshot = {
             "package_msrs": {"MSR_PKG_POWER_LIMIT": {"value": "0x0000000000001111"}},
             "power_backends": {
-                "kernel_mmio": None,
-                "direct_mchbar": {"available": False},
+                "kernel_mmio": saved_powercap,
+                "direct_mchbar": {
+                    "available": True,
+                    "matches_msr": True,
+                    "pkg_power_limit_raw": 0x1111,
+                },
             },
         }
-        result = probe.apply_full_restore(msr, plan, snapshot)
+
+        with mock.patch.object(probe, "find_mmio_package_zone") as find_powercap:
+            with mock.patch.object(probe, "_open_snapshot_mchbar") as open_mchbar:
+                result = probe.apply_full_restore(msr, plan, snapshot)
+
+        self.assertEqual(msr.values[(0, "MSR_PKG_POWER_LIMIT")], 0x3333)
         self.assertEqual(result["msr"]["status"], "failed")
         self.assertIn("cpu1", result["msr"]["reason"])
+        self.assertIn("pre-restore MSR state restored", result["msr"]["reason"])
+        self.assertEqual(result["kernel_mmio"]["status"], "skipped")
+        self.assertEqual(result["direct_mchbar"]["status"], "skipped")
+        self.assertFalse(result["complete"])
+        find_powercap.assert_not_called()
+        open_mchbar.assert_not_called()
 
     def test_snapshot_recovery_grade_distinguishes_msr_and_tpl_control(self):
         cpu = {
