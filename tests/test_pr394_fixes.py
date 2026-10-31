@@ -358,7 +358,7 @@ class PR394FixTests(unittest.TestCase):
                     throttled.apply_package_power_limit(0x8001)
 
         writemsr.assert_not_called()
-        self.assertTrue(any('No safe MMIO' in call.args[0] for call in warning.call_args_list))
+        self.assertTrue(any('No MMIO==MSR-validated direct MCHBAR' in call.args[0] for call in warning.call_args_list))
     def test_validated_direct_mchbar_and_package_msr_update_together(self):
         throttled = load_throttled()
         msr_state = {'value': 0x8000}
