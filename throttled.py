@@ -14,7 +14,7 @@ import subprocess
 import sys
 import traceback
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from errno import EACCES, EIO, ENOENT, EPERM
 from platform import uname
 from subprocess import check_output, CalledProcessError, PIPE
@@ -709,7 +709,7 @@ def write_daemon_oc_recovery(kind, values):
         }
         os.makedirs(OC_BACKUP_DIR, mode=0o700, exist_ok=True)
         os.chmod(OC_BACKUP_DIR, 0o700)
-        stamp = datetime.utcnow().strftime('%Y%m%dT%H%M%S%fZ')
+        stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
         path = os.path.join(OC_BACKUP_DIR, f'{kind}-{stamp}-{os.getpid():d}.json')
         with open(path, 'x', encoding='utf-8') as handle:
             json.dump(payload, handle, indent=2, sort_keys=True)
@@ -1661,11 +1661,12 @@ def open_mchbar_power_limit_mmio(expected_msr=None):
 
 
 def apply_package_power_limit(write_value, mmio_powercap=None, mchbar_mmio=None):
-    """Apply one package-power value without allowing MSR/MMIO control-plane drift.
+    """Apply one synchronized package-power value without control-plane drift.
 
-    The kernel powercap interface is used for watts/Tau because it enforces
-    platform bounds. Enable/Clamp bits require the full MCHBAR mirror, which is
-    used only after a same-run MMIO==MSR preflight.
+    Every synchronized TPL update requires a direct MCHBAR mirror that already
+    passed the same-run MMIO==MSR preflight. When kernel intel-rapl-mmio is
+    available it is additionally used for watts/Tau bounds and readback, but it
+    is never sufficient by itself.
     """
     msr_before = readmsr('MSR_PKG_POWER_LIMIT', cpu=0)
     if (msr_before >> PKG_POWER_LIMIT_LOCK_BIT) & 1:
