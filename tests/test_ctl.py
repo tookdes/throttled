@@ -127,6 +127,28 @@ class ControlEncodingTests(unittest.TestCase):
         self.assertEqual(ctl.encode_iccmax_write_field("core", 400) & 0x3FF, 400)
 
 
+class MonitorMathTests(unittest.TestCase):
+    def test_counter_delta_wraps(self):
+        self.assertEqual(ctl.counter_delta((1 << 64) - 5, 3), 8)
+        self.assertEqual(ctl.counter_delta((1 << 32) - 2, 3, 32), 5)
+
+    def test_effective_mhz_and_c0(self):
+        self.assertAlmostEqual(ctl.effective_mhz(100, 200, 300, 300, 2000), 4000)
+        self.assertAlmostEqual(ctl.c0_percent(0, 1_000_000_000, 1.0, 2000), 50.0)
+
+    def test_package_watts_handles_energy_wrap(self):
+        unit = 1 / 16384
+        before = (1 << 32) - 100
+        after = 100
+        expected = 200 * unit
+        self.assertAlmostEqual(ctl.package_watts(before, after, 1.0, unit), expected)
+
+    def test_core_temperature_uses_digital_readout(self):
+        raw = (1 << 31) | (25 << 16)
+        self.assertEqual(ctl.core_temperature(raw, 100), 75)
+        self.assertIsNone(ctl.core_temperature(25 << 16, 100))
+
+
 class TransactionTests(unittest.TestCase):
     def test_transaction_writes_and_verifies(self):
         msr = FakeMsr({(0, "A"): 1, (1, "A"): 1})
@@ -190,6 +212,13 @@ class ParserTests(unittest.TestCase):
         ratio = parser.parse_args(["turbo-ratio", "--1c", "41", "--4c", "38"])
         self.assertEqual(ratio.ratio1, 41)
         self.assertEqual(ratio.ratio4, 38)
+
+        monitor = parser.parse_args(["monitor", "--interval", "0.5", "--count", "3"])
+        self.assertEqual(monitor.interval, 0.5)
+        self.assertEqual(monitor.count, 3)
+
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["monitor", "--count", "-1"])
 
 
 if __name__ == "__main__":
