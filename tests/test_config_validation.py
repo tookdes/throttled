@@ -614,10 +614,31 @@ class ConfigValidationTests(unittest.TestCase):
         messages = [call.args[0] for call in warning.call_args_list]
         self.assertTrue(any('[DEFAULT]' in message for message in messages))
 
-        with mock.patch.object(throttled, 'writemsr') as writemsr:
-            throttled.set_icc_max(config, source='AC')
+        state = {plane: 40 for plane in throttled.CURRENT_PLANES}
 
-        writemsr.assert_called_once()
+        def get_icc(plane=None, convert=False):
+            return {plane: state[plane]}
+
+        def execute(command):
+            plane_id = (command >> 40) & 0xFF
+            plane = next(name for name, value in throttled.CURRENT_PLANES.items() if value == plane_id)
+            state[plane] = command & throttled.ICCMAX_MAX_FIELD
+            return command
+
+        with mock.patch.object(throttled, 'get_icc_max', side_effect=get_icc):
+            with mock.patch.object(throttled, 'execute_oc_mailbox', side_effect=execute) as execute_mailbox:
+                with mock.patch.object(
+                    throttled,
+                    'write_daemon_oc_recovery',
+                    return_value='/var/lib/throttled/oc-backups/iccmax-test.json',
+                ):
+                    throttled.set_icc_max(config, source='AC')
+
+        self.assertEqual(execute_mailbox.call_count, 1)
+        self.assertEqual(
+            execute_mailbox.call_args.args[0] & throttled.ICCMAX_MAX_FIELD,
+            throttled.calc_icc_max_msr('CACHE', 100) & throttled.ICCMAX_MAX_FIELD,
+        )
 
     def test_loader_vets_the_synthesized_undervolt_profile_against_default_planes(self):
         throttled = load_throttled()
