@@ -68,6 +68,7 @@ class DaemonRobustnessTests(unittest.TestCase):
         with (
             mock.patch.object(throttled, 'build_arg_parser', return_value=parser),
             mock.patch.object(throttled, 'load_config', return_value=config),
+            mock.patch.object(throttled, 'acquire_daemon_lock'),
             mock.patch.object(throttled, 'set_msr_allow_writes'),
             mock.patch.object(throttled, 'test_msr_rw_capabilities'),
             mock.patch.object(throttled, 'is_on_battery', return_value=False),
