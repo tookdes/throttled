@@ -90,6 +90,32 @@ SNAPSHOT_PER_CPU_REGS = (
     "IA32_PERF_CTL",
 )
 
+# Snapshot JSON keeps full raw values for diagnostics, but restore only writes
+# fields this fork can actually modify. This prevents snapshot recovery from
+# replaying reserved/read-only/lock bits.
+PKG_POWER_PROGRAMMABLE_MASK = (
+    0x7FFF
+    | (1 << 15)
+    | (1 << 16)
+    | (0x7F << 17)
+    | (0x7FFF << 32)
+    | (1 << 47)
+    | (1 << 48)
+    | (0x7F << 49)
+)
+SNAPSHOT_RESTORE_MASKS = {
+    "MSR_PKG_POWER_LIMIT": PKG_POWER_PROGRAMMABLE_MASK,
+    "MSR_TEMPERATURE_TARGET": 0x3F << 24,
+    "MSR_CONFIG_TDP_CONTROL": 0x3,
+    "MSR_TURBO_RATIO_LIMIT": 0xFFFFFFFFFFFFFFFF,
+    "IA32_HWP_REQUEST_PKG": 0xFF << 24,
+    "MSR_POWER_CTL": 1,
+    "IA32_HWP_REQUEST": 0xFF << 24,
+    "IA32_MISC_ENABLE": (1 << 16) | (1 << 38),
+    "IA32_CLOCK_MODULATION": 1 << 4,
+    "IA32_PERF_CTL": 0xFF << 8,
+}
+
 PCI_HOST_BRIDGE_SYSFS_PATH = Path("/sys/bus/pci/devices/0000:00:00.0")
 
 
@@ -636,41 +662,74 @@ def build_restore_plan(snapshot, current_cpus):
     return plan
 
 
+def _safe_restore_value(msr, cpu, name, current, saved):
+    mask = SNAPSHOT_RESTORE_MASKS.get(name)
+    if mask is None:
+        raise ProbeError(f"no safe restore mask is defined for {name}")
+    current_managed = current & mask
+    saved_managed = saved & mask
+    if current_managed == saved_managed:
+        return current
+
+    if name == "MSR_PKG_POWER_LIMIT" and bit(current, 63):
+        raise ProbeError("MSR_PKG_POWER_LIMIT is locked; managed fields cannot be restored")
+    if name == "MSR_TEMPERATURE_TARGET" and bit(current, 31):
+        raise ProbeError("MSR_TEMPERATURE_TARGET TCC offset is locked")
+    if name == "MSR_CONFIG_TDP_CONTROL" and bit(current, 31):
+        raise ProbeError("MSR_CONFIG_TDP_CONTROL is locked")
+    if name == "MSR_POWER_CTL" and bit(current, 23):
+        raise ProbeError(f"MSR_POWER_CTL is locked on cpu{cpu}")
+    if name == "MSR_TURBO_RATIO_LIMIT":
+        platform = msr.read(0, "MSR_PLATFORM_INFO")
+        if not bit(platform, 28):
+            raise ProbeError("turbo ratio limits are not programmable on this platform")
+    if name in ("IA32_HWP_REQUEST", "IA32_HWP_REQUEST_PKG"):
+        if not bit(msr.read(0, "IA32_PM_ENABLE"), 0):
+            raise ProbeError("HWP is disabled; refusing to restore HWP EPP state")
+    if name == "IA32_PERF_CTL" and bit(msr.read(0, "IA32_PM_ENABLE"), 0):
+        raise ProbeError("HWP is enabled; refusing to restore a legacy IA32_PERF_CTL multiplier")
+
+    return (current & ~mask) | saved_managed
+
+
 def apply_restore_plan(msr, plan):
-    """Apply and verify a restore plan, rolling back partial progress on failure."""
+    """Restore only managed fields and verify them, with transactional rollback."""
     prepared = []
-    for cpu, name, value in plan:
-        prepared.append((cpu, name, msr.read(cpu, name), value))
+    for cpu, name, saved in plan:
+        current = msr.read(cpu, name)
+        target = _safe_restore_value(msr, cpu, name, current, saved)
+        prepared.append((cpu, name, current, target))
 
     completed = []
     results = []
     try:
-        for cpu, name, original, value in prepared:
-            if value == original:
+        for cpu, name, original, target in prepared:
+            if target == original:
                 results.append(
                     {
                         "cpu": cpu,
                         "register": name,
-                        "written": value,
+                        "written": target,
                         "readback": original,
                         "match": True,
                     }
                 )
                 continue
 
-            msr.write(cpu, name, value)
+            msr.write(cpu, name, target)
             completed.append((cpu, name, original))
             readback = msr.read(cpu, name)
-            if readback != value:
+            mask = SNAPSHOT_RESTORE_MASKS[name]
+            if (readback & mask) != (target & mask):
                 raise ProbeError(
                     f"restore verify failed for cpu{cpu} {name}: "
-                    f"wrote 0x{value:016x}, read 0x{readback:016x}"
+                    f"wrote managed bits 0x{target & mask:016x}, read 0x{readback & mask:016x}"
                 )
             results.append(
                 {
                     "cpu": cpu,
                     "register": name,
-                    "written": value,
+                    "written": target,
                     "readback": readback,
                     "match": True,
                 }
@@ -679,8 +738,14 @@ def apply_restore_plan(msr, plan):
         rollback_errors = []
         for cpu, name, original in reversed(completed):
             try:
-                msr.write(cpu, name, original)
-                if msr.read(cpu, name) != original:
+                current = msr.read(cpu, name)
+                rollback_target = (current & ~SNAPSHOT_RESTORE_MASKS[name]) | (
+                    original & SNAPSHOT_RESTORE_MASKS[name]
+                )
+                msr.write(cpu, name, rollback_target)
+                readback = msr.read(cpu, name)
+                mask = SNAPSHOT_RESTORE_MASKS[name]
+                if (readback & mask) != (original & mask):
                     rollback_errors.append(f"cpu{cpu} {name}: verify mismatch")
             except ProbeError as rollback_exc:
                 rollback_errors.append(f"cpu{cpu} {name}: {rollback_exc}")
@@ -740,16 +805,19 @@ def _open_snapshot_mchbar(snapshot, current_msr_raw):
     return mapping, current_raw
 
 
-def _restore_direct_mchbar(mapping, target_raw):
+def _restore_direct_mchbar(mapping, saved_raw):
     current = mapping.read64(0)
-    if ((current >> 63) & 1) and current != target_raw:
-        raise ProbeError("direct MCHBAR package power limit is locked; cannot restore it")
-    if current != target_raw:
-        mapping.write64(0, target_raw)
+    target = (current & ~PKG_POWER_PROGRAMMABLE_MASK) | (saved_raw & PKG_POWER_PROGRAMMABLE_MASK)
+    if bit(current, 63) and (current & PKG_POWER_PROGRAMMABLE_MASK) != (
+        saved_raw & PKG_POWER_PROGRAMMABLE_MASK
+    ):
+        raise ProbeError("direct MCHBAR package power limit is locked; cannot restore managed fields")
+    if current != target:
+        mapping.write64(0, target)
     readback = mapping.read64(0)
-    if readback != target_raw:
+    if (readback & PKG_POWER_PROGRAMMABLE_MASK) != (saved_raw & PKG_POWER_PROGRAMMABLE_MASK):
         raise ProbeError(
-            f"direct MCHBAR restore verify failed: wrote {target_raw:#x}, read {readback:#x}"
+            "direct MCHBAR restore verify failed for package-power managed fields"
         )
 
 
@@ -795,11 +863,16 @@ def apply_full_restore(msr, plan, snapshot):
             _restore_direct_mchbar(direct_mapping, direct_target)
 
         target_msr = int(snapshot["package_msrs"]["MSR_PKG_POWER_LIMIT"]["value"], 16)
-        if msr.read(0, "MSR_PKG_POWER_LIMIT") != target_msr:
-            raise ProbeError("package power MSR changed during backend restore")
+        msr_readback = msr.read(0, "MSR_PKG_POWER_LIMIT")
+        if (msr_readback & PKG_POWER_PROGRAMMABLE_MASK) != (target_msr & PKG_POWER_PROGRAMMABLE_MASK):
+            raise ProbeError("package power MSR managed fields changed during backend restore")
 
-        if direct_mapping is not None and direct_mapping.read64(0) != target_msr:
-            raise ProbeError("restored direct MCHBAR mirror does not match restored package power MSR")
+        if direct_mapping is not None:
+            direct_readback = direct_mapping.read64(0)
+            if (direct_readback & PKG_POWER_PROGRAMMABLE_MASK) != (
+                target_msr & PKG_POWER_PROGRAMMABLE_MASK
+            ):
+                raise ProbeError("restored direct MCHBAR managed fields do not match restored MSR")
     except (ProbeError, PowercapError, OSError) as exc:
         rollback_errors = []
         if direct_mapping is not None and direct_before is not None:
