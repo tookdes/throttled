@@ -1623,17 +1623,10 @@ def apply_package_power_limit(write_value, mmio_powercap=None, mchbar_mmio=None)
                 direct_before = None
 
     control_change = bool((write_value ^ msr_before) & PKG_POWER_LIMIT_CONTROL_MASK)
-    if control_change and mchbar_mmio is None:
+    if mchbar_mmio is None:
         warning(
-            'TPL update would change Enable/Clamp bits but no MMIO==MSR-validated direct MCHBAR '
-            'mirror is available; skipping this package power update.'
-        )
-        return mmio_powercap, mchbar_mmio
-
-    if mmio_powercap is None and mchbar_mmio is None:
-        warning(
-            'No safe MMIO package-power backend is available; skipping package power update '
-            'instead of applying an unverifiable MSR-only daemon state.'
+            'No MMIO==MSR-validated direct MCHBAR mirror is available; skipping the entire '
+            'TPL update to avoid preserving or deepening an MSR/MMIO split-brain state.'
         )
         return mmio_powercap, mchbar_mmio
 
@@ -1858,11 +1851,17 @@ def _power_thread(state, exit_event):
 
         if config_reloaded:
             has_tpl = any('MSR_PKG_POWER_LIMIT' in regs.get(profile, {}) for profile in POWER_PROFILES)
-            if has_tpl and mmio_powercap is None:
-                mmio_powercap = find_mmio_package_zone()
-            if has_tpl and mchbar_mmio is None:
-                pkg_baseline = readmsr('MSR_PKG_POWER_LIMIT', cpu=0)
-                mchbar_mmio = open_mchbar_power_limit_mmio(expected_msr=pkg_baseline)
+            if not has_tpl:
+                mmio_powercap = None
+                if mchbar_mmio is not None:
+                    mchbar_mmio.close()
+                    mchbar_mmio = None
+            else:
+                if mmio_powercap is None:
+                    mmio_powercap = find_mmio_package_zone()
+                if mchbar_mmio is None:
+                    pkg_baseline = readmsr('MSR_PKG_POWER_LIMIT', cpu=0)
+                    mchbar_mmio = open_mchbar_power_limit_mmio(expected_msr=pkg_baseline)
 
         hwp_epp = _hwp_epp(config, power_source)
         event_hwp_due = hwp_epp is not None and (
