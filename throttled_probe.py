@@ -520,12 +520,22 @@ def validate_snapshot_identity(snapshot, cpu, dmi=None):
             )
 
 
+def _snapshot_hex_value(item, register):
+    try:
+        value = int(item["value"], 16)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ProbeError(f"invalid snapshot value for {register}: {item!r}") from exc
+    if not 0 <= value <= 0xFFFFFFFFFFFFFFFF:
+        raise ProbeError(f"snapshot value for {register} is outside the 64-bit MSR range")
+    return value
+
+
 def build_restore_plan(snapshot, current_cpus):
     plan = []
     for name in SNAPSHOT_PACKAGE_REGS:
         item = snapshot.get("package_msrs", {}).get(name, {})
         if "value" in item:
-            value = int(item["value"], 16)
+            value = _snapshot_hex_value(item, name)
             for cpu in current_cpus:
                 plan.append((cpu, name, value))
 
@@ -535,7 +545,7 @@ def build_restore_plan(snapshot, current_cpus):
         for name in SNAPSHOT_PER_CPU_REGS:
             item = registers.get(name, {})
             if "value" in item:
-                plan.append((cpu, name, int(item["value"], 16)))
+                plan.append((cpu, name, _snapshot_hex_value(item, name)))
     return plan
 
 
