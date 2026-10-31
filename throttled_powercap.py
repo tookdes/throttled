@@ -78,6 +78,8 @@ class PowercapZone:
             "time": self.path / f"constraint_{index}_time_window_us",
             "min_power": self.path / f"constraint_{index}_min_power_uw",
             "max_power": self.path / f"constraint_{index}_max_power_uw",
+            "min_time": self.path / f"constraint_{index}_min_time_window_us",
+            "max_time": self.path / f"constraint_{index}_max_time_window_us",
         }
 
     def read_constraint(self, role):
@@ -91,6 +93,8 @@ class PowercapZone:
             "time_window_us": _read_int(paths["time"]),
             "min_power_uw": _read_int(paths["min_power"]),
             "max_power_uw": _read_int(paths["max_power"]),
+            "min_time_window_us": _read_int(paths["min_time"]),
+            "max_time_window_us": _read_int(paths["max_time"]),
         }
 
     def read(self):
@@ -130,20 +134,38 @@ class PowercapZone:
                     before = _read_int(paths["power"])
                     if before is None:
                         raise PowercapError(f"unable to read {paths['power']}")
-                    touched.append((paths["power"], before))
-                    self._write_int(paths["power"], round(values["power"] * 1_000_000))
+                    target = round(values["power"] * 1_000_000)
+                    minimum = _read_int(paths["min_power"])
+                    maximum = _read_int(paths["max_power"])
+                    if minimum is not None and target < minimum:
+                        raise PowercapError(f"{role.upper()} {target} uW is below kernel minimum {minimum} uW")
+                    if maximum is not None and target > maximum:
+                        raise PowercapError(f"{role.upper()} {target} uW is above kernel maximum {maximum} uW")
+                    if target != before:
+                        touched.append((paths["power"], before))
+                        self._write_int(paths["power"], target)
 
                 if values["time"] is not None:
                     before = _read_int(paths["time"])
                     if before is None:
                         raise PowercapError(f"unable to read {paths['time']}")
-                    touched.append((paths["time"], before))
-                    self._write_int(paths["time"], round(values["time"] * 1_000_000))
+                    target = round(values["time"] * 1_000_000)
+                    minimum = _read_int(paths["min_time"])
+                    maximum = _read_int(paths["max_time"])
+                    if minimum is not None and target < minimum:
+                        raise PowercapError(f"{role.upper()} {target} us is below kernel minimum {minimum} us")
+                    if maximum is not None and target > maximum:
+                        raise PowercapError(f"{role.upper()} {target} us is above kernel maximum {maximum} us")
+                    if target != before:
+                        touched.append((paths["time"], before))
+                        self._write_int(paths["time"], target)
         except PowercapError as exc:
             rollback_errors = []
             for path, original in reversed(touched):
                 try:
                     self._write_int(path, original)
+                    if _read_int(path) != original:
+                        rollback_errors.append(f"{path}: verify mismatch")
                 except PowercapError as rollback_exc:
                     rollback_errors.append(str(rollback_exc))
             suffix = f"; rollback issues: {'; '.join(rollback_errors)}" if rollback_errors else "; rollback attempted"
