@@ -10,6 +10,7 @@ available, but requires both --restore-snapshot and --apply-restore.
 """
 
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -118,6 +119,7 @@ SNAPSHOT_RESTORE_MASKS = {
 }
 
 PCI_HOST_BRIDGE_SYSFS_PATH = Path("/sys/bus/pci/devices/0000:00:00.0")
+DAEMON_LOCK_PATH = Path("/run/throttled/daemon.lock")
 
 
 # MSR 0x64F layout for Skylake/Kaby/Coffee/Whiskey Lake (Intel SDM
@@ -150,6 +152,46 @@ THERM_STATUS_BITS = {
 
 class ProbeError(RuntimeError):
     pass
+
+
+def daemon_lock_active():
+    """Detect a running throttled instance, including manual launches, via shared flock."""
+    try:
+        handle = DAEMON_LOCK_PATH.open("a+", encoding="ascii")
+    except OSError:
+        return False
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return False
+    finally:
+        handle.close()
+
+
+def daemon_is_active():
+    if daemon_lock_active():
+        return True
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-active", "--quiet", "throttled.service"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return result.returncode == 0
+    except OSError:
+        return False
+
+
+def ensure_restore_daemon_stopped(allow_daemon_race=False):
+    """Refuse snapshot writes while the daemon can immediately reapply a profile."""
+    if not allow_daemon_race and daemon_is_active():
+        raise ProbeError(
+            "throttled daemon is active and may overwrite restored state; "
+            "stop throttled.service/manual throttled first or pass --allow-daemon-race"
+        )
 
 
 def bit(value, number):
@@ -920,16 +962,35 @@ def apply_full_restore(msr, plan, snapshot):
     }
 
     # Minimum recovery path: managed MSR fields remain transactional.
+    # Keep a pre-restore plan so a package-view inconsistency can abort the
+    # entire MSR restore before any powercap/direct-MCHBAR backend is touched.
+    rollback_plan = [(cpu, name, msr.read(cpu, name)) for cpu, name, _ in plan]
     apply_restore_plan(msr, plan)
     package_view_errors = verify_package_register_views(msr, plan)
-    status["msr"] = (
-        {"status": "restored"}
-        if not package_view_errors
-        else {
+    if package_view_errors:
+        rollback_reason = "pre-restore MSR state restored"
+        try:
+            apply_restore_plan(msr, rollback_plan)
+        except ProbeError as rollback_exc:
+            rollback_reason = f"MSR rollback failed: {rollback_exc}"
+        status["msr"] = {
             "status": "failed",
-            "reason": "package MSR view mismatch: " + "; ".join(package_view_errors),
+            "reason": (
+                "package MSR view mismatch: "
+                + "; ".join(package_view_errors)
+                + f"; {rollback_reason}"
+            ),
         }
-    )
+        for backend in ("kernel_mmio", "direct_mchbar"):
+            if status[backend]["status"] == "pending":
+                status[backend] = {
+                    "status": "skipped",
+                    "reason": "MSR package-view verification failed before backend restore",
+                }
+        status["complete"] = False
+        return status
+
+    status["msr"] = {"status": "restored"}
 
     if saved_powercap is not None:
         powercap_zone = find_mmio_package_zone()
@@ -1313,6 +1374,11 @@ def parse_args(argv=None):
         action="store_true",
         help="actually perform --restore-snapshot writes; without this flag restore is dry-run only",
     )
+    parser.add_argument(
+        "--allow-daemon-race",
+        action="store_true",
+        help="allow restore while throttled is active; unsafe because the daemon may immediately reapply its profile",
+    )
     return parser.parse_args(argv)
 
 
@@ -1357,6 +1423,7 @@ def _main(argv=None):
         if not args.apply_restore:
             print("Dry run only. Add --apply-restore to write and verify these values.")
             return 0
+        ensure_restore_daemon_stopped(args.allow_daemon_race)
         result = apply_full_restore(msr, plan, snapshot)
         for backend in ("msr", "kernel_mmio", "direct_mchbar"):
             item = result[backend]
