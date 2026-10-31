@@ -1,4 +1,6 @@
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import throttled_ctl as ctl
@@ -262,6 +264,76 @@ class LegacyControlGuardTests(unittest.TestCase):
         with mock.patch.object(ctl, "validate_write_environment"):
             with self.assertRaises(ctl.ControlError):
                 ctl.command_multiplier(self._args(), msr)
+
+
+class PowerCommandTests(unittest.TestCase):
+    def _msr(self, pkg_raw):
+        # RAPL power unit = 1/8 W, time unit = 1 s.
+        return FakeMsr({
+            (0, "MSR_RAPL_POWER_UNIT"): 3,
+            (0, "MSR_PKG_POWER_LIMIT"): pkg_raw,
+        })
+
+    def test_power_refuses_before_msr_write_without_safe_mmio_backend(self):
+        msr = self._msr((120 | (1 << ctl.PKG_PL1_ENABLE_BIT)))
+        args = ctl.build_parser().parse_args(["power", "--pl1", "25"])
+        with mock.patch.object(ctl, "validate_write_environment"):
+            with mock.patch.object(ctl, "find_mmio_package_zone", return_value=None):
+                with mock.patch.object(ctl, "open_validated_ctl_mchbar", return_value=None):
+                    with self.assertRaises(ctl.ControlError):
+                        ctl.command_power(args, msr)
+        self.assertEqual(msr.values[(0, "MSR_PKG_POWER_LIMIT")], 120 | (1 << ctl.PKG_PL1_ENABLE_BIT))
+        self.assertEqual(msr.write_count, 0)
+
+    def test_powercap_receives_msr_quantized_value(self):
+        current = 120 | (1 << ctl.PKG_PL1_ENABLE_BIT)
+        msr = self._msr(current)
+        args = ctl.build_parser().parse_args(["power", "--pl1", "25.03"])
+        zone = mock.Mock()
+        zone.snapshot.return_value = {"pl1": None, "pl2": None}
+
+        with mock.patch.object(ctl, "validate_write_environment"):
+            with mock.patch.object(ctl, "find_mmio_package_zone", return_value=zone):
+                ctl.command_power(args, msr)
+
+        self.assertAlmostEqual(zone.write.call_args.kwargs["pl1_w"], 25.0)
+
+    def test_enable_clamp_change_uses_validated_direct_mchbar(self):
+        current = 120 | (1 << ctl.PKG_PL1_ENABLE_BIT)
+        msr = self._msr(current)
+        args = ctl.build_parser().parse_args(["power", "--pl1-enable", "off"])
+        state = {"value": current}
+        mapping = mock.Mock()
+        mapping.read64.side_effect = lambda offset: state["value"]
+        mapping.write64.side_effect = lambda offset, value: state.__setitem__("value", value)
+
+        with mock.patch.object(ctl, "validate_write_environment"):
+            with mock.patch.object(ctl, "find_mmio_package_zone", return_value=None):
+                with mock.patch.object(ctl, "open_validated_ctl_mchbar", return_value=mapping):
+                    ctl.command_power(args, msr)
+
+        self.assertFalse(ctl.bit(msr.values[(0, "MSR_PKG_POWER_LIMIT")], ctl.PKG_PL1_ENABLE_BIT))
+        self.assertEqual(state["value"], msr.values[(0, "MSR_PKG_POWER_LIMIT")])
+        mapping.close.assert_called_once_with()
+
+
+class OcRecoveryTests(unittest.TestCase):
+    def test_recovery_backup_round_trip_validates_machine_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(ctl, "OC_BACKUP_DIR", Path(tmp)):
+                with mock.patch.object(
+                    ctl,
+                    "_current_machine_identity",
+                    return_value={
+                        "target": ctl.TARGET_DMI_PRODUCT,
+                        "dmi_product": ctl.TARGET_DMI_PRODUCT,
+                        "cpu": {"vendor_id": "GenuineIntel", "family": 6, "model": 142, "stepping": 12},
+                    },
+                ):
+                    path = ctl.write_oc_recovery("fivr", {"core": -82, "cache": -82})
+                    restored = ctl.load_oc_recovery(path, "fivr")
+
+        self.assertEqual(restored, {"core": -82, "cache": -82})
 
 
 class ParserTests(unittest.TestCase):
