@@ -52,11 +52,11 @@ class ControlEncodingTests(unittest.TestCase):
         self.assertFalse(disabled & 1)
         self.assertEqual(raw & ~1, disabled)
 
-    def test_bd_prochot_refuses_locked_state_change(self):
-        raw = (1 << ctl.BD_PROCHOT_LOCK_BIT) | 1
-        self.assertEqual(ctl.update_bd_prochot(raw, True), raw)
-        with self.assertRaises(ctl.ControlError):
-            ctl.update_bd_prochot(raw, False)
+    def test_bd_prochot_ignores_reserved_bit23_and_only_changes_bit_zero(self):
+        raw = (1 << 23) | 1
+        updated = ctl.update_bd_prochot(raw, False)
+        self.assertTrue(updated & (1 << 23))
+        self.assertFalse(updated & 1)
 
     def test_power_update_preserves_unrelated_bits(self):
         units = {"power_w": 0.125, "time_s": 1 / 1024}
@@ -300,18 +300,24 @@ class PowerCommandTests(unittest.TestCase):
         self.assertEqual(msr.values[(0, "MSR_PKG_POWER_LIMIT")], 120 | (1 << ctl.PKG_PL1_ENABLE_BIT))
         self.assertEqual(msr.write_count, 0)
 
-    def test_powercap_receives_msr_quantized_value(self):
+    def test_powercap_receives_msr_quantized_value_after_direct_preflight(self):
         current = 120 | (1 << ctl.PKG_PL1_ENABLE_BIT)
         msr = self._msr(current)
         args = ctl.build_parser().parse_args(["power", "--pl1", "25.03"])
         zone = mock.Mock()
         zone.snapshot.return_value = {"pl1": None, "pl2": None}
+        state = {"value": current}
+        mapping = mock.Mock()
+        mapping.read64.side_effect = lambda offset: state["value"]
+        mapping.write64.side_effect = lambda offset, value: state.__setitem__("value", value)
 
         with mock.patch.object(ctl, "validate_write_environment"):
             with mock.patch.object(ctl, "find_mmio_package_zone", return_value=zone):
-                ctl.command_power(args, msr)
+                with mock.patch.object(ctl, "open_validated_ctl_mchbar", return_value=mapping):
+                    ctl.command_power(args, msr)
 
         self.assertAlmostEqual(zone.write.call_args.kwargs["pl1_w"], 25.0)
+        mapping.close.assert_called_once_with()
 
     def test_enable_clamp_change_uses_validated_direct_mchbar(self):
         current = 120 | (1 << ctl.PKG_PL1_ENABLE_BIT)
