@@ -24,6 +24,8 @@ import sys
 import time
 from pathlib import Path
 
+from mmio import MMIO, MMIOError
+from throttled_mchbar import MCHBAR_PACKAGE_POWER_LIMIT_OFFSET, MCHBAR_PACKAGE_POWER_LIMIT_SIZE
 from throttled_powercap import PowercapError, find_mmio_package_zone
 from throttled_probe import (
     MSR,
@@ -37,6 +39,7 @@ from throttled_probe import (
     decode_rapl_units,
     format_report,
     probe_machine,
+    probe_mmio,
     read_cpuinfo,
     read_dmi,
 )
@@ -987,6 +990,28 @@ def command_iccmax_restore(args, msr):
     return 0
 
 
+def open_validated_ctl_mchbar(expected_msr):
+    """Return a RW direct MCHBAR mapping only after the strict probe proves MMIO==MSR."""
+    result = probe_mmio(expected_msr)
+    if not result.get("available") or result.get("matches_msr") is not True:
+        return None
+    base = result.get("base")
+    if not isinstance(base, int):
+        return None
+    try:
+        mapping = MMIO(
+            base + MCHBAR_PACKAGE_POWER_LIMIT_OFFSET,
+            MCHBAR_PACKAGE_POWER_LIMIT_SIZE,
+        )
+        current = mapping.read64(0)
+    except (MMIOError, OSError) as exc:
+        raise ControlError(f"unable to open validated direct MCHBAR: {exc}") from exc
+    if current != expected_msr:
+        mapping.close()
+        return None
+    return mapping
+
+
 def command_power(args, msr):
     validate_write_environment(args)
 
@@ -1019,34 +1044,73 @@ def command_power(args, msr):
         pl1_clamp=args.pl1_clamp,
         pl2_clamp=args.pl2_clamp,
     )
+    target_decoded = decode_pkg_power_limit(updated, units)
 
+    numeric_requested = any(value is not None for value in (args.pl1, args.pl2, args.tau1, args.tau2))
     bit_control_requested = any(
         value is not None
         for value in (args.pl1_enable, args.pl2_enable, args.pl1_clamp, args.pl2_clamp)
     )
-    if bit_control_requested and not args.no_mmio_sync:
-        raise ControlError(
-            "PL Enable/Clamp bits cannot be synchronized through intel-rapl-mmio. "
-            "For now use --no-mmio-sync only for an explicitly MSR-only validation; "
-            "direct MCHBAR bit control remains gated on read-only mirror validation."
-        )
 
-    # MSR_PKG_POWER_LIMIT is package-scoped on the single-package 830 G6.
-    msr_results = apply_transaction(msr, [(0, "MSR_PKG_POWER_LIMIT", updated)])
+    mmio_zone = None
+    direct_mapping = None
+    direct_before = None
+    powercap_before = None
 
-    target_decoded = decode_pkg_power_limit(updated, units)
-    mmio_zone = None if args.no_mmio_sync else find_mmio_package_zone()
-    mmio_requested = any(value is not None for value in (args.pl1, args.pl2, args.tau1, args.tau2))
-    mmio_state = None
-    if mmio_zone is not None and mmio_requested:
-        try:
-            mmio_state = mmio_zone.write(
+    if not args.no_mmio_sync:
+        mmio_zone = find_mmio_package_zone() if numeric_requested else None
+        direct_required = bit_control_requested or (numeric_requested and mmio_zone is None)
+        if direct_required:
+            direct_mapping = open_validated_ctl_mchbar(current)
+            if direct_mapping is None:
+                raise ControlError(
+                    "no MMIO==MSR-validated direct MCHBAR mirror is available for this TPL update; "
+                    "no registers were changed. Use --no-mmio-sync only for an intentional MSR-only experiment."
+                )
+            direct_before = current
+        if mmio_zone is not None:
+            powercap_before = mmio_zone.snapshot()
+
+    msr_results = []
+    direct_changed = False
+    try:
+        msr_results = apply_transaction(msr, [(0, "MSR_PKG_POWER_LIMIT", updated)])
+
+        if mmio_zone is not None:
+            mmio_zone.write(
                 pl1_w=target_decoded["pl1"]["watts"] if args.pl1 is not None else None,
                 pl2_w=target_decoded["pl2"]["watts"] if args.pl2 is not None else None,
                 tau1_s=target_decoded["pl1"]["seconds"] if args.tau1 is not None else None,
                 tau2_s=target_decoded["pl2"]["seconds"] if args.tau2 is not None else None,
             )
-        except PowercapError as exc:
+
+        if direct_mapping is not None:
+            direct_now = direct_mapping.read64(0)
+            if bit(direct_now, PKG_POWER_LOCK_BIT) and direct_now != updated:
+                raise ControlError("direct MCHBAR package power limit is locked")
+            if direct_now != updated:
+                direct_mapping.write64(0, updated)
+                direct_changed = True
+            direct_readback = direct_mapping.read64(0)
+            if direct_readback != updated:
+                raise ControlError(
+                    f"direct MCHBAR verify failed: wrote 0x{updated:016x}, read 0x{direct_readback:016x}"
+                )
+    except (ControlError, ProbeError, PowercapError, MMIOError, OSError) as exc:
+        rollback_errors = []
+        if direct_changed and direct_mapping is not None and direct_before is not None:
+            try:
+                direct_mapping.write64(0, direct_before)
+                if direct_mapping.read64(0) != direct_before:
+                    rollback_errors.append("direct MCHBAR verify mismatch")
+            except (MMIOError, OSError) as rollback_exc:
+                rollback_errors.append(f"direct MCHBAR: {rollback_exc}")
+        if mmio_zone is not None and powercap_before is not None:
+            try:
+                mmio_zone.restore(powercap_before)
+            except PowercapError as rollback_exc:
+                rollback_errors.append(f"powercap: {rollback_exc}")
+        if msr_results:
             rollback = [
                 (result["cpu"], result["register"], result["before"])
                 for result in msr_results
@@ -1056,10 +1120,12 @@ def command_power(args, msr):
                 try:
                     apply_transaction(msr, rollback)
                 except ControlError as rollback_exc:
-                    raise ControlError(
-                        f"MMIO powercap update failed: {exc}; MSR rollback also failed: {rollback_exc}"
-                    ) from exc
-            raise ControlError(f"MMIO powercap update failed: {exc}; MSR changes rolled back") from exc
+                    rollback_errors.append(f"MSR: {rollback_exc}")
+        suffix = f"; rollback issues: {'; '.join(rollback_errors)}" if rollback_errors else "; rollback attempted"
+        raise ControlError(f"package power update failed: {exc}{suffix}") from exc
+    finally:
+        if direct_mapping is not None:
+            direct_mapping.close()
 
     decoded = decode_pkg_power_limit(msr.read(0, "MSR_PKG_POWER_LIMIT"), units)
     print(
@@ -1071,16 +1137,12 @@ def command_power(args, msr):
             "Represented values: "
             + ", ".join(f"{key}={value:.6g}" for key, value in sorted(represented.items()))
         )
-    if mmio_state is not None:
-        mmio_pl1 = (mmio_state.get("pl1") or {}).get("power_limit_uw")
-        mmio_pl2 = (mmio_state.get("pl2") or {}).get("power_limit_uw")
-        rendered1 = "?" if mmio_pl1 is None else f"{mmio_pl1 / 1_000_000:.3f} W"
-        rendered2 = "?" if mmio_pl2 is None else f"{mmio_pl2 / 1_000_000:.3f} W"
-        print(f"Kernel intel-rapl-mmio synchronized: PL1 {rendered1}; PL2 {rendered2}.")
+    if direct_before is not None:
+        print("Validated direct MCHBAR synchronized and verified.")
+    elif mmio_zone is not None:
+        print("Kernel intel-rapl-mmio watts/Tau synchronized and verified.")
     elif args.no_mmio_sync:
-        print("MMIO synchronization explicitly disabled.")
-    else:
-        print("Kernel intel-rapl-mmio zone not available; direct MCHBAR was not modified.")
+        print("MMIO synchronization explicitly disabled; this was an MSR-only experiment.")
     return 0
 
 
