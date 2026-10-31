@@ -116,6 +116,9 @@ class ControlEncodingTests(unittest.TestCase):
         with self.assertRaises(ctl.ControlError):
             ctl.update_temperature_target(raw, 20)
 
+        with self.assertRaises(ctl.ControlError):
+            ctl.update_temperature_target(raw | (1 << 31), 90)
+
     def test_turbo_ratio_update_preserves_unspecified_bytes(self):
         raw = 0x28292A2B2C2D2E2F
         updated = ctl.update_turbo_ratios(raw, {1: 0x31, 4: 0x30})
