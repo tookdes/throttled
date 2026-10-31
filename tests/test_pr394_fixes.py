@@ -398,6 +398,28 @@ class PR394FixTests(unittest.TestCase):
         mmio.assert_called_once_with(0xFED159A0, 8)
         mapping.write64.assert_called_once_with(0, 0x1234)
 
+    def test_kernel_mmio_failure_falls_back_to_direct_mchbar_in_same_iteration(self):
+        throttled = load_throttled()
+        config = make_config()
+        state = {'config': config, 'regs': {'AC': {'MSR_PKG_POWER_LIMIT': 0x1234}, 'BATTERY': {}}}
+        powercap = mock.Mock()
+        powercap.path = '/sys/devices/virtual/powercap/intel-rapl-mmio/intel-rapl-mmio:0'
+        powercap.write.side_effect = throttled.PowercapError('read-only')
+        mapping = mock.Mock()
+        mapping.read64.return_value = 0
+
+        with mock.patch.object(throttled, 'find_mmio_package_zone', return_value=powercap):
+            with mock.patch.object(throttled, 'read_mchbar_base', return_value=0xFED10000):
+                with mock.patch.object(throttled, 'MMIO', return_value=mapping) as mmio:
+                    with mock.patch.object(throttled, 'writemsr'):
+                        with mock.patch.object(throttled, 'warning') as warning:
+                            throttled._power_thread(state, StopAfterWait())
+
+        powercap.write.assert_called_once()
+        mmio.assert_called_once_with(0xFED159A0, 8)
+        mapping.write64.assert_called_once_with(0, 0x1234)
+        self.assertIn('falling back', warning.call_args_list[0].args[0])
+
     def test_mchbar_write_error_disables_only_the_mmio_path(self):
         throttled = load_throttled()
         config = make_config()
