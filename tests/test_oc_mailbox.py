@@ -171,23 +171,23 @@ class OcMailboxTests(unittest.TestCase):
         throttled = load_throttled()
         config = configparser.ConfigParser()
         config.read_dict({"UNDERVOLT.AC": {"CORE": "-50"}})
-        desired = throttled.calc_undervolt_msr("CORE", -50) & 0xFFE00000
-        values = {
-            "CORE": [0, desired ^ (1 << 21)],
-            "GPU": [0, 0],
-            "CACHE": [0, 0],
-            "UNCORE": [0, 0],
-            "ANALOGIO": [0, 0],
-        }
+        state = {plane: 0 for plane in throttled.VOLTAGE_PLANES}
 
         def get_uv(plane=None, convert=False):
-            value = values[plane].pop(0)
-            return {plane: value}
+            return {plane: state[plane]}
 
+        # Command reports success but deliberately leaves CORE unchanged.
         with mock.patch.object(throttled, "get_undervolt", side_effect=get_uv):
-            with mock.patch.object(throttled, "execute_oc_mailbox"):
-                with self.assertRaises(throttled.OCMailboxError):
-                    throttled.undervolt(config, source="AC")
+            with mock.patch.object(throttled, "execute_oc_mailbox", return_value=0):
+                with mock.patch.object(
+                    throttled,
+                    "write_daemon_oc_recovery",
+                    return_value="/var/lib/throttled/oc-backups/fivr-test.json",
+                ):
+                    with self.assertRaises(throttled.OCMailboxError):
+                        throttled.undervolt(config, source="AC")
+
+        self.assertEqual(state["CORE"], 0)
 
 
 if __name__ == "__main__":
