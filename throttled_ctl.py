@@ -130,9 +130,19 @@ def parse_ratio(value):
     try:
         parsed = int(value, 0)
     except ValueError as exc:
-        raise argparse.ArgumentTypeError("turbo ratio must be an integer") from exc
+        raise argparse.ArgumentTypeError("ratio must be an integer") from exc
     if not 1 <= parsed <= 0xFF:
-        raise argparse.ArgumentTypeError("turbo ratio must be in the range 1..255")
+        raise argparse.ArgumentTypeError("ratio must be in the range 1..255")
+    return parsed
+
+
+def nonnegative_int(value):
+    try:
+        parsed = int(value, 0)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("value must be a non-negative integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be a non-negative integer")
     return parsed
 
 
@@ -505,10 +515,14 @@ def command_multiplier(args, msr):
     platform = msr.read(0, "MSR_PLATFORM_INFO")
     min_ratio = (platform >> 48) & 0xFF
     max_non_turbo = (platform >> 8) & 0xFF
-    if not args.force_ratio and not min_ratio <= args.ratio <= max(0x50, max_non_turbo):
+    turbo_raw = msr.read(0, "MSR_TURBO_RATIO_LIMIT")
+    turbo_ratios = [(turbo_raw >> shift) & 0xFF for shift in range(0, 64, 8)]
+    detected_max = max([max_non_turbo, *[ratio for ratio in turbo_ratios if ratio]], default=max_non_turbo)
+    detected_min = min_ratio or 1
+    if not args.force_ratio and not detected_min <= args.ratio <= detected_max:
         raise ControlError(
-            f"multiplier {args.ratio}x is outside the conservative detected range "
-            f"{min_ratio}..{max(0x50, max_non_turbo)}; use --force-ratio if intentional"
+            f"multiplier {args.ratio}x is outside the detected range "
+            f"{detected_min}..{detected_max}; use --force-ratio if intentional"
         )
 
     writes = []
@@ -609,6 +623,8 @@ def command_turbo_ratio(args, msr):
     }
     if not ratios:
         raise ControlError("turbo-ratio requires at least one --1c .. --8c value")
+    if not args.force_ratio and any(ratio > 80 for ratio in ratios.values()):
+        raise ControlError("turbo ratios above 80x require --force-ratio")
 
     current = msr.read(0, "MSR_TURBO_RATIO_LIMIT")
     updated = update_turbo_ratios(current, ratios)
@@ -855,7 +871,7 @@ def build_parser():
 
     monitor = sub.add_parser("monitor", help="live Ratio/Effective MHz/C0%/temperature/limit monitor")
     monitor.add_argument("--interval", type=positive_finite, default=1.0, metavar="SECONDS")
-    monitor.add_argument("--count", type=int, default=0, metavar="N", help="stop after N samples (0 = until Ctrl-C)")
+    monitor.add_argument("--count", type=nonnegative_int, default=0, metavar="N", help="stop after N samples (0 = until Ctrl-C)")
     monitor.set_defaults(handler=command_monitor)
 
     speedstep = sub.add_parser("speedstep", help="enable or disable legacy SpeedStep/EIST")
@@ -868,6 +884,7 @@ def build_parser():
     ratio = sub.add_parser("turbo-ratio", help="set per-active-core Turbo Ratio Limit bytes")
     for cores in range(1, 9):
         ratio.add_argument(f"--{cores}c", dest=f"ratio{cores}", type=parse_ratio, metavar="RATIO")
+    ratio.add_argument("--force-ratio", action="store_true", help="allow ratios above the conservative 80x ceiling")
     ratio.set_defaults(handler=command_turbo_ratio)
 
     fivr = sub.add_parser("fivr", help="query or set FIVR voltage offsets (OC mailbox)")
