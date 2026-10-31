@@ -34,7 +34,7 @@ throttled = "throttled:main"
 throttlectl = "throttled_ctl:main"
 
 [tool.setuptools]
-py-modules = ["mmio", "throttled", "throttled_ctl", "throttled_powercap", "throttled_probe", "throttled_version"]
+py-modules = ["mmio", "throttled", "throttled_ctl", "throttled_mchbar", "throttled_powercap", "throttled_probe", "throttled_version"]
 
 [tool.setuptools.dynamic]
 version = { attr = "throttled_version.__version__" }
