@@ -511,6 +511,18 @@ def collect_snapshot(msr, cpu, dmi):
         snapshot["per_cpu_msrs"][str(logical_cpu)] = registers
 
     errors = snapshot_completeness_errors(snapshot, current_cpus)
+    direct = snapshot["power_backends"].get("direct_mchbar") or {}
+    snapshot["recovery"] = {
+        "msr_complete": not errors,
+        "kernel_mmio_captured": snapshot["power_backends"].get("kernel_mmio") is not None,
+        "tpl_control_complete": bool(
+            direct.get("available")
+            and direct.get("matches_msr") is True
+            and isinstance(direct.get("pkg_power_limit_raw"), int)
+        ),
+    }
+    # "complete" means the managed MSR snapshot is structurally restorable.
+    # TPL Enable/Clamp recovery is graded separately in snapshot["recovery"].
     snapshot["complete"] = not errors
     snapshot["errors"] = errors
     return snapshot
@@ -1283,9 +1295,20 @@ def _main(argv=None):
         if not args.apply_restore:
             print("Dry run only. Add --apply-restore to write and verify these values.")
             return 0
-        apply_full_restore(msr, plan, snapshot)
-        print("Snapshot restore verified across captured MSR/MMIO power backends.")
-        return 0
+        result = apply_full_restore(msr, plan, snapshot)
+        for backend in ("msr", "kernel_mmio", "direct_mchbar"):
+            item = result[backend]
+            detail = f": {item['reason']}" if item.get("reason") else ""
+            print(f"  {backend}: {item['status']}{detail}")
+        if result["complete"]:
+            print("Snapshot restore verified across every captured and currently available backend.")
+            return 0
+        print(
+            "Snapshot restore completed PARTIALLY; recovered backends are shown above. "
+            "Do not assume TPL Enable/Clamp was restored unless direct_mchbar=restored.",
+            file=sys.stderr,
+        )
+        return 3
 
     report = probe_machine(msr)
     print(json.dumps(report, indent=2, sort_keys=True) if args.json else format_report(report))
@@ -1299,7 +1322,9 @@ def _main(argv=None):
         except OSError as exc:
             raise ProbeError(f"unable to write snapshot {str(path)!r}: {exc}") from exc
         if snapshot["complete"]:
-            print(f"Snapshot written to {path} (complete)")
+            recovery = snapshot.get("recovery") or {}
+            tpl = "captured" if recovery.get("tpl_control_complete") else "not captured"
+            print(f"Snapshot written to {path} (MSR complete; TPL control recovery {tpl})")
         else:
             print(f"Snapshot written to {path} but is NOT restorable:", file=sys.stderr)
             for error in snapshot["errors"]:
