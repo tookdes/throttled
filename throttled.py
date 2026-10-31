@@ -34,6 +34,7 @@ CURRENT_PLANES = {'CORE': 0, 'GPU': 1, 'CACHE': 2}
 TRIP_TEMP_RANGE = [40, 97]
 PKG_POWER_LIMIT_POWER_MASK = (1 << 15) - 1
 PKG_POWER_LIMIT_TIME_WINDOW_MASK = (1 << 7) - 1
+PKG_POWER_LIMIT_LOCK_BIT = 63
 POWER_PROFILES = ('AC', 'BATTERY')
 UNDERVOLT_KEYS = ('UNDERVOLT', 'UNDERVOLT.AC', 'UNDERVOLT.BATTERY')
 ICCMAX_KEYS = ('ICCMAX', 'ICCMAX.AC', 'ICCMAX.BATTERY')
@@ -54,6 +55,7 @@ MSR_DICT = {
     'MSR_DRAM_ENERGY_STATUS': 0x619,
     'MSR_PP1_ENERGY_STATUS': 0x641,
     'MSR_CONFIG_TDP_CONTROL': 0x64B,
+    'IA32_HWP_REQUEST_PKG': 0x772,
     'IA32_HWP_REQUEST': 0x774,
 }
 
@@ -650,13 +652,18 @@ def get_critical_temp():
 
 
 def get_cur_pkg_power_limits():
-    """Return the current PL1/PL2 power and time-window fields from
-    MSR_PKG_POWER_LIMIT."""
-    value = readmsr('MSR_PKG_POWER_LIMIT', 0, 55, flatten=True)
+    """Return the current package power-limit register and decoded fields."""
+    value = readmsr('MSR_PKG_POWER_LIMIT', flatten=True)
     return {
+        'RAW': value,
+        'LOCKED': bool(get_value_for_bits(value, PKG_POWER_LIMIT_LOCK_BIT, PKG_POWER_LIMIT_LOCK_BIT)),
         'PL1': get_value_for_bits(value, 0, 14),
+        'PL1_ENABLED': bool(get_value_for_bits(value, 15, 15)),
+        'PL1_CLAMP': bool(get_value_for_bits(value, 16, 16)),
         'TW1': get_value_for_bits(value, 17, 23),
         'PL2': get_value_for_bits(value, 32, 46),
+        'PL2_ENABLED': bool(get_value_for_bits(value, 47, 47)),
+        'PL2_CLAMP': bool(get_value_for_bits(value, 48, 48)),
         'TW2': get_value_for_bits(value, 49, 55),
     }
 
@@ -672,8 +679,19 @@ def calc_time_window_vars(t):
     raise ValueError('Unable to find a good combination!')
 
 
-def _encode_pkg_power_limit(pl1, tw1, pl2, tw2):
-    """Encode MSR_PKG_POWER_LIMIT fields without allowing adjacent-bit spill."""
+def _encode_pkg_power_limit(
+    pl1,
+    tw1,
+    pl2,
+    tw2,
+    *,
+    base_value=0,
+    pl1_enabled=True,
+    pl1_clamp=True,
+    pl2_enabled=True,
+    pl2_clamp=False,
+):
+    """Encode MSR_PKG_POWER_LIMIT while preserving unrelated/reserved bits."""
     fields = (
         ('PL1', pl1, PKG_POWER_LIMIT_POWER_MASK),
         ('TW1', tw1, PKG_POWER_LIMIT_TIME_WINDOW_MASK),
@@ -687,15 +705,31 @@ def _encode_pkg_power_limit(pl1, tw1, pl2, tw2):
         if name in ('PL1', 'PL2') and value == 0:
             raise ValueError(f'{name:s} must be at least one power-unit tick, got {value!r}.')
         encoded[name] = value
-    return (
-        encoded['PL1']
+
+    programmable_mask = (
+        PKG_POWER_LIMIT_POWER_MASK
         | (1 << 15)
         | (1 << 16)
-        | (encoded['TW1'] << 17)
-        | (encoded['PL2'] << 32)
+        | (PKG_POWER_LIMIT_TIME_WINDOW_MASK << 17)
+        | (PKG_POWER_LIMIT_POWER_MASK << 32)
         | (1 << 47)
-        | (encoded['TW2'] << 49)
+        | (1 << 48)
+        | (PKG_POWER_LIMIT_TIME_WINDOW_MASK << 49)
     )
+    value = base_value & ~programmable_mask
+    value |= encoded['PL1']
+    value |= encoded['TW1'] << 17
+    value |= encoded['PL2'] << 32
+    value |= encoded['TW2'] << 49
+    if pl1_enabled:
+        value |= 1 << 15
+    if pl1_clamp:
+        value |= 1 << 16
+    if pl2_enabled:
+        value |= 1 << 47
+    if pl2_clamp:
+        value |= 1 << 48
+    return value
 
 
 def _undervolt_offset_to_ticks(offset):
@@ -875,7 +909,11 @@ def load_config():
         fatal('At least one power profile ([AC] or [BATTERY]) is required.')
 
     boolean_options = [('GENERAL', 'Enabled'), ('GENERAL', 'Autoreload'), ('AC', 'HWP_Mode')]
-    boolean_options.extend((profile, option) for profile in power_profiles for option in ('Disable_BDPROCHOT', 'Disable_Turbo'))
+    boolean_options.extend(
+        (profile, option)
+        for profile in power_profiles
+        for option in ('Disable_BDPROCHOT', 'Disable_Turbo', 'PL1_Enable', 'PL1_Clamp', 'PL2_Enable', 'PL2_Clamp')
+    )
     for section, option in boolean_options:
         try:
             config.getboolean(section, option, fallback=None)
@@ -1080,10 +1118,25 @@ def calc_reg_values(platform_info, config):
                 Y, Z = calc_time_window_vars(PL2_Duration_s)
                 TW2 = Y | (Z << 5)
 
-            try:
-                regs[power_source]['MSR_PKG_POWER_LIMIT'] = _encode_pkg_power_limit(PL1, TW1, PL2, TW2)
-            except ValueError as e:
-                fatal(f'Invalid package power limits in [{power_source:s}]: {e}')
+            if cur_pkg_power_limits.get('LOCKED', False):
+                warning(
+                    f'MSR_PKG_POWER_LIMIT is locked; package power-limit writes for [{power_source:s}] are disabled.'
+                )
+            else:
+                try:
+                    regs[power_source]['MSR_PKG_POWER_LIMIT'] = _encode_pkg_power_limit(
+                        PL1,
+                        TW1,
+                        PL2,
+                        TW2,
+                        base_value=cur_pkg_power_limits.get('RAW', 0),
+                        pl1_enabled=config.getboolean(power_source, 'PL1_Enable', fallback=True),
+                        pl1_clamp=config.getboolean(power_source, 'PL1_Clamp', fallback=True),
+                        pl2_enabled=config.getboolean(power_source, 'PL2_Enable', fallback=True),
+                        pl2_clamp=config.getboolean(power_source, 'PL2_Clamp', fallback=False),
+                    )
+                except ValueError as e:
+                    fatal(f'Invalid package power limits in [{power_source:s}]: {e}')
         else:
             log(f'[I] {power_source:s} package power limits are disabled in config.')
 
@@ -1101,16 +1154,31 @@ def calc_reg_values(platform_info, config):
 
 
 def set_hwp_epp(epp):
-    """Set IA32_HWP_REQUEST.EPP on every online logical CPU."""
+    """Set HWP EPP, including the package request when package control is active."""
     if epp is None or 'HWP' in UNSUPPORTED_FEATURES:
         return
     if not isinstance(epp, int) or not 0 <= epp <= 255:
         raise ValueError(f'HWP EPP must be an integer from 0 to 255, got {epp!r}.')
 
-    # A CPU that disappears mid-loop is fatal rather than falling back to a broadcast write.
+    requests = []
+    package_control = False
     for addr in _ensure_msr_module():
         cpu = int(os.path.basename(os.path.dirname(addr)))
         cur_val = readmsr('IA32_HWP_REQUEST', cpu=cpu)
+        requests.append((cpu, cur_val))
+        package_control = package_control or bool((cur_val >> 42) & 1)
+
+    if package_control:
+        cur_pkg = readmsr('IA32_HWP_REQUEST_PKG', cpu=0)
+        new_pkg = (cur_pkg & 0xFFFFFFFF00FFFFFF) | (epp << 24)
+        writemsr('IA32_HWP_REQUEST_PKG', new_pkg, cpu=0)
+        if args.debug:
+            read_value = readmsr('IA32_HWP_REQUEST_PKG', from_bit=24, to_bit=31, cpu=0)
+            match = OK if epp == read_value else ERR
+            log(f'[D] HWP package - write EPP "{epp:#02x}" - read "{read_value:#02x}" - match {match}')
+
+    # A CPU that disappears mid-loop is fatal rather than falling back to a broadcast write.
+    for cpu, cur_val in requests:
         new_val = (cur_val & 0xFFFFFFFF00FFFFFF) | (epp << 24)
         writemsr('IA32_HWP_REQUEST', new_val, cpu=cpu)
         if args.debug:
@@ -1396,19 +1464,24 @@ def _power_thread(state, exit_event):
             write_value = regs[power_source]['MSR_PKG_POWER_LIMIT']
             writemsr('MSR_PKG_POWER_LIMIT', write_value)
             if args.debug:
-                read_value = readmsr('MSR_PKG_POWER_LIMIT', 0, 55, flatten=True)
+                read_value = readmsr('MSR_PKG_POWER_LIMIT', flatten=True)
                 match = OK if write_value == read_value else ERR
                 log(f'[D] MSR PACKAGE_POWER_LIMIT - write {write_value:#x} - read {read_value:#x} - match {match}')
             if mchbar_mmio is not None:
                 # set MCHBAR register to the same PL1/2 values
                 try:
-                    mchbar_mmio.write64(0, write_value)
-                    if args.debug:
-                        read_value = mchbar_mmio.read64(0)
-                        match = OK if write_value == read_value else ERR
-                        log(
-                            f'[D] MCHBAR PACKAGE_POWER_LIMIT - write {write_value:#x} - read {read_value:#x} - match {match}'
-                        )
+                    mmio_current = mchbar_mmio.read64(0)
+                    if (mmio_current >> PKG_POWER_LIMIT_LOCK_BIT) & 1:
+                        warning('MCHBAR package power limit is locked; disabling only MMIO writes.')
+                        mchbar_mmio = None
+                    else:
+                        mchbar_mmio.write64(0, write_value)
+                        if args.debug:
+                            read_value = mchbar_mmio.read64(0)
+                            match = OK if write_value == read_value else ERR
+                            log(
+                                f'[D] MCHBAR PACKAGE_POWER_LIMIT - write {write_value:#x} - read {read_value:#x} - match {match}'
+                            )
                 except OSError as e:
                     warning(f'Unable to write MCHBAR package power limits ({e}); disabling only MMIO writes.')
                     mchbar_mmio = None
