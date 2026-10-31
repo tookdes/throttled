@@ -33,7 +33,7 @@ Issues = "https://github.com/erpalma/throttled/issues"
 throttled = "throttled:main"
 
 [tool.setuptools]
-py-modules = ["mmio", "throttled", "throttled_version"]
+py-modules = ["mmio", "throttled", "throttled_probe", "throttled_version"]
 
 [tool.setuptools.dynamic]
 version = { attr = "throttled_version.__version__" }
