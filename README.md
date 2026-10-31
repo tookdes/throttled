@@ -134,28 +134,35 @@ or `--no-start` to install without enabling or starting it.
 
 ## HP EliteBook 830 G6 / ThrottleStop replacement
 
-This fork contains an intentionally narrow bring-up path for the HP EliteBook
-830 G6 / Whiskey Lake-U generation. The goal is to reproduce the CPU controls
-that are useful in Windows ThrottleStop before adding a GUI.
+This fork contains a narrowly scoped Linux backend for the HP EliteBook 830 G6
+/ Whiskey Lake-U generation. The shipped configuration is **disabled by
+default**. Do not enable the daemon until the read-only hardware report has
+been reviewed.
 
 Start with the strict read-only probe:
 
 ```sh
 sudo throttled --probe
+sudo throttled --probe --json
+sudo throttled --probe --snapshot /root/830g6-stock.json
 ```
 
-It reports DMI/CPUID identity, HWP/Speed Shift and EPP state, PL1/PL2/Tau and
-lock bits, kernel `intel-rapl` / `intel-rapl-mmio` zones, the validated
-direct MCHBAR fallback when readable, TjMax/TCC and BD PROCHOT state, turbo
-ratio limits, and performance-limit reasons. A normal probe does **not** issue
-the OC-mailbox WRMSR transaction required to query FIVR offsets.
+The probe performs RDMSR, sysfs/PCI reads and a true read-only MCHBAR mapping.
+It reports DMI/CPUID identity, HWP/Speed Shift (including the effective package
+EPP when package control is active), PL1/PL2/Tau and lock bits, kernel
+`intel-rapl` / `intel-rapl-mmio` zones, the allow-listed direct MCHBAR
+mirror, TjMax/TCC, BD PROCHOT, turbo ratios and Whiskey Lake package
+performance-limit reasons. It does **not** query FIVR or IccMax because an OC
+mailbox "read" itself requires WRMSR.
 
-For one-shot ThrottleStop-style controls use `throttlectl`. Write commands
-are guarded to the 830 G6 target by default, preserve unrelated MSR bits,
-verify readback, and attempt rollback after partial failures. They also refuse
-to race the background daemon unless explicitly overridden.
+One-shot controls use `throttlectl`. Write paths require the 830 G6 target,
+verify readback, preserve unrelated fields and attempt rollback. They refuse to
+race an active systemd daemon; persistent daemon writes are separately
+serialized across resume, AC/battery changes and config reloads.
 
 ```sh
+sudo systemctl stop throttled
+
 sudo throttlectl status
 sudo throttlectl limits
 sudo throttlectl monitor --interval 1
@@ -163,47 +170,72 @@ sudo throttlectl monitor --interval 1
 sudo throttlectl epp 32
 sudo throttlectl turbo on
 sudo throttlectl bd-prochot on
-sudo throttlectl speedstep on
-sudo throttlectl clock-mod
-sudo throttlectl multiplier 38
 sudo throttlectl temp-target 90
-
 sudo throttlectl power --pl1 25 --pl2 44 --tau1 28
 sudo throttlectl turbo-ratio --1c 42 --2c 41 --3c 39 --4c 39
 
-# These "read" operations are not electrically read-only: Intel's OC mailbox
-# protocol requires a WRMSR selector transaction before the mailbox result can
-# be read.
+# Legacy controls: rejected while HWP/Speed Shift is enabled.
+sudo throttlectl speedstep on
+sudo throttlectl multiplier 38
+
+# OC mailbox reads are WRMSR transactions, not strict read-only operations.
 sudo throttlectl fivr read
 sudo throttlectl fivr set --core -80 --cache -80
 sudo throttlectl iccmax read
 ```
 
-When the kernel exposes `intel-rapl-mmio`, TPL changes synchronize that
-kernel-managed chipset/MMIO zone instead of guessing an 830 G6 MCHBAR mapping.
-The existing validated `/dev/mem` MCHBAR implementation remains a daemon
-fallback for already allow-listed host bridges.
-
-For bring-up and recovery work, save the stock raw registers before testing:
+FIVR/IccMax `set` automatically writes a root-only recovery JSON under
+`/var/lib/throttled/oc-backups/` before the first mailbox change. Recovery is
+explicit:
 
 ```sh
-sudo python3 throttled_probe.py --snapshot /root/830g6-stock.json
+sudo throttlectl fivr restore /var/lib/throttled/oc-backups/fivr-....json
+sudo throttlectl iccmax restore /var/lib/throttled/oc-backups/iccmax-....json
 ```
 
-Restore is deliberately two-step. The first invocation prints the WRMSR plan;
-the second actually writes and verifies it:
+### TPL / MMIO safety
+
+`intel-rapl-mmio` can represent watts/Tau but not every PL Enable/Clamp bit.
+The daemon and CLI therefore do not treat a successful powercap write as a
+complete TPL update.
+
+- watts/Tau prefer the kernel `intel-rapl-mmio` interface;
+- Enable/Clamp, or systems without a usable kernel MMIO zone, require the
+  direct package-power MCHBAR mirror;
+- direct MCHBAR is opened for writes only after a same-run **read-only
+  MMIO == MSR_PKG_POWER_LIMIT** preflight on an allow-listed host bridge;
+- a kernel powercap rejection is rolled back rather than bypassed with a raw
+  `/dev/mem` write;
+- if no safe MMIO backend exists the daemon skips the TPL update. The CLI only
+  permits MSR-only testing when the operator explicitly passes
+  `--no-mmio-sync`.
+
+### Stock snapshot / restore
+
+Snapshot schema v2 keeps the full raw values for diagnostics but restores only
+the bit fields this fork manages. Lock, reserved and unrelated fields are
+preserved with read-modify-write.
+
+When available, the snapshot also records the kernel `intel-rapl-mmio`
+constraints and a direct MCHBAR raw value **only if** that mirror matched MSR
+0x610 at snapshot time. An incomplete register snapshot is written for
+diagnostics but exits non-zero and is refused by restore.
+
+Restore remains deliberately two-step:
 
 ```sh
 sudo python3 throttled_probe.py --restore-snapshot /root/830g6-stock.json
 sudo python3 throttled_probe.py --restore-snapshot /root/830g6-stock.json --apply-restore
 ```
 
-The snapshot currently covers package power/temperature/cTDP, Turbo Ratio and
-HWP package request, plus per-CPU BD-PROCHOT/POWER_CTL, HWP, Turbo/SpeedStep,
-clock-modulation, and PERF_CTL state. FIVR/IccMax are intentionally excluded
-from the strict stock snapshot because merely querying them requires an OC
-mailbox write. See `docs/elitebook-830-g6.md` for the implementation map and
-remaining hardware-validation gates.
+The apply step preflights every captured backend before changing state and
+transactionally restores/verifies managed MSR fields, captured kernel MMIO
+watts/Tau, and a validated direct MCHBAR mirror. FIVR/IccMax remain outside the
+strict snapshot because querying them requires WRMSR; their automatic OC
+recovery files provide the separate recovery path.
+
+See `docs/elitebook-830-g6.md` for the exact register map and remaining
+physical-hardware validation gates.
 
 ## Configuration
 
@@ -213,28 +245,26 @@ targets, and experimental controls:
 
 ```ini
 [GENERAL]
-Enabled: True
+Enabled: False
 Autoreload: True
 
 [AC]
 Update_Rate_s: 5
-PL1_Tdp_W: 44
-PL1_Duration_s: 28
-PL2_Tdp_W: 44
-PL2_Duration_S: 0.002
-Trip_Temp_C: 95
+# HWP_EPP: 32
+# PL1_Tdp_W: 25
+# PL1_Duration_s: 28
+# PL2_Tdp_W: 44
+# PL2_Duration_S: 0.002
+# Trip_Temp_C: 90
 
 [BATTERY]
 Update_Rate_s: 30
-PL1_Tdp_W: 29
-PL1_Duration_s: 28
-PL2_Tdp_W: 44
-PL2_Duration_S: 0.002
-Trip_Temp_C: 85
 ```
 
-These are project defaults, not recommendations for every system. Check your
-processor limits and cooling capacity before changing them. The service reloads
+The shipped profile is intentionally inert until individual controls and
+`Enabled: True` are explicitly selected. Example values are syntax examples,
+not recommendations. Check the probe report, processor limits and cooling
+capacity before changing them. The service reloads
 valid configuration changes automatically when `Autoreload` is enabled.
 
 ### Undervolting and IccMax
