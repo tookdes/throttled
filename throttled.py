@@ -1640,9 +1640,9 @@ def apply_package_power_limit(write_value, mmio_powercap=None, mchbar_mmio=None)
                     f'MSR_PKG_POWER_LIMIT verify failed: wrote {write_value:#x}, read {readback:#x}'
                 )
 
-        power_unit = get_power_unit()
-        time_unit = get_time_unit()
         if mmio_powercap is not None:
+            power_unit = get_power_unit()
+            time_unit = get_time_unit()
             mmio_powercap.write(
                 pl1_w=get_value_for_bits(write_value, 0, 14) * power_unit,
                 pl2_w=get_value_for_bits(write_value, 32, 46) * power_unit,
