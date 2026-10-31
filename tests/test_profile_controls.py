@@ -64,6 +64,21 @@ class ProfileControlTests(unittest.TestCase):
         self.assertEqual(throttled._hwp_epp(config, "AC"), throttled.HWP_PERFORMANCE_VALUE)
         self.assertEqual(throttled._hwp_epp(config, "BATTERY"), throttled.HWP_DEFAULT_VALUE)
 
+    def test_legacy_hwp_false_is_not_periodically_reasserted(self):
+        throttled = load_throttled()
+        config = make_config({"AC": {"HWP_Mode": False}})
+        self.assertEqual(throttled._hwp_epp(config, "AC"), throttled.HWP_DEFAULT_VALUE)
+        self.assertFalse(throttled._hwp_should_reassert(config, "AC"))
+        self.assertFalse(throttled._hwp_should_apply_event(config, "AC"))
+
+    def test_legacy_hwp_true_reasserts_only_on_ac_but_handles_source_events(self):
+        throttled = load_throttled()
+        config = make_config({"AC": {"HWP_Mode": True}})
+        self.assertTrue(throttled._hwp_should_reassert(config, "AC"))
+        self.assertFalse(throttled._hwp_should_reassert(config, "BATTERY"))
+        self.assertTrue(throttled._hwp_should_apply_event(config, "AC"))
+        self.assertTrue(throttled._hwp_should_apply_event(config, "BATTERY"))
+
     def test_set_hwp_epp_preserves_each_cpu_request(self):
         throttled = load_throttled()
         current = {
