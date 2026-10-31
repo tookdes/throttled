@@ -76,7 +76,8 @@ For the chipset copy of PL1/PL2, the preferred order is:
 1. kernel `intel-rapl-mmio` powercap zone;
 2. existing direct MCHBAR implementation only for host bridges already in the
    validated allow-list;
-3. no MMIO write if neither interface is available.
+3. direct MCHBAR on Whiskey Lake host bridges `0x3E34/0x3E35` using the coreboot-validated 32 KiB bits-38:15 layout and `+0x59A0` package-power mirror;
+4. no MMIO write if none of the validated interfaces is available.
 
 This is intentional. A guessed Whiskey Lake PCI ID / MCHBAR offset must not be
 added merely to make the feature appear supported.
@@ -172,7 +173,7 @@ they are observed on the physical 830 G6:
 
 - exact DMI product string and CPUID stepping;
 - whether `intel-rapl-mmio` is exposed by the installed kernel;
-- host-bridge PCI ID and whether direct MCHBAR fallback is needed at all;
+- whether the statically validated Whiskey Lake `0x3E34/0x3E35` direct MCHBAR fallback is actually needed on this BIOS/kernel;
 - MSR_PKG_POWER_LIMIT lock state;
 - whether HWP package control is active;
 - whether Turbo Ratio writes are accepted or firmware-locked;
