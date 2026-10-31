@@ -75,7 +75,7 @@ flags : fpu hwp hwp_epp hwp_act_window hwp_pkg_req
     def test_decode_perf_limit_reasons(self):
         raw = (1 << 10) | (1 << 8) | (1 << (16 + 6))
         decoded = probe.decode_perf_limit_reasons(raw)
-        self.assertEqual(decoded["active"], ["Current/EDP", "Package-PL1"])
+        self.assertEqual(decoded["active"], ["Other/EDP", "Package-PL1"])
         self.assertEqual(decoded["logged"], ["VR-Thermal"])
 
     def test_target_detection_accepts_both_whiskey_lake_cpuid_revisions(self):
