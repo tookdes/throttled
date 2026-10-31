@@ -100,6 +100,24 @@ flags : fpu hwp hwp_epp hwp_act_window hwp_pkg_req
         self.assertIn((1, "IA32_HWP_REQUEST", 0x43), plan)
         self.assertFalse(any(name == "MSR_TEMPERATURE_TARGET" for _, name, _ in plan))
 
+    def test_snapshot_schema_rejects_unknown_version_target_and_cpu_topology(self):
+        base = {
+            "schema_version": 1,
+            "target": probe.TARGET_DMI_PRODUCT,
+            "per_cpu_msrs": {"0": {}, "1": {}},
+        }
+        probe.validate_snapshot_schema(base, [0, 1])
+
+        for broken in (
+            {**base, "schema_version": 2},
+            {**base, "target": "Other Laptop"},
+            {**base, "per_cpu_msrs": {"0": {}}},
+            {**base, "per_cpu_msrs": {"cpu0": {}}},
+        ):
+            with self.subTest(broken=broken):
+                with self.assertRaises(probe.ProbeError):
+                    probe.validate_snapshot_schema(broken, [0, 1])
+
     def test_snapshot_identity_rejects_other_cpu(self):
         snapshot = {
             "cpu": {
