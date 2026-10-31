@@ -214,6 +214,34 @@ flags : fpu hwp hwp_epp hwp_act_window hwp_pkg_req
         self.assertEqual(msr.values[(0, "MSR_PKG_POWER_LIMIT")], 0x1111)
         zone.restore.assert_called_once_with(saved_powercap)
 
+    def test_safe_restore_preserves_unmanaged_temperature_target_bits(self):
+        current = (100 << 16) | (5 << 24) | (1 << 40)
+        saved = (95 << 16) | (10 << 24)
+        msr = FakeMsr({(0, "MSR_TEMPERATURE_TARGET"): current})
+        probe.apply_restore_plan(msr, [(0, "MSR_TEMPERATURE_TARGET", saved)])
+        restored = msr.values[(0, "MSR_TEMPERATURE_TARGET")]
+        self.assertEqual((restored >> 24) & 0x3F, 10)
+        self.assertEqual((restored >> 16) & 0xFF, 100)
+        self.assertEqual(restored & (1 << 40), current & (1 << 40))
+
+    def test_safe_restore_refuses_locked_temperature_target_change(self):
+        current = (100 << 16) | (5 << 24) | (1 << 31)
+        saved = (100 << 16) | (10 << 24)
+        msr = FakeMsr({(0, "MSR_TEMPERATURE_TARGET"): current})
+        with self.assertRaises(probe.ProbeError):
+            probe.apply_restore_plan(msr, [(0, "MSR_TEMPERATURE_TARGET", saved)])
+        self.assertEqual(msr.values[(0, "MSR_TEMPERATURE_TARGET")], current)
+
+    def test_safe_restore_only_changes_managed_misc_enable_bits(self):
+        current = (1 << 10) | (1 << 38)
+        saved = (1 << 16)
+        msr = FakeMsr({(0, "IA32_MISC_ENABLE"): current})
+        probe.apply_restore_plan(msr, [(0, "IA32_MISC_ENABLE", saved)])
+        restored = msr.values[(0, "IA32_MISC_ENABLE")]
+        self.assertTrue(restored & (1 << 10))
+        self.assertTrue(restored & (1 << 16))
+        self.assertFalse(restored & (1 << 38))
+
     def test_restore_rolls_back_after_write_failure(self):
         msr = FakeMsr(
             {
