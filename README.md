@@ -132,6 +132,42 @@ an existing `/etc/throttled.conf`, detects systemd, OpenRC, or runit, and
 enables the service. Use `--init systemd|openrc|runit` to override detection,
 or `--no-start` to install without enabling or starting it.
 
+## HP EliteBook 830 G6 bring-up probe
+
+This fork is currently adding a narrowly scoped ThrottleStop replacement path
+for the HP EliteBook 830 G6 / Whiskey Lake-U generation. Before changing any
+settings, collect the machine's actual register capabilities:
+
+```sh
+sudo throttled --probe
+```
+
+The probe is intentionally read-only. It reports DMI/CPUID identity, HWP/Speed
+Shift and EPP state, PL1/PL2/Tau and lock bits, the validated MCHBAR power-limit
+mirror when readable, TjMax/TCC and BD PROCHOT state, turbo ratio limits, and
+core performance-limit reasons. It does **not** issue the OC-mailbox WRMSR
+transaction needed to query FIVR offsets, so a normal probe cannot change
+voltage state.
+
+For bring-up and recovery work, the standalone module can also save selected
+raw control registers:
+
+```sh
+sudo python3 throttled_probe.py --snapshot /root/830g6-stock.json
+```
+
+Restoring is deliberately two-step. The first command only prints the WRMSR
+plan; the second actually writes and verifies it:
+
+```sh
+sudo python3 throttled_probe.py --restore-snapshot /root/830g6-stock.json
+sudo python3 throttled_probe.py --restore-snapshot /root/830g6-stock.json --apply-restore
+```
+
+Snapshots currently cover package power/temperature/BD-PROCHOT/cTDP controls
+and per-CPU HWP requests. FIVR/IccMax and the MMIO mirror are intentionally not
+part of this first restore milestone.
+
 ## Configuration
 
 The configuration file is `/etc/throttled.conf`. It contains separate `[AC]`
