@@ -217,6 +217,35 @@ flags : fpu hwp hwp_epp hwp_act_window hwp_pkg_req
         self.assertEqual(msr.values[(0, "MSR_PKG_POWER_LIMIT")], 0x1111)
         zone.restore.assert_called_once_with(saved_powercap)
 
+    def test_snapshot_mchbar_open_allows_current_split_from_saved_value(self):
+        snapshot = {
+            "power_backends": {
+                "direct_mchbar": {
+                    "available": True,
+                    "matches_msr": True,
+                    "vendor_id": 0x8086,
+                    "device_id": 0x3E34,
+                    "pkg_power_limit_raw": 0x1111,
+                }
+            }
+        }
+        ro_mapping = mock.MagicMock()
+        ro_mapping.__enter__.return_value = ro_mapping
+        ro_mapping.read64.return_value = 0x2222
+        rw_mapping = mock.Mock()
+        rw_mapping.read64.return_value = 0x2222
+
+        with mock.patch.object(probe, "read_host_bridge_identity", return_value=(0x8086, 0x3E34)):
+            with mock.patch.object(probe, "read_mchbar_base", return_value=0xFED10000):
+                with mock.patch.object(probe, "MMIO", side_effect=[ro_mapping, rw_mapping]) as mmio:
+                    mapping, current_raw, error = probe._open_snapshot_mchbar(snapshot)
+
+        self.assertIs(mapping, rw_mapping)
+        self.assertEqual(current_raw, 0x2222)
+        self.assertIsNone(error)
+        self.assertNotEqual(current_raw, snapshot["power_backends"]["direct_mchbar"]["pkg_power_limit_raw"])
+        self.assertEqual(mmio.call_count, 2)
+
     def test_full_restore_repairs_msr_mchbar_divergence(self):
         msr = FakeMsr({(0, "MSR_PKG_POWER_LIMIT"): 0x3333})
         plan = [(0, "MSR_PKG_POWER_LIMIT", 0x1111)]
