@@ -435,7 +435,11 @@ def probe_mmio(msr_pkg_raw):
 
     out["base"] = base
     try:
-        mapping = MMIO(base + MCHBAR_PACKAGE_POWER_LIMIT_OFFSET, MCHBAR_PACKAGE_POWER_LIMIT_SIZE)
+        mapping = MMIO(
+            base + MCHBAR_PACKAGE_POWER_LIMIT_OFFSET,
+            MCHBAR_PACKAGE_POWER_LIMIT_SIZE,
+            readonly=True,
+        )
         try:
             raw = mapping.read64(0)
         finally:
