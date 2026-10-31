@@ -34,6 +34,22 @@ class FakeMsr:
 
 
 class RestoreDaemonGuardTests(unittest.TestCase):
+    def test_probe_daemon_lock_detects_manual_instance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "daemon.lock"
+            path.touch()
+            with path.open("a+", encoding="ascii") as held:
+                probe.fcntl.flock(
+                    held.fileno(),
+                    probe.fcntl.LOCK_EX | probe.fcntl.LOCK_NB,
+                )
+                with mock.patch.object(probe, "DAEMON_LOCK_PATH", path):
+                    self.assertTrue(probe.daemon_lock_active())
+                probe.fcntl.flock(held.fileno(), probe.fcntl.LOCK_UN)
+
+            with mock.patch.object(probe, "DAEMON_LOCK_PATH", path):
+                self.assertFalse(probe.daemon_lock_active())
+
     def test_restore_refuses_active_daemon_by_default(self):
         with mock.patch.object(probe, "daemon_is_active", return_value=True):
             with self.assertRaises(probe.ProbeError):
