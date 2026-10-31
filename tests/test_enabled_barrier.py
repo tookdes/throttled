@@ -101,19 +101,20 @@ class EnabledBarrierTests(unittest.TestCase):
         new_config = make_config(enabled=False, autoreload=True)
         state = {'config': old_config, 'regs': {'AC': {'MSR_PKG_POWER_LIMIT': 0x1234}}}
 
-        with mock.patch.object(throttled, 'read_mchbar_base', return_value=0):
-            with mock.patch.object(throttled, 'MMIO', side_effect=throttled.MMIOError):
-                with mock.patch.object(throttled, 'warning'):
-                    with mock.patch.object(throttled, 'get_config_write_time', side_effect=(1, 2)):
-                        with mock.patch.object(
-                            throttled, 'reload_config', return_value=(new_config, defaultdict(dict))
-                        ):
-                            with mock.patch.object(throttled, 'writemsr') as writemsr:
-                                with mock.patch.object(throttled, 'undervolt') as undervolt:
-                                    with mock.patch.object(
-                                        throttled, 'get_reset_thermal_status'
-                                    ) as thermal_status:
-                                        throttled._power_thread(state, StopAfterWait())
+        with mock.patch.object(throttled, 'find_mmio_package_zone', return_value=None):
+            with mock.patch.object(throttled, 'readmsr', return_value=0x1234):
+                with mock.patch.object(throttled, 'open_mchbar_power_limit_mmio', return_value=None):
+                    with mock.patch.object(throttled, 'warning'):
+                        with mock.patch.object(throttled, 'get_config_write_time', side_effect=(1, 2)):
+                            with mock.patch.object(
+                                throttled, 'reload_config', return_value=(new_config, defaultdict(dict))
+                            ):
+                                with mock.patch.object(throttled, 'writemsr') as writemsr:
+                                    with mock.patch.object(throttled, 'undervolt') as undervolt:
+                                        with mock.patch.object(
+                                            throttled, 'get_reset_thermal_status'
+                                        ) as thermal_status:
+                                            throttled._power_thread(state, StopAfterWait())
 
         writemsr.assert_not_called()
         undervolt.assert_not_called()
