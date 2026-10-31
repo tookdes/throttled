@@ -17,6 +17,10 @@ def make_zone(root, driver="intel-rapl-mmio", name="package-0"):
         (zone / f"constraint_{index}_name").write_text(role)
         (zone / f"constraint_{index}_power_limit_uw").write_text(str(power))
         (zone / f"constraint_{index}_time_window_us").write_text(str(time_us))
+        (zone / f"constraint_{index}_min_power_uw").write_text("1000000")
+        (zone / f"constraint_{index}_max_power_uw").write_text("60000000")
+        (zone / f"constraint_{index}_min_time_window_us").write_text("1")
+        (zone / f"constraint_{index}_max_time_window_us").write_text("60000000")
     return zone
 
 
@@ -57,6 +61,28 @@ class PowercapTests(unittest.TestCase):
             self.assertEqual(restored["pl2"]["power_limit_uw"], 44_000_000)
             self.assertEqual(restored["pl1"]["time_window_us"], 28_000_000)
             self.assertEqual(restored["pl2"]["time_window_us"], 2_440)
+
+    def test_write_rejects_kernel_power_bounds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            zone = powercap.PowercapZone(make_zone(tmp))
+            with self.assertRaises(powercap.PowercapError):
+                zone.write(pl1_w=0.5)
+            with self.assertRaises(powercap.PowercapError):
+                zone.write(pl2_w=61)
+
+    def test_write_rejects_kernel_time_bounds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            zone = powercap.PowercapZone(make_zone(tmp))
+            with self.assertRaises(powercap.PowercapError):
+                zone.write(tau1_s=61)
+
+    def test_write_skips_values_that_are_already_applied(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            zone = powercap.PowercapZone(make_zone(tmp))
+            before = zone.read()
+            after = zone.write(pl1_w=15, pl2_w=44, tau1_s=28, tau2_s=0.00244)
+            self.assertEqual(after["pl1"]["power_limit_uw"], before["pl1"]["power_limit_uw"])
+            self.assertEqual(after["pl2"]["power_limit_uw"], before["pl2"]["power_limit_uw"])
 
     def test_probe_reports_missing_driver_as_none(self):
         with tempfile.TemporaryDirectory() as tmp:
