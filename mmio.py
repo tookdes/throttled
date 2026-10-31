@@ -101,8 +101,6 @@ class MMIO(object):
         return struct.unpack("=L", self.mapping[offset : offset + 4])[0]
 
     def write32(self, offset: int, value: int) -> None:
-        if self._readonly:
-            raise MMIOError("MMIO mapping is read-only")
         """Write 32-bits to the specified `offset` in bytes, relative to the
         base physical address of the MMIO region.
         Args:
@@ -112,6 +110,8 @@ class MMIO(object):
             TypeError: if `offset` or `value` type are invalid.
             ValueError: if `offset` or `value` are out of bounds.
         """
+        if self._readonly:
+            raise MMIOError("MMIO mapping is read-only")
         if not isinstance(offset, int):
             raise TypeError("Invalid offset type, should be integer.")
         if not isinstance(value, int):
@@ -133,9 +133,9 @@ class MMIO(object):
         return struct.unpack("=Q", self.mapping[offset : offset + 8])[0]
 
     def write64(self, offset: int, value: int) -> None:
+        """Write 64-bits to the specified `offset` in bytes, relative to the base physical address of the MMIO region."""
         if self._readonly:
             raise MMIOError("MMIO mapping is read-only")
-        """Write 64-bits to the specified `offset` in bytes, relative to the base physical address of the MMIO region."""
         if not isinstance(offset, int):
             raise TypeError("Invalid offset type, should be integer.")
         if not isinstance(value, int):
