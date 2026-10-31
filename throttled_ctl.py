@@ -543,7 +543,6 @@ def apply_transaction(msr, writes):
     try:
         for cpu, register, original, new_value in originals:
             if new_value == original:
-                completed.append((cpu, register, original))
                 continue
             msr.write(cpu, register, new_value)
             completed.append((cpu, register, original))
@@ -1079,7 +1078,6 @@ def command_power(args, msr):
             powercap_before = mmio_zone.snapshot()
 
     msr_results = []
-    direct_changed = False
     try:
         msr_results = apply_transaction(msr, [(0, "MSR_PKG_POWER_LIMIT", updated)])
 
@@ -1097,7 +1095,6 @@ def command_power(args, msr):
                 raise ControlError("direct MCHBAR package power limit is locked")
             if direct_now != updated:
                 direct_mapping.write64(0, updated)
-                direct_changed = True
             direct_readback = direct_mapping.read64(0)
             if direct_readback != updated:
                 raise ControlError(
