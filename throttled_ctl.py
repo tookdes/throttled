@@ -1082,15 +1082,13 @@ def command_power(args, msr):
 
     if not args.no_mmio_sync:
         mmio_zone = find_mmio_package_zone() if numeric_requested else None
-        direct_required = bit_control_requested or (numeric_requested and mmio_zone is None)
-        if direct_required:
-            direct_mapping = open_validated_ctl_mchbar(current)
-            if direct_mapping is None:
-                raise ControlError(
-                    "no MMIO==MSR-validated direct MCHBAR mirror is available for this TPL update; "
-                    "no registers were changed. Use --no-mmio-sync only for an intentional MSR-only experiment."
-                )
-            direct_before = current
+        direct_mapping = open_validated_ctl_mchbar(current)
+        if direct_mapping is None:
+            raise ControlError(
+                "no MMIO==MSR-validated direct MCHBAR mirror is available for this TPL update; "
+                "no registers were changed. Use --no-mmio-sync only for an intentional MSR-only experiment."
+            )
+        direct_before = current
         if mmio_zone is not None:
             powercap_before = mmio_zone.snapshot()
 
