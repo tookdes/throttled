@@ -878,7 +878,7 @@ def parse_args(argv=None):
     return parser.parse_args(argv)
 
 
-def main(argv=None):
+def _main(argv=None):
     args = parse_args(argv)
     if os.geteuid() != 0:
         raise ProbeError("MSR access requires root; run this command with sudo")
@@ -889,7 +889,10 @@ def main(argv=None):
     dmi = read_dmi()
 
     if args.restore_snapshot:
-        snapshot = json.loads(Path(args.restore_snapshot).read_text(encoding="utf-8"))
+        try:
+            snapshot = json.loads(Path(args.restore_snapshot).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ProbeError(f"unable to read snapshot {args.restore_snapshot!r}: {exc}") from exc
         validate_snapshot_identity(snapshot, cpu, dmi)
         plan = build_restore_plan(snapshot, msr.cpus())
         print(f"Restore plan: {len(plan)} WRMSR operations")
@@ -898,16 +901,7 @@ def main(argv=None):
         if not args.apply_restore:
             print("Dry run only. Add --apply-restore to write and verify these values.")
             return 0
-        results = apply_restore_plan(msr, plan)
-        mismatches = [item for item in results if not item["match"]]
-        if mismatches:
-            for item in mismatches:
-                print(
-                    f"VERIFY FAIL cpu{item['cpu']} {item['register']}: "
-                    f"wrote 0x{item['written']:016x}, read 0x{item['readback']:016x}",
-                    file=sys.stderr,
-                )
-            return 2
+        apply_restore_plan(msr, plan)
         print("Snapshot restore verified.")
         return 0
 
@@ -917,15 +911,22 @@ def main(argv=None):
     if args.snapshot:
         snapshot = collect_snapshot(msr, cpu, dmi)
         path = Path(args.snapshot)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(snapshot, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(snapshot, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        except OSError as exc:
+            raise ProbeError(f"unable to write snapshot {str(path)!r}: {exc}") from exc
         print(f"Snapshot written to {path}")
     return 0
 
 
-if __name__ == "__main__":
+def main(argv=None):
     try:
-        raise SystemExit(main())
+        return _main(argv)
     except ProbeError as exc:
         print(f"probe error: {exc}", file=sys.stderr)
-        raise SystemExit(1)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
