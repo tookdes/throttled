@@ -107,7 +107,8 @@ SNAPSHOT_RESTORE_MASKS = {
     "MSR_PKG_POWER_LIMIT": PKG_POWER_PROGRAMMABLE_MASK,
     "MSR_TEMPERATURE_TARGET": 0x3F << 24,
     "MSR_CONFIG_TDP_CONTROL": 0x3,
-    "MSR_TURBO_RATIO_LIMIT": 0xFFFFFFFFFFFFFFFF,
+    # EliteBook 830 G6 is a 4-core Whiskey Lake-U target: restore only 1C..4C ratios.
+    "MSR_TURBO_RATIO_LIMIT": 0xFFFFFFFF,
     "IA32_HWP_REQUEST_PKG": 0xFF << 24,
     "MSR_POWER_CTL": 1,
     "IA32_HWP_REQUEST": 0xFF << 24,
@@ -1280,9 +1281,15 @@ def _main(argv=None):
         validate_snapshot_identity(snapshot, cpu, dmi)
         validate_snapshot_completeness(snapshot, current_cpus)
         plan = build_restore_plan(snapshot, current_cpus)
-        print(f"Restore plan: {len(plan)} WRMSR operations")
-        for logical_cpu, name, value in plan:
-            print(f"  cpu{logical_cpu}: {name} <- 0x{value:016x}")
+        print(f"Restore plan: {len(plan)} managed-field WRMSR operations")
+        for logical_cpu, name, saved in plan:
+            current = msr.read(logical_cpu, name)
+            target = _safe_restore_value(msr, logical_cpu, name, current, saved)
+            mask = SNAPSHOT_RESTORE_MASKS[name]
+            print(
+                f"  cpu{logical_cpu}: {name} mask=0x{mask:016x} "
+                f"current=0x{current:016x} -> target=0x{target:016x}"
+            )
         backends = snapshot.get("power_backends") or {}
         if backends.get("kernel_mmio") is not None:
             print("  backend: restore captured intel-rapl-mmio PL1/PL2 watts/Tau")
