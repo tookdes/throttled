@@ -43,6 +43,7 @@ from throttled_probe import (
 
 TURBO_DISABLE_BIT = 38
 BD_PROCHOT_ENABLE_BIT = 0
+BD_PROCHOT_LOCK_BIT = 23
 HWP_EPP_SHIFT = 24
 HWP_EPP_MASK = 0xFF << HWP_EPP_SHIFT
 HWP_PACKAGE_CONTROL_BIT = 42
@@ -213,6 +214,9 @@ def update_turbo(raw, enabled):
 
 
 def update_bd_prochot(raw, enabled):
+    current = bit(raw, BD_PROCHOT_ENABLE_BIT)
+    if bit(raw, BD_PROCHOT_LOCK_BIT) and current != enabled:
+        raise ControlError("BD PROCHOT is locked by MSR_POWER_CTL bit 23")
     return set_bit(raw, BD_PROCHOT_ENABLE_BIT, enabled)
 
 
