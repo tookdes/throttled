@@ -4,6 +4,7 @@ import struct
 import tempfile
 from pathlib import Path
 import unittest
+from unittest import mock
 
 import throttled_probe as probe
 
@@ -88,6 +89,7 @@ flags : fpu hwp hwp_epp hwp_act_window hwp_pkg_req
 
     def test_restore_plan_rejects_any_missing_or_unreadable_register(self):
         snapshot = {
+            "power_backends": {"kernel_mmio": None, "direct_mchbar": {"available": False}},
             "package_msrs": {
                 name: {"value": "0x1"} for name in probe.SNAPSHOT_PACKAGE_REGS
             },
@@ -105,6 +107,7 @@ flags : fpu hwp hwp_epp hwp_act_window hwp_pkg_req
             "schema_version": probe.SNAPSHOT_SCHEMA_VERSION,
             "target": probe.TARGET_DMI_PRODUCT,
             "per_cpu_msrs": {"0": {}, "1": {}},
+            "power_backends": {"kernel_mmio": None, "direct_mchbar": {"available": False}},
         }
         probe.validate_snapshot_schema(base, [0, 1])
 
@@ -177,11 +180,39 @@ flags : fpu hwp hwp_epp hwp_act_window hwp_pkg_req
             "per_cpu_msrs": {
                 "0": {name: {"value": "0x2"} for name in probe.SNAPSHOT_PER_CPU_REGS},
             },
+            "power_backends": {"kernel_mmio": None, "direct_mchbar": {"available": False}},
         }
         self.assertEqual(probe.snapshot_completeness_errors(snapshot, [0]), [])
         del snapshot["per_cpu_msrs"]["0"]["IA32_HWP_REQUEST"]
         errors = probe.snapshot_completeness_errors(snapshot, [0])
         self.assertTrue(any("IA32_HWP_REQUEST" in error for error in errors))
+
+    def test_full_restore_verifies_captured_powercap_backend(self):
+        msr = FakeMsr({(0, "MSR_PKG_POWER_LIMIT"): 0x2222})
+        plan = [(0, "MSR_PKG_POWER_LIMIT", 0x1111)]
+        saved_powercap = {
+            "pl1": {"power_limit_uw": 15000000, "time_window_us": 28000000},
+            "pl2": {"power_limit_uw": 44000000, "time_window_us": 2440},
+        }
+        snapshot = {
+            "package_msrs": {"MSR_PKG_POWER_LIMIT": {"value": "0x0000000000001111"}},
+            "power_backends": {
+                "kernel_mmio": saved_powercap,
+                "direct_mchbar": {"available": False},
+            },
+        }
+        zone = mock.Mock()
+        zone.snapshot.return_value = {
+            "pl1": {"power_limit_uw": 10000000, "time_window_us": 1000000},
+            "pl2": {"power_limit_uw": 20000000, "time_window_us": 1000},
+        }
+        zone.restore.return_value = saved_powercap
+
+        with mock.patch.object(probe, "find_mmio_package_zone", return_value=zone):
+            probe.apply_full_restore(msr, plan, snapshot)
+
+        self.assertEqual(msr.values[(0, "MSR_PKG_POWER_LIMIT")], 0x1111)
+        zone.restore.assert_called_once_with(saved_powercap)
 
     def test_restore_rolls_back_after_write_failure(self):
         msr = FakeMsr(
