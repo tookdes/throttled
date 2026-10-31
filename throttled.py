@@ -1796,17 +1796,17 @@ def main():
 
     args = build_arg_parser().parse_args()
 
+    if getattr(args, 'probe', False):
+        from throttled_probe import main as probe_main
+
+        return probe_main([])
+
     if args.log:
         try:
             args.log = open(args.log, 'w')
         except OSError as e:
             args.log = None
             fatal(f'Unable to write to the log file: {e}')
-
-    if getattr(args, 'probe', False):
-        from throttled_probe import main as probe_main
-
-        return probe_main([])
 
     log('[I] Loading config file.')
     config = load_config()
@@ -1865,4 +1865,4 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())
