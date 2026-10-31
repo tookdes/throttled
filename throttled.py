@@ -1289,8 +1289,60 @@ def write_msr_field_verified(msr_name, cpu, mask, desired_bits, label):
     )
 
 
+def write_msr_fields_transaction(fields):
+    """Apply multiple managed MSR fields atomically enough for daemon profile updates.
+
+    Each item is (msr_name, cpu, mask, desired_bits, label). On any write or
+    verify failure, every field whose write was attempted is restored to its
+    pre-transaction managed bits and verified.
+    """
+    prepared = []
+    for msr_name, cpu, mask, desired_bits, label in fields:
+        original = readmsr(msr_name, cpu=cpu)
+        target = (original & ~mask) | (desired_bits & mask)
+        prepared.append((msr_name, cpu, mask, original, target, label))
+
+    attempted = []
+    results = {}
+    try:
+        for msr_name, cpu, mask, original, target, label in prepared:
+            if target == original:
+                results[(msr_name, cpu)] = original
+                continue
+            attempted.append((msr_name, cpu, mask, original, label))
+            writemsr(msr_name, target, cpu=cpu)
+            readback = readmsr(msr_name, cpu=cpu)
+            if (readback & mask) != (target & mask):
+                raise OSError(
+                    f'{label} verify failed on CPU {cpu:d}: '
+                    f'expected 0x{target & mask:x}, read 0x{readback & mask:x}'
+                )
+            results[(msr_name, cpu)] = readback
+    except (OSError, IOError) as exc:
+        rollback_errors = []
+        for msr_name, cpu, mask, original, label in reversed(attempted):
+            try:
+                current = readmsr(msr_name, cpu=cpu)
+                rollback_target = (current & ~mask) | (original & mask)
+                if rollback_target != current:
+                    writemsr(msr_name, rollback_target, cpu=cpu)
+                verify = readmsr(msr_name, cpu=cpu)
+                if (verify & mask) != (original & mask):
+                    rollback_errors.append(f'{label} CPU {cpu:d}: verify mismatch')
+            except (OSError, IOError) as rollback_exc:
+                rollback_errors.append(f'{label} CPU {cpu:d}: {rollback_exc}')
+        suffix = (
+            f'; rollback issues: {"; ".join(rollback_errors)}'
+            if rollback_errors
+            else '; transaction rollback verified'
+        )
+        raise OSError(f'MSR field transaction failed: {exc}{suffix}') from exc
+
+    return results
+
+
 def set_hwp_epp(epp):
-    """Set HWP EPP, including the package request when package control is active."""
+    """Set HWP EPP as one package/per-CPU managed-field transaction."""
     if epp is None or 'HWP' in UNSUPPORTED_FEATURES:
         return
     if not isinstance(epp, int) or not 0 <= epp <= 255:
@@ -1308,27 +1360,31 @@ def set_hwp_epp(epp):
         package_control = package_control or bool((cur_val >> 42) & 1)
 
     epp_mask = 0xFF << 24
+    fields = []
     if package_control:
-        readback = write_msr_field_verified(
+        fields.append((
             'IA32_HWP_REQUEST_PKG',
             0,
             epp_mask,
             epp << 24,
             'HWP package EPP',
-        )
-        if args.debug:
-            log(f'[D] HWP package - EPP "{(readback >> 24) & 0xFF:#02x}" - match {OK}')
-
-    # A CPU that disappears mid-loop is fatal rather than falling back to a broadcast write.
-    for cpu, cur_val in requests:
-        readback = write_msr_field_verified(
+        ))
+    for cpu, _ in requests:
+        fields.append((
             'IA32_HWP_REQUEST',
             cpu,
             epp_mask,
             epp << 24,
             f'HWP CPU {cpu:d} EPP',
-        )
-        if args.debug:
+        ))
+
+    results = write_msr_fields_transaction(fields)
+    if args.debug:
+        if package_control:
+            readback = results[('IA32_HWP_REQUEST_PKG', 0)]
+            log(f'[D] HWP package - EPP "{(readback >> 24) & 0xFF:#02x}" - match {OK}')
+        for cpu, _ in requests:
+            readback = results[('IA32_HWP_REQUEST', cpu)]
             log(f'[D] HWP CPU {cpu:d} - EPP "{(readback >> 24) & 0xFF:#02x}" - match {OK}')
 
 
@@ -1415,39 +1471,51 @@ def _bdprochot_setting(config, source=None):
 
 
 def set_turbo(enabled):
-    """Set IA32_MISC_ENABLE[38] without disturbing unrelated bits."""
+    """Set IA32_MISC_ENABLE[38] transactionally across online CPUs."""
     if enabled is None:
         return
     mask = 1 << TURBO_DISABLE_BIT
     desired = 0 if enabled else mask
-    for addr in _ensure_msr_module():
-        cpu = int(os.path.basename(os.path.dirname(addr)))
-        readback = write_msr_field_verified('IA32_MISC_ENABLE', cpu, mask, desired, 'Turbo Disable')
-        if args.debug:
+    cpus = [int(os.path.basename(os.path.dirname(addr))) for addr in _ensure_msr_module()]
+    fields = [
+        ('IA32_MISC_ENABLE', cpu, mask, desired, 'Turbo Disable')
+        for cpu in cpus
+    ]
+    results = write_msr_fields_transaction(fields)
+    if args.debug:
+        expected = 0 if enabled else 1
+        for cpu in cpus:
+            readback = results[('IA32_MISC_ENABLE', cpu)]
             read_value = (readback >> TURBO_DISABLE_BIT) & 1
-            expected = 0 if enabled else 1
-            log(f'[D] Turbo CPU {cpu:d} - disable={read_value:d} - match {OK if read_value == expected else ERR}')
+            log(
+                f'[D] Turbo CPU {cpu:d} - disable={read_value:d} '
+                f'- match {OK if read_value == expected else ERR}'
+            )
+
 
 
 def set_bdprochot(enabled):
-    """Set or clear MSR_POWER_CTL[0] per CPU without copying unrelated bits."""
+    """Set MSR_POWER_CTL[0] transactionally across online CPUs."""
     if enabled is None:
         return
     expected = 1 if enabled else 0
     mask = 1 << BD_PROCHOT_ENABLE_BIT
-    for addr in _ensure_msr_module():
-        cpu = int(os.path.basename(os.path.dirname(addr)))
-        cur_val = readmsr('MSR_POWER_CTL', cpu=cpu)
-        readback = write_msr_field_verified(
-            'MSR_POWER_CTL',
-            cpu,
-            mask,
-            mask if enabled else 0,
-            'BD PROCHOT',
-        )
-        if args.debug:
+    desired = mask if enabled else 0
+    cpus = [int(os.path.basename(os.path.dirname(addr))) for addr in _ensure_msr_module()]
+    fields = [
+        ('MSR_POWER_CTL', cpu, mask, desired, 'BD PROCHOT')
+        for cpu in cpus
+    ]
+    results = write_msr_fields_transaction(fields)
+    if args.debug:
+        for cpu in cpus:
+            readback = results[('MSR_POWER_CTL', cpu)]
             read_value = 1 if readback & mask else 0
-            log(f'[D] BDPROCHOT CPU {cpu:d} - state "{read_value:#02x}" - match {OK if read_value == expected else ERR}')
+            log(
+                f'[D] BDPROCHOT CPU {cpu:d} - state "{read_value:#02x}" '
+                f'- match {OK if read_value == expected else ERR}'
+            )
+
 
 
 def set_disable_bdprochot():
