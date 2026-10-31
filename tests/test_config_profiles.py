@@ -77,6 +77,86 @@ class ConfigProfileTests(unittest.TestCase):
         self.assertEqual(regs['AC']['MSR_TEMPERATURE_TARGET'], 10 << 24)
         self.assertNotIn('BATTERY', regs)
 
+    def test_boolean_only_tpl_profile_preserves_unspecified_live_flags(self):
+        throttled = load_throttled()
+        config = throttled.configparser.ConfigParser()
+        config.add_section('AC')
+        config.set('AC', 'Update_Rate_s', '5')
+        config.set('AC', 'PL1_Clamp', 'True')
+
+        current_raw = throttled._encode_pkg_power_limit(
+            120,
+            10,
+            352,
+            5,
+            pl1_enabled=False,
+            pl1_clamp=False,
+            pl2_enabled=True,
+            pl2_clamp=True,
+        )
+        current = {
+            'RAW': current_raw,
+            'LOCKED': False,
+            'PL1': 120,
+            'PL1_ENABLED': False,
+            'PL1_CLAMP': False,
+            'TW1': 10,
+            'PL2': 352,
+            'PL2_ENABLED': True,
+            'PL2_CLAMP': True,
+            'TW2': 5,
+        }
+
+        with mock.patch.object(throttled, 'warning'):
+            with mock.patch.object(throttled, 'get_cur_pkg_power_limits', return_value=current):
+                with mock.patch.object(throttled, 'get_power_unit', side_effect=AssertionError('not needed')):
+                    regs = throttled.calc_reg_values(
+                        {'feature_programmable_temperature_target': 0, 'feature_programmable_tdp_limit': 0},
+                        config,
+                    )
+
+        raw = regs['AC']['MSR_PKG_POWER_LIMIT']
+        self.assertFalse(bool((raw >> 15) & 1))
+        self.assertTrue(bool((raw >> 16) & 1))
+        self.assertTrue(bool((raw >> 47) & 1))
+        self.assertTrue(bool((raw >> 48) & 1))
+        self.assertEqual(raw & 0x7FFF, 120)
+        self.assertEqual((raw >> 32) & 0x7FFF, 352)
+
+    def test_numeric_tpl_profile_keeps_historical_boolean_defaults(self):
+        throttled = load_throttled()
+        config = throttled.configparser.ConfigParser()
+        config.add_section('AC')
+        config.set('AC', 'Update_Rate_s', '5')
+        config.set('AC', 'PL1_Tdp_W', '25')
+
+        current = {
+            'RAW': 0,
+            'LOCKED': False,
+            'PL1': 120,
+            'PL1_ENABLED': False,
+            'PL1_CLAMP': False,
+            'TW1': 10,
+            'PL2': 352,
+            'PL2_ENABLED': False,
+            'PL2_CLAMP': True,
+            'TW2': 5,
+        }
+
+        with mock.patch.object(throttled, 'warning'):
+            with mock.patch.object(throttled, 'get_cur_pkg_power_limits', return_value=current):
+                with mock.patch.object(throttled, 'get_power_unit', return_value=1):
+                    regs = throttled.calc_reg_values(
+                        {'feature_programmable_temperature_target': 0, 'feature_programmable_tdp_limit': 0},
+                        config,
+                    )
+
+        raw = regs['AC']['MSR_PKG_POWER_LIMIT']
+        self.assertTrue(bool((raw >> 15) & 1))
+        self.assertTrue(bool((raw >> 16) & 1))
+        self.assertTrue(bool((raw >> 47) & 1))
+        self.assertFalse(bool((raw >> 48) & 1))
+
     def test_power_thread_uses_configured_update_rate_when_current_profile_is_missing(self):
         throttled = load_throttled()
         throttled.power['source'] = 'BATTERY'

@@ -12,7 +12,7 @@ class MMIOError(IOError):
 
 
 class MMIO(object):
-    def __init__(self, physaddr: int, size: int) -> None:
+    def __init__(self, physaddr: int, size: int, readonly: bool = False) -> None:
         """Instantiate an MMIO object and map the region of physical memory
         specified by the address base `physaddr` and size `size` in bytes.
         Args:
@@ -25,6 +25,7 @@ class MMIO(object):
             TypeError: if `physaddr` or `size` types are invalid.
         """
         self.mapping = None
+        self._readonly = readonly
         self._open(physaddr, size)
 
     def __del__(self):
@@ -50,7 +51,8 @@ class MMIO(object):
         self._aligned_size = size + (physaddr - self._aligned_physaddr)
 
         try:
-            fd = os.open("/dev/mem", os.O_RDWR | os.O_SYNC)
+            flags = os.O_RDONLY if self._readonly else os.O_RDWR
+            fd = os.open("/dev/mem", flags | os.O_SYNC)
         except OSError as e:
             raise MMIOError(e.errno, "Opening /dev/mem: " + e.strerror)
 
@@ -59,7 +61,7 @@ class MMIO(object):
                 fd,
                 self._aligned_size,
                 flags=mmap.MAP_SHARED,
-                prot=mmap.PROT_READ | mmap.PROT_WRITE,
+                prot=mmap.PROT_READ if self._readonly else mmap.PROT_READ | mmap.PROT_WRITE,
                 offset=self._aligned_physaddr,
             )
         except OSError as e:
@@ -108,6 +110,8 @@ class MMIO(object):
             TypeError: if `offset` or `value` type are invalid.
             ValueError: if `offset` or `value` are out of bounds.
         """
+        if self._readonly:
+            raise MMIOError("MMIO mapping is read-only")
         if not isinstance(offset, int):
             raise TypeError("Invalid offset type, should be integer.")
         if not isinstance(value, int):
@@ -130,6 +134,8 @@ class MMIO(object):
 
     def write64(self, offset: int, value: int) -> None:
         """Write 64-bits to the specified `offset` in bytes, relative to the base physical address of the MMIO region."""
+        if self._readonly:
+            raise MMIOError("MMIO mapping is read-only")
         if not isinstance(offset, int):
             raise TypeError("Invalid offset type, should be integer.")
         if not isinstance(value, int):

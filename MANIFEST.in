@@ -4,6 +4,7 @@ include requirements.txt
 include nfpm.yaml
 include docs/static-power-limits.md
 include docs/supported-hardware.md
+include docs/elitebook-830-g6.md
 recursive-include etc *
 recursive-include openrc *
 recursive-include packaging *

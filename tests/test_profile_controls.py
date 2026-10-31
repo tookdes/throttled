@@ -1,0 +1,292 @@
+import configparser
+import importlib.util
+import os
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def load_throttled():
+    spec = importlib.util.spec_from_file_location("throttled_under_test", ROOT / "throttled.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.args = SimpleNamespace(log=None, debug=False, config="/tmp/throttled.conf", monitor=None)
+    module.log_history.clear()
+    module.power["source"] = "AC"
+    module.power["method"] = "dbus"
+    return module
+
+
+def make_config(sections):
+    config = configparser.ConfigParser()
+    for section, options in sections.items():
+        config.add_section(section)
+        for key, value in options.items():
+            config.set(section, key, str(value))
+    return config
+
+
+class ProfileControlTests(unittest.TestCase):
+    def test_hwp_epp_prefers_direct_profile_value(self):
+        throttled = load_throttled()
+        config = make_config(
+            {
+                "AC": {"HWP_EPP": 32, "HWP_Mode": False},
+                "BATTERY": {"HWP_EPP": 180},
+            }
+        )
+
+        self.assertEqual(throttled._hwp_epp(config, "AC"), 32)
+        self.assertEqual(throttled._hwp_epp(config, "BATTERY"), 180)
+
+    def test_missing_power_profile_is_safe_for_new_controls(self):
+        throttled = load_throttled()
+        config = make_config({'AC': {'HWP_Mode': True, 'Disable_Turbo': False}})
+
+        self.assertEqual(throttled._hwp_epp(config, 'BATTERY'), throttled.HWP_DEFAULT_VALUE)
+        self.assertIsNone(throttled._turbo_setting(config, 'BATTERY'))
+        self.assertIsNone(throttled._bdprochot_setting(config, 'BATTERY'))
+
+        throttled.power['source'] = None
+        self.assertIsNone(throttled._hwp_epp(config))
+        self.assertIsNone(throttled._turbo_setting(config))
+        self.assertIsNone(throttled._bdprochot_setting(config))
+
+    def test_hwp_epp_keeps_legacy_hwp_mode_semantics(self):
+        throttled = load_throttled()
+        config = make_config({"AC": {"HWP_Mode": True}})
+
+        self.assertEqual(throttled._hwp_epp(config, "AC"), throttled.HWP_PERFORMANCE_VALUE)
+        self.assertEqual(throttled._hwp_epp(config, "BATTERY"), throttled.HWP_DEFAULT_VALUE)
+
+    def test_legacy_hwp_false_is_not_periodically_reasserted(self):
+        throttled = load_throttled()
+        config = make_config({"AC": {"HWP_Mode": False}})
+        self.assertEqual(throttled._hwp_epp(config, "AC"), throttled.HWP_DEFAULT_VALUE)
+        self.assertFalse(throttled._hwp_should_reassert(config, "AC"))
+        self.assertFalse(throttled._hwp_should_apply_event(config, "AC"))
+
+    def test_legacy_hwp_true_reasserts_only_on_ac_but_handles_source_events(self):
+        throttled = load_throttled()
+        config = make_config({"AC": {"HWP_Mode": True}})
+        self.assertTrue(throttled._hwp_should_reassert(config, "AC"))
+        self.assertFalse(throttled._hwp_should_reassert(config, "BATTERY"))
+        self.assertTrue(throttled._hwp_should_apply_event(config, "AC"))
+        self.assertTrue(throttled._hwp_should_apply_event(config, "BATTERY"))
+
+    def test_set_hwp_epp_preserves_each_cpu_request(self):
+        throttled = load_throttled()
+        current = {
+            0: 0x0000000011223344,
+            2: 0x0000000055667788,
+        }
+        original = dict(current)
+
+        def readmsr(name, *args, cpu=None, **kwargs):
+            if name == "IA32_PM_ENABLE":
+                return 1
+            self.assertEqual(name, "IA32_HWP_REQUEST")
+            return current[cpu]
+
+        def writemsr(name, value, cpu=None):
+            self.assertEqual(name, "IA32_HWP_REQUEST")
+            current[cpu] = value
+
+        with mock.patch.object(throttled, "_ensure_msr_module", return_value=["/dev/cpu/0/msr", "/dev/cpu/2/msr"]):
+            with mock.patch.object(throttled, "readmsr", side_effect=readmsr):
+                with mock.patch.object(throttled, "writemsr", side_effect=writemsr) as write:
+                    throttled.set_hwp_epp(0x20)
+
+        self.assertEqual(
+            write.call_args_list,
+            [
+                mock.call("IA32_HWP_REQUEST", (original[0] & 0xFFFFFFFF00FFFFFF) | (0x20 << 24), cpu=0),
+                mock.call("IA32_HWP_REQUEST", (original[2] & 0xFFFFFFFF00FFFFFF) | (0x20 << 24), cpu=2),
+            ],
+        )
+
+    def test_set_hwp_epp_updates_package_request_when_package_control_is_set(self):
+        throttled = load_throttled()
+        current = {
+            0: (1 << 42) | 0x00112233,
+            1: (1 << 42) | 0x00445566,
+        }
+        state = {"package": 0xABCDEF0012345678}
+        package = state["package"]
+
+        def readmsr(name, *args, cpu=None, **kwargs):
+            if name == "IA32_PM_ENABLE":
+                return 1
+            if name == "IA32_HWP_REQUEST_PKG":
+                return state["package"]
+            return current[cpu]
+
+        def writemsr(name, value, cpu=None):
+            if name == "IA32_HWP_REQUEST_PKG":
+                state["package"] = value
+            else:
+                current[cpu] = value
+
+        with mock.patch.object(throttled, "_ensure_msr_module", return_value=["/dev/cpu/0/msr", "/dev/cpu/1/msr"]):
+            with mock.patch.object(throttled, "readmsr", side_effect=readmsr):
+                with mock.patch.object(throttled, "writemsr", side_effect=writemsr) as write:
+                    throttled.set_hwp_epp(0x80)
+
+        self.assertEqual(write.call_args_list[0], mock.call(
+            "IA32_HWP_REQUEST_PKG",
+            (package & 0xFFFFFFFF00FFFFFF) | (0x80 << 24),
+            cpu=0,
+        ))
+        self.assertEqual(len(write.call_args_list), 3)
+
+    def test_set_hwp_epp_skips_when_hwp_is_disabled(self):
+        throttled = load_throttled()
+        with mock.patch.object(throttled, "readmsr", return_value=0):
+            with mock.patch.object(throttled, "_ensure_msr_module") as ensure:
+                with mock.patch.object(throttled, "writemsr") as write:
+                    with mock.patch.object(throttled, "warning"):
+                        throttled.set_hwp_epp(0x20)
+        ensure.assert_not_called()
+        write.assert_not_called()
+
+    def test_bdprochot_profile_setting_preserves_legacy_semantics(self):
+        throttled = load_throttled()
+
+        explicit = make_config({"AC": {"BDPROCHOT_Enabled": False, "Disable_BDPROCHOT": False}})
+        self.assertIs(throttled._bdprochot_setting(explicit, "AC"), False)
+
+        legacy_disable = make_config({"AC": {"Disable_BDPROCHOT": True}})
+        self.assertIs(throttled._bdprochot_setting(legacy_disable, "AC"), False)
+
+        legacy_false = make_config({"AC": {"Disable_BDPROCHOT": False}})
+        self.assertIsNone(throttled._bdprochot_setting(legacy_false, "AC"))
+
+        untouched = make_config({"AC": {}})
+        self.assertIsNone(throttled._bdprochot_setting(untouched, "AC"))
+
+    def test_turbo_and_bd_prochot_are_reversible(self):
+        throttled = load_throttled()
+        cpu_values = {0: 0, 1: 0}
+
+        def read_turbo(name, *args, cpu=None, **kwargs):
+            return cpu_values[cpu]
+
+        def write_turbo(name, value, cpu=None):
+            cpu_values[cpu] = value
+
+        with mock.patch.object(throttled, "_ensure_msr_module", return_value=["/dev/cpu/0/msr", "/dev/cpu/1/msr"]):
+            with mock.patch.object(throttled, "readmsr", side_effect=read_turbo):
+                with mock.patch.object(throttled, "writemsr", side_effect=write_turbo) as write:
+                    throttled.set_turbo(False)
+
+        self.assertTrue(all(call.args[1] & (1 << throttled.TURBO_DISABLE_BIT) for call in write.call_args_list))
+
+        bd_values = {0: 0, 1: 0}
+        with mock.patch.object(throttled, "_ensure_msr_module", return_value=["/dev/cpu/0/msr", "/dev/cpu/1/msr"]):
+            with mock.patch.object(throttled, "readmsr", side_effect=lambda name, *args, cpu=None, **kwargs: bd_values[cpu]):
+                with mock.patch.object(
+                    throttled, "writemsr", side_effect=lambda name, value, cpu=None: bd_values.__setitem__(cpu, value)
+                ) as write:
+                    throttled.set_bdprochot(True)
+        self.assertEqual(len(write.call_args_list), 2)
+        self.assertTrue(all(call.args[1] & 1 for call in write.call_args_list))
+
+        with mock.patch.object(throttled, "_ensure_msr_module", return_value=["/dev/cpu/0/msr", "/dev/cpu/1/msr"]):
+            with mock.patch.object(throttled, "readmsr", side_effect=lambda name, *args, cpu=None, **kwargs: bd_values[cpu]):
+                with mock.patch.object(
+                    throttled, "writemsr", side_effect=lambda name, value, cpu=None: bd_values.__setitem__(cpu, value)
+                ) as write:
+                    throttled.set_bdprochot(False)
+        self.assertEqual(len(write.call_args_list), 2)
+        self.assertTrue(all(not (call.args[1] & 1) for call in write.call_args_list))
+
+    def test_set_turbo_rolls_back_first_cpu_when_second_cpu_write_fails(self):
+        throttled = load_throttled()
+        state = {0: 0, 1: 0}
+        writes = []
+
+        def readmsr(name, *args, cpu=None, **kwargs):
+            return state[cpu]
+
+        def writemsr(name, value, cpu=None):
+            writes.append((cpu, value))
+            if cpu == 1 and value & (1 << throttled.TURBO_DISABLE_BIT):
+                raise OSError("synthetic cpu1 write failure")
+            state[cpu] = value
+
+        with mock.patch.object(
+            throttled,
+            "_ensure_msr_module",
+            return_value=["/dev/cpu/0/msr", "/dev/cpu/1/msr"],
+        ):
+            with mock.patch.object(throttled, "readmsr", side_effect=readmsr):
+                with mock.patch.object(throttled, "writemsr", side_effect=writemsr):
+                    with self.assertRaises(OSError):
+                        throttled.set_turbo(False)
+
+        self.assertEqual(state, {0: 0, 1: 0})
+        self.assertTrue(any(cpu == 0 and value == 0 for cpu, value in writes))
+
+    def test_set_turbo_skips_identical_register_value(self):
+        throttled = load_throttled()
+        with mock.patch.object(throttled, "_ensure_msr_module", return_value=["/dev/cpu/0/msr"]):
+            with mock.patch.object(throttled, "readmsr", return_value=0):
+                with mock.patch.object(throttled, "writemsr") as write:
+                    throttled.set_turbo(True)
+        write.assert_not_called()
+
+    def test_set_bdprochot_preserves_reserved_bit23(self):
+        throttled = load_throttled()
+        state = {"value": (1 << 23) | 1}
+
+        def readmsr(name, *args, cpu=None, **kwargs):
+            return state["value"]
+
+        def writemsr(name, value, cpu=None):
+            state["value"] = value
+
+        with mock.patch.object(throttled, "_ensure_msr_module", return_value=["/dev/cpu/0/msr"]):
+            with mock.patch.object(throttled, "readmsr", side_effect=readmsr):
+                with mock.patch.object(throttled, "writemsr", side_effect=writemsr):
+                    throttled.set_bdprochot(False)
+
+        self.assertTrue(state["value"] & (1 << 23))
+        self.assertFalse(state["value"] & 1)
+
+    def test_load_config_validates_hwp_epp_and_new_booleans(self):
+        throttled = load_throttled()
+        cases = (
+            "HWP_EPP: -1",
+            "HWP_EPP: 256",
+            "HWP_EPP: fast",
+            "Disable_Turbo: perhaps",
+            "BDPROCHOT_Enabled: perhaps",
+            "PL1_Enable: perhaps",
+            "PL1_Clamp: perhaps",
+            "PL2_Enable: perhaps",
+            "PL2_Clamp: perhaps",
+        )
+
+        for invalid in cases:
+            with self.subTest(invalid=invalid):
+                tmp = tempfile.NamedTemporaryFile("w", delete=False)
+                tmp.write(
+                    "[GENERAL]\nEnabled: True\nAutoreload: False\n"
+                    "[AC]\nUpdate_Rate_s: 5\n"
+                    + invalid
+                    + "\n"
+                )
+                tmp.close()
+                self.addCleanup(os.unlink, tmp.name)
+                throttled.args.config = tmp.name
+                with self.assertRaises(SystemExit):
+                    throttled.load_config()
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -71,23 +71,41 @@ class PowerSourceFlipTests(unittest.TestCase):
         throttled = load_throttled()
         throttled.power['source'] = 'BATTERY'
         config = make_config({'ICCMAX.AC': {'CORE': 100}})
+        desired = throttled.calc_icc_max_msr('CORE', 100) & throttled.ICCMAX_MAX_FIELD
+        state = {plane: 40 for plane in throttled.CURRENT_PLANES}
 
-        with mock.patch.object(throttled, 'writemsr') as writemsr:
-            with mock.patch.object(throttled, 'warning'):
-                throttled.set_icc_max(config, source='AC')
+        def get_icc(plane=None, convert=False):
+            return {plane: state[plane]}
 
-        writemsr.assert_called_once_with('MSR_OC_MAILBOX', throttled.calc_icc_max_msr('CORE', 100))
+        def execute(command):
+            plane_id = (command >> 40) & 0xFF
+            plane = next(name for name, value in throttled.CURRENT_PLANES.items() if value == plane_id)
+            state[plane] = command & throttled.ICCMAX_MAX_FIELD
+            return command
+
+        with mock.patch.object(throttled, 'get_icc_max', side_effect=get_icc):
+            with mock.patch.object(throttled, 'execute_oc_mailbox', side_effect=execute) as execute_mailbox:
+                with mock.patch.object(
+                    throttled,
+                    'write_daemon_oc_recovery',
+                    return_value='/var/lib/throttled/oc-backups/iccmax-test.json',
+                ):
+                    with mock.patch.object(throttled, 'warning'):
+                        throttled.set_icc_max(config, source='AC')
+
+        self.assertEqual(state['CORE'], desired)
+        execute_mailbox.assert_called_once_with(throttled.calc_icc_max_msr('CORE', 100))
 
     def test_set_icc_max_warning_honors_an_explicit_power_source(self):
         throttled = load_throttled()
         throttled.power['source'] = 'AC'
         config = make_config({'ICCMAX.AC': {'CORE': 100}})
 
-        with mock.patch.object(throttled, 'writemsr') as writemsr:
+        with mock.patch.object(throttled, 'execute_oc_mailbox') as execute:
             with mock.patch.object(throttled, 'warning') as warning:
                 throttled.set_icc_max(config, source='BATTERY')
 
-        writemsr.assert_not_called()
+        execute.assert_not_called()
         warning.assert_called_once_with('IccMax CORE is not configured for the BATTERY profile: leaving it untouched.')
 
     def test_power_flip_reapplies_undervolt_and_iccmax(self):

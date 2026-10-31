@@ -132,6 +132,125 @@ an existing `/etc/throttled.conf`, detects systemd, OpenRC, or runit, and
 enables the service. Use `--init systemd|openrc|runit` to override detection,
 or `--no-start` to install without enabling or starting it.
 
+## HP EliteBook 830 G6 / ThrottleStop replacement
+
+This fork contains a narrowly scoped Linux backend for the HP EliteBook 830 G6
+/ Whiskey Lake-U generation. The shipped configuration is **disabled by
+default**. Do not enable the daemon until the read-only hardware report has
+been reviewed.
+
+Start with the strict read-only probe:
+
+```sh
+sudo throttled --probe
+sudo throttled --probe --json
+sudo throttled --probe --snapshot /root/830g6-stock.json
+```
+
+The probe performs RDMSR, sysfs/PCI reads and a true read-only MCHBAR mapping.
+It reports DMI/CPUID identity, HWP/Speed Shift (including the effective package
+EPP when package control is active), PL1/PL2/Tau and lock bits, kernel
+`intel-rapl` / `intel-rapl-mmio` zones, the allow-listed direct MCHBAR
+mirror, TjMax/TCC, BD PROCHOT, turbo ratios and Whiskey Lake package
+performance-limit reasons. It does **not** query FIVR or IccMax because an OC
+mailbox "read" itself requires WRMSR.
+
+One-shot controls use `throttlectl`. Write paths require the 830 G6 target,
+verify readback, preserve unrelated fields and attempt rollback. They refuse to
+race an active systemd daemon; persistent daemon writes are separately
+serialized across resume, AC/battery changes and config reloads.
+
+```sh
+sudo systemctl stop throttled
+
+sudo throttlectl status
+sudo throttlectl limits
+sudo throttlectl monitor --interval 1
+
+sudo throttlectl epp 32
+sudo throttlectl turbo on
+sudo throttlectl bd-prochot on
+sudo throttlectl temp-target 90
+sudo throttlectl power --pl1 25 --pl2 44 --tau1 28
+sudo throttlectl turbo-ratio --1c 42 --2c 41 --3c 39 --4c 39
+
+# Legacy controls: rejected while HWP/Speed Shift is enabled.
+sudo throttlectl speedstep on
+sudo throttlectl multiplier 38
+
+# OC mailbox reads are WRMSR transactions, not strict read-only operations.
+sudo throttlectl fivr read
+sudo throttlectl fivr set --core -80 --cache -80
+sudo throttlectl iccmax read
+```
+
+FIVR/IccMax changes made by either `throttlectl` or an explicitly configured
+daemon profile write a root-only recovery JSON under
+`/var/lib/throttled/oc-backups/` before the first mailbox change. A
+multi-plane daemon failure rolls already changed planes back in reverse order;
+the persistent file remains available for manual recovery:
+
+```sh
+sudo throttlectl fivr restore /var/lib/throttled/oc-backups/fivr-....json
+sudo throttlectl iccmax restore /var/lib/throttled/oc-backups/iccmax-....json
+```
+
+### TPL / MMIO safety
+
+`intel-rapl-mmio` can represent watts/Tau but not every PL Enable/Clamp bit.
+The daemon and CLI therefore do not treat a successful powercap write as a
+complete TPL update.
+
+- every synchronized TPL update requires the direct package-power MCHBAR
+  mirror to pass a same-run **read-only MMIO == MSR_PKG_POWER_LIMIT**
+  preflight on an allow-listed host bridge;
+- when available, `intel-rapl-mmio` is additionally used for watts/Tau so
+  kernel min/max bounds are enforced;
+- a kernel powercap rejection is rolled back rather than bypassed with a raw
+  `/dev/mem` write;
+- if no safe MMIO backend exists the daemon skips the TPL update. The CLI only
+  permits MSR-only testing when the operator explicitly passes
+  `--no-mmio-sync`.
+
+### Stock snapshot / restore
+
+Snapshot schema v2 keeps the full raw values for diagnostics but restores only
+the bit fields this fork manages. Lock, reserved and unrelated fields are
+preserved with read-modify-write.
+
+When available, the snapshot also records the kernel `intel-rapl-mmio`
+constraints and a direct MCHBAR raw value **only if** that mirror matched MSR
+0x610 at snapshot time. An incomplete register snapshot is written for
+diagnostics but exits non-zero and is refused by restore.
+
+Restore remains deliberately two-step:
+
+```sh
+sudo python3 throttled_probe.py --restore-snapshot /root/830g6-stock.json
+sudo python3 throttled_probe.py --restore-snapshot /root/830g6-stock.json --apply-restore
+```
+
+The apply step refuses to write while a throttled daemon is active (shared
+flock plus systemd check). `--allow-daemon-race` exists only as an explicit
+unsafe override for controlled experiments.
+
+The apply step always attempts the transactional managed-MSR recovery first,
+then verifies package-scoped managed MSR views from all online CPUs. A
+cross-CPU package-view mismatch rolls the entire MSR restore back to its
+pre-restore state and skips powercap/direct-MCHBAR recovery. Only after that
+check passes are captured kernel MMIO and direct MCHBAR backends restored
+independently.
+Unlike live TPL writes, recovery deliberately does **not** require the current
+MCHBAR value to equal the current MSR value: repairing that split-brain state
+is the purpose of restore. If a captured backend is unavailable, the command
+reports a partial recovery and exits non-zero instead of discarding recovery
+that already succeeded on the other backends. FIVR/IccMax remain outside the
+strict snapshot because querying them requires WRMSR; their automatic OC
+recovery files provide the separate recovery path.
+
+See `docs/elitebook-830-g6.md` for the exact register map and remaining
+physical-hardware validation gates.
+
 ## Configuration
 
 The configuration file is `/etc/throttled.conf`. It contains separate `[AC]`
@@ -140,28 +259,26 @@ targets, and experimental controls:
 
 ```ini
 [GENERAL]
-Enabled: True
+Enabled: False
 Autoreload: True
 
 [AC]
 Update_Rate_s: 5
-PL1_Tdp_W: 44
-PL1_Duration_s: 28
-PL2_Tdp_W: 44
-PL2_Duration_S: 0.002
-Trip_Temp_C: 95
+# HWP_EPP: 32
+# PL1_Tdp_W: 25
+# PL1_Duration_s: 28
+# PL2_Tdp_W: 44
+# PL2_Duration_s: 0.002
+# Trip_Temp_C: 90
 
 [BATTERY]
 Update_Rate_s: 30
-PL1_Tdp_W: 29
-PL1_Duration_s: 28
-PL2_Tdp_W: 44
-PL2_Duration_S: 0.002
-Trip_Temp_C: 85
 ```
 
-These are project defaults, not recommendations for every system. Check your
-processor limits and cooling capacity before changing them. The service reloads
+The shipped profile is intentionally inert until individual controls and
+`Enabled: True` are explicitly selected. Example values are syntax examples,
+not recommendations. Check the probe report, processor limits and cooling
+capacity before changing them. The service reloads
 valid configuration changes automatically when `Autoreload` is enabled.
 
 ### Undervolting and IccMax

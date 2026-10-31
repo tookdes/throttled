@@ -30,28 +30,36 @@ class HWPPerCpuTests(unittest.TestCase):
             0: 0xAAAABBBB01020304,
             2: 0x1111222233445566,
         }
+        original = dict(current)
 
         def readmsr(msr, *args, cpu=None, **kwargs):
+            if msr == 'IA32_PM_ENABLE':
+                return 1
             self.assertEqual(msr, 'IA32_HWP_REQUEST')
             return current[cpu]
 
+        def writemsr(msr, value, cpu=None):
+            self.assertEqual(msr, 'IA32_HWP_REQUEST')
+            current[cpu] = value
+
         with mock.patch.object(throttled, '_ensure_msr_module', return_value=['/dev/cpu/0/msr', '/dev/cpu/2/msr']):
             with mock.patch.object(throttled, 'readmsr', side_effect=readmsr):
-                with mock.patch.object(throttled, 'writemsr') as writemsr:
+                with mock.patch.object(throttled, 'writemsr', side_effect=writemsr) as write:
                     throttled.set_hwp(True)
 
         expected = [
             mock.call(
                 'IA32_HWP_REQUEST',
-                (current[0] & 0xFFFFFFFF00FFFFFF) | (throttled.HWP_PERFORMANCE_VALUE << 24),
+                (original[0] & 0xFFFFFFFF00FFFFFF) | (throttled.HWP_PERFORMANCE_VALUE << 24),
                 cpu=0,
             ),
             mock.call(
                 'IA32_HWP_REQUEST',
-                (current[2] & 0xFFFFFFFF00FFFFFF) | (throttled.HWP_PERFORMANCE_VALUE << 24),
+                (original[2] & 0xFFFFFFFF00FFFFFF) | (throttled.HWP_PERFORMANCE_VALUE << 24),
                 cpu=2,
             ),
         ]
+        writemsr = write
         self.assertEqual(writemsr.call_args_list, expected)
 
     def test_writemsr_cpu_targets_one_msr_device(self):
@@ -115,12 +123,17 @@ class HWPPerCpuTests(unittest.TestCase):
         self.assertEqual(exit_context.exception.code, 1)
         self.assertIn('CPU 2 went offline while reading MSR IA32_HWP_REQUEST (774); aborting.', stderr.getvalue())
 
-    def test_hwp_probe_writes_back_only_cpu0(self):
+    def test_hwp_probe_is_read_only_after_pm_enable_check(self):
         throttled = load_throttled()
 
         def readmsr(msr, *args, cpu=None, **kwargs):
-            self.assertEqual((msr, cpu), ('IA32_HWP_REQUEST', 0))
-            return 0x1234
+            if msr == 'IA32_PM_ENABLE':
+                self.assertEqual(cpu, 0)
+                return 1
+            if msr == 'IA32_HWP_REQUEST':
+                self.assertEqual(cpu, 0)
+                return 0x1234
+            raise AssertionError(msr)
 
         with mock.patch.object(throttled, 'get_undervolt', return_value={'CORE': 0}):
             with mock.patch.object(throttled, 'get_icc_max', return_value={'CORE': 0}):
@@ -128,7 +141,7 @@ class HWPPerCpuTests(unittest.TestCase):
                     with mock.patch.object(throttled, 'writemsr') as writemsr:
                         throttled.test_msr_rw_capabilities()
 
-        writemsr.assert_called_once_with('IA32_HWP_REQUEST', 0x1234, cpu=0)
+        writemsr.assert_not_called()
 
 
 if __name__ == '__main__':

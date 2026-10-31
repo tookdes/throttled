@@ -2,8 +2,10 @@
 import argparse
 import asyncio
 import configparser
+import fcntl
 import glob
 import gzip
+import json
 import math
 import os
 import re
@@ -12,14 +14,25 @@ import subprocess
 import sys
 import traceback
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from errno import EACCES, EIO, ENOENT, EPERM
 from platform import uname
 from subprocess import check_output, CalledProcessError, PIPE
 from threading import Event, Lock, Thread, current_thread, main_thread
-from time import time
+from time import monotonic, sleep, time
 
 from mmio import MMIO, MMIOError
+from throttled_powercap import PowercapError, find_mmio_package_zone
+from throttled_probe import TARGET_DMI_PRODUCT, read_cpuinfo as probe_read_cpuinfo, read_dmi as probe_read_dmi
+from throttled_mchbar import (
+    MCHBAR_ADDRESS_MASKS_BY_PCI_DEVICE,
+    MCHBAR_ENABLE_BIT,
+    MCHBAR_PACKAGE_POWER_LIMIT_OFFSET,
+    MCHBAR_PACKAGE_POWER_LIMIT_SIZE,
+    MCHBAR_ADDRESS_MASK_39_15,
+    MCHBAR_ADDRESS_MASK_39_17,
+    MCHBAR_ADDRESS_MASK_42_17,
+)
 from throttled_version import __version__
 
 DEFAULT_SYSFS_POWER_PATH = '/sys/class/power_supply/AC*/online'
@@ -34,15 +47,20 @@ CURRENT_PLANES = {'CORE': 0, 'GPU': 1, 'CACHE': 2}
 TRIP_TEMP_RANGE = [40, 97]
 PKG_POWER_LIMIT_POWER_MASK = (1 << 15) - 1
 PKG_POWER_LIMIT_TIME_WINDOW_MASK = (1 << 7) - 1
+PKG_POWER_LIMIT_LOCK_BIT = 63
 POWER_PROFILES = ('AC', 'BATTERY')
 UNDERVOLT_KEYS = ('UNDERVOLT', 'UNDERVOLT.AC', 'UNDERVOLT.BATTERY')
 ICCMAX_KEYS = ('ICCMAX', 'ICCMAX.AC', 'ICCMAX.BATTERY')
+DAEMON_LOCK_PATH = '/run/throttled/daemon.lock'
+_daemon_lock_file = None
 power = {'source': None, 'method': 'polling'}
-# serializes config publication with the resume callback's read-then-write
+# Serialize config/source publication separately from low-level hardware writes.
 config_lock = Lock()
+hardware_lock = Lock()
 MSR_DICT = {
     'MSR_PLATFORM_INFO': 0xCE,
     'MSR_OC_MAILBOX': 0x150,
+    'IA32_MISC_ENABLE': 0x1A0,
     'IA32_PERF_STATUS': 0x198,
     'IA32_THERM_STATUS': 0x19C,
     'MSR_TEMPERATURE_TARGET': 0x1A2,
@@ -53,220 +71,31 @@ MSR_DICT = {
     'MSR_DRAM_ENERGY_STATUS': 0x619,
     'MSR_PP1_ENERGY_STATUS': 0x641,
     'MSR_CONFIG_TDP_CONTROL': 0x64B,
+    'IA32_PM_ENABLE': 0x770,
+    'IA32_HWP_REQUEST_PKG': 0x772,
     'IA32_HWP_REQUEST': 0x774,
 }
 
 HWP_PERFORMANCE_VALUE = 0x20
 HWP_DEFAULT_VALUE = 0x80
 HWP_INTERVAL = 60
+TURBO_DISABLE_BIT = 38
+BD_PROCHOT_ENABLE_BIT = 0
 UNDERVOLT_TICKS_PER_MV = 1.024
 UNDERVOLT_MIN_TICKS = -(1 << 10)
 UNDERVOLT_MAX_TICKS = 0
 ICCMAX_STEPS_PER_A = 4
 ICCMAX_MAX_FIELD = 0x3FF
-MCHBAR_ENABLE_BIT = 1
-MCHBAR_PACKAGE_POWER_LIMIT_OFFSET = 0x59A0
-MCHBAR_PACKAGE_POWER_LIMIT_SIZE = 8
+OC_MAILBOX_BUSY_BIT = 63
+OC_MAILBOX_STATUS_SHIFT = 32
+OC_MAILBOX_STATUS_MASK = 0xFF
+OC_MAILBOX_TIMEOUT_S = 0.05
+OC_MAILBOX_POLL_S = 0.00001
+OC_BACKUP_DIR = '/var/lib/throttled/oc-backups'
+OC_BACKUP_SCHEMA_VERSION = 1
 PCI_HOST_BRIDGE_SYSFS_PATH = '/sys/bus/pci/devices/0000:00:00.0'
 PCI_VENDOR_ID_INTEL = 0x8086
-# The masked address bits also encode the per-generation window alignment, so
-# rejecting any bit outside the mask fully validates the BAR before /dev/mem
-# is ever opened.
-MCHBAR_ADDRESS_MASK_39_15 = ((1 << 39) - 1) & ~((1 << 15) - 1)
-MCHBAR_ADDRESS_MASK_39_17 = ((1 << 39) - 1) & ~((1 << 17) - 1)
-MCHBAR_ADDRESS_MASK_42_17 = ((1 << 42) - 1) & ~((1 << 17) - 1)
 
-
-platform_info_bits = {
-    'maximum_non_turbo_ratio': [8, 15],
-    'maximum_efficiency_ratio': [40, 47],
-    'minimum_operating_ratio': [48, 55],
-    'feature_ppin_cap': [23, 23],
-    'feature_programmable_turbo_ratio': [28, 28],
-    'feature_programmable_tdp_limit': [29, 29],
-    'number_of_additional_tdp_profiles': [33, 34],
-    'feature_programmable_temperature_target': [30, 30],
-    'feature_low_power_mode': [32, 32],
-}
-
-thermal_status_bits = {
-    'thermal_limit_status': [0, 0],
-    'thermal_limit_log': [1, 1],
-    'prochot_or_forcepr_status': [2, 2],
-    'prochot_or_forcepr_log': [3, 3],
-    'crit_temp_status': [4, 4],
-    'crit_temp_log': [5, 5],
-    'thermal_threshold1_status': [6, 6],
-    'thermal_threshold1_log': [7, 7],
-    'thermal_threshold2_status': [8, 8],
-    'thermal_threshold2_log': [9, 9],
-    'power_limit_status': [10, 10],
-    'power_limit_log': [11, 11],
-    'current_limit_status': [12, 12],
-    'current_limit_log': [13, 13],
-    'cross_domain_limit_status': [14, 14],
-    'cross_domain_limit_log': [15, 15],
-    'cpu_temp': [16, 22],
-    'temp_resolution': [27, 30],
-    'reading_valid': [31, 31],
-}
-
-supported_cpus = {
-    (6, 26, 1): 'Nehalem',
-    (6, 26, 2): 'Nehalem-EP',
-    (6, 26, 4): 'Bloomfield',
-    (6, 28, 2): 'Silverthorne',
-    (6, 28, 10): 'PineView',
-    (6, 29, 0): 'Dunnington-6C',
-    (6, 29, 1): 'Dunnington',
-    (6, 30, 0): 'Lynnfield',
-    (6, 30, 5): 'Lynnfield_CPUID',
-    (6, 31, 1): 'Auburndale',
-    (6, 37, 2): 'Clarkdale',
-    (6, 37, 5): 'Arrandale',
-    (6, 38, 1): 'TunnelCreek',
-    (6, 39, 2): 'Medfield',
-    (6, 42, 2): 'SandyBridge',
-    (6, 42, 6): 'SandyBridge',
-    (6, 42, 7): 'Sandy Bridge-DT',
-    (6, 44, 1): 'Westmere-EP',
-    (6, 44, 2): 'Gulftown',
-    (6, 45, 5): 'Sandy Bridge-EP',
-    (6, 45, 6): 'Sandy Bridge-E',
-    (6, 46, 4): 'Beckton',
-    (6, 46, 5): 'Beckton',
-    (6, 46, 6): 'Beckton',
-    (6, 47, 2): 'Eagleton',
-    (6, 53, 1): 'Cloverview',
-    (6, 54, 1): 'Cedarview-D',
-    (6, 54, 9): 'Centerton',
-    (6, 55, 3): 'Bay Trail-D',
-    (6, 55, 8): 'Silvermont',
-    (6, 58, 9): 'Ivy Bridge-DT',
-    (6, 60, 3): 'Haswell-DT',
-    (6, 61, 4): 'Broadwell-U',
-    (6, 62, 3): 'IvyBridgeEP',
-    (6, 62, 4): 'Ivy Bridge-E',
-    (6, 63, 2): 'Haswell-EP',
-    (6, 69, 1): 'HaswellULT',
-    (6, 70, 1): 'Crystal Well-DT',
-    (6, 71, 1): 'Broadwell-H',
-    (6, 76, 3): 'Braswell',
-    (6, 77, 8): 'Avoton',
-    (6, 78, 3): 'Skylake',
-    (6, 79, 1): 'BroadwellE',
-    (6, 85, 4): 'SkylakeXeon',
-    (6, 85, 6): 'CascadeLakeSP',
-    (6, 85, 7): 'CascadeLakeXeon2',
-    (6, 86, 2): 'BroadwellDE',
-    (6, 86, 4): 'BroadwellDE',
-    (6, 87, 0): 'KnightsLanding',
-    (6, 87, 1): 'KnightsLanding',
-    (6, 90, 0): 'Moorefield',
-    (6, 92, 9): 'Apollo Lake',
-    (6, 93, 1): 'SoFIA',
-    (6, 94, 0): 'Skylake',
-    (6, 94, 3): 'Skylake-S',
-    (6, 95, 1): 'Denverton',
-    (6, 102, 3): 'Cannon Lake-U',
-    (6, 117, 10): 'Spreadtrum',
-    (6, 122, 1): 'Gemini Lake-D',
-    (6, 122, 8): 'GoldmontPlus',
-    (6, 126, 5): 'IceLakeY',
-    (6, 138, 1): 'Lakefield',
-    (6, 140, 1): 'TigerLake-U',
-    (6, 140, 2): 'TigerLake-U',
-    (6, 141, 1): 'TigerLake-H',
-    (6, 142, 9): 'KabyLake',
-    (6, 142, 10): 'KabyLake',
-    (6, 142, 11): 'WhiskeyLake',
-    (6, 142, 12): 'CometLake-U',
-    (6, 151, 2): 'AlderLake-S/HX',
-    (6, 151, 5): 'AlderLake-S',
-    (6, 154, 3): 'AlderLake-P/H',
-    (6, 154, 4): 'AlderLake-U',
-    (6, 156, 0): 'JasperLake',
-    (6, 158, 9): 'KabyLakeG',
-    (6, 158, 10): 'CoffeeLake',
-    (6, 158, 11): 'CoffeeLake',
-    (6, 158, 12): 'CoffeeLake',
-    (6, 158, 13): 'CoffeeLake',
-    (6, 165, 2): 'CometLake',
-    (6, 165, 3): 'CometLake-S',
-    (6, 165, 4): 'CometLake',
-    (6, 165, 5): 'CometLake-S',
-    (6, 166, 0): 'CometLake',
-    (6, 166, 1): 'CometLake-U',
-    (6, 167, 1): 'RocketLake',
-    (6, 170, 4): 'MeteorLake',
-    (6, 181, 0): 'ArrowLake-U',
-    (6, 183, 1): 'RaptorLake-HX',
-    (6, 186, 2): 'RaptorLake',
-    (6, 186, 3): 'RaptorLake-U',
-    (6, 189, 1): 'LunarLake',
-    (6, 190, 0): 'AlderLake-N',
-    (6, 191, 2): 'RaptorLake-HX/S',
-    (6, 191, 5): 'RaptorLake-S',
-    (6, 197, 2): 'ArrowLake-H',
-    (6, 198, 2): 'ArrowLake-HX',
-    (6, 204, 2): 'PantherLake',
-    (6, 204, 3): 'PantherLake',
-}
-
-FIXED_DRAM_ENERGY_UNIT_MODELS = {63, 79, 85, 86, 87}
-
-# MCHBAR belongs to the PCI host bridge, not to a CPUID signature. This is a
-# deliberately narrow allowlist: an unlisted device remains MSR-only.
-#
-# TGL/ADL/RPL/Core Ultra datasheets document PACKAGE_RAPL_LIMIT_0_0_0_MCHBAR_PCU
-# at MCHBAR + 0x59a0 (Intel docs 631122, 767625/767626, 764981/767624, 795258,
-# 819323, 844345). Kaby and Coffee Lake do not publish the offset: those two
-# rest on coreboot's MCH_PKG_POWER_LIMIT_LO (the MSR 0x610 mirror) and a live
-# MMIO == MSR equality check on 0x3ec4. Groups follow Linux igen6/ie31200 EDAC.
-MCHBAR_ADDRESS_MASKS_BY_PCI_DEVICE = {
-    # Kaby Lake-U/R and Coffee Lake-H target systems (T480/T480s/X1C6, P53).
-    0x5914: MCHBAR_ADDRESS_MASK_39_15,
-    0x3EC4: MCHBAR_ADDRESS_MASK_39_15,
-    # Comet Lake-H (Intel doc 615212; coreboot PCI_DID_INTEL_CML_H).
-    0x9B54: MCHBAR_ADDRESS_MASK_39_15,
-    # Comet Lake-U (Intel doc 615229; coreboot PCI_DID_INTEL_CML_U).
-    0x9B61: MCHBAR_ADDRESS_MASK_39_15,
-    # Tiger Lake (Linux igen6 tgl_cfg).
-    0x9A14: MCHBAR_ADDRESS_MASK_39_17,
-    # Alder Lake (Linux igen6 adl_cfg).
-    0x4601: MCHBAR_ADDRESS_MASK_42_17,
-    0x4602: MCHBAR_ADDRESS_MASK_42_17,
-    0x4621: MCHBAR_ADDRESS_MASK_42_17,
-    0x4641: MCHBAR_ADDRESS_MASK_42_17,
-    # Alder/Raptor Lake S/HX (Linux ie31200 rpl_s_cfg).
-    0x4660: MCHBAR_ADDRESS_MASK_42_17,
-    0x4668: MCHBAR_ADDRESS_MASK_42_17,
-    0x4648: MCHBAR_ADDRESS_MASK_42_17,
-    0xA703: MCHBAR_ADDRESS_MASK_42_17,
-    0x4640: MCHBAR_ADDRESS_MASK_42_17,
-    0x4630: MCHBAR_ADDRESS_MASK_42_17,
-    0xA700: MCHBAR_ADDRESS_MASK_42_17,
-    0xA740: MCHBAR_ADDRESS_MASK_42_17,
-    0xA704: MCHBAR_ADDRESS_MASK_42_17,
-    0xA702: MCHBAR_ADDRESS_MASK_42_17,
-    # Raptor Lake-P (Linux igen6 rpl_p_cfg).
-    0xA706: MCHBAR_ADDRESS_MASK_42_17,
-    0xA707: MCHBAR_ADDRESS_MASK_42_17,
-    0xA708: MCHBAR_ADDRESS_MASK_42_17,
-    0xA716: MCHBAR_ADDRESS_MASK_42_17,
-    0xA718: MCHBAR_ADDRESS_MASK_42_17,
-    # Meteor Lake and Arrow Lake-U/H (Linux igen6 mtl_ps/mtl_p_cfg).
-    0x7D21: MCHBAR_ADDRESS_MASK_42_17,
-    0x7D22: MCHBAR_ADDRESS_MASK_42_17,
-    0x7D23: MCHBAR_ADDRESS_MASK_42_17,
-    0x7D24: MCHBAR_ADDRESS_MASK_42_17,
-    0x7D01: MCHBAR_ADDRESS_MASK_42_17,
-    0x7D02: MCHBAR_ADDRESS_MASK_42_17,
-    0x7D14: MCHBAR_ADDRESS_MASK_42_17,
-    0x7D06: MCHBAR_ADDRESS_MASK_42_17,
-    0x7D20: MCHBAR_ADDRESS_MASK_42_17,
-    0x7D30: MCHBAR_ADDRESS_MASK_42_17,
-}
 
 TESTMSR = False
 UNSUPPORTED_FEATURES = []
@@ -533,32 +362,92 @@ def _current_config(config_or_state):
     return config_or_state['config'] if isinstance(config_or_state, dict) else config_or_state
 
 
+def _current_regs(config_or_state):
+    return config_or_state.get('regs') if isinstance(config_or_state, dict) else None
+
+
 def config_is_enabled(config):
     """Return whether hardware changes are enabled in the loaded config."""
     return config.getboolean('GENERAL', 'Enabled', fallback=False)
 
 
 def handle_sleep_prepare(sleeping, config_or_state):
-    if not sleeping:
-        with config_lock:
-            config = _current_config(config_or_state)
-            if config_is_enabled(config):
-                undervolt(config)
-                set_icc_max(config)
+    if sleeping:
+        return
+
+    with config_lock:
+        config = _current_config(config_or_state)
+        regs = _current_regs(config_or_state)
+        source = power['source']
+
+    if not config_is_enabled(config) or source not in POWER_PROFILES:
+        return
+
+    with hardware_lock:
+        mmio_powercap = find_mmio_package_zone()
+        mchbar_mmio = None
+        if regs is not None and 'MSR_PKG_POWER_LIMIT' in regs.get(source, {}):
+            baseline = readmsr('MSR_PKG_POWER_LIMIT', cpu=0)
+            mchbar_mmio = open_mchbar_power_limit_mmio(expected_msr=baseline)
+        try:
+            apply_runtime_profile(
+                config,
+                regs,
+                source,
+                mmio_powercap=mmio_powercap,
+                mchbar_mmio=mchbar_mmio,
+                apply_mailbox=True,
+                apply_hwp=_hwp_should_apply_event(config, source),
+            )
+        finally:
+            if mchbar_mmio is not None:
+                mchbar_mmio.close()
 
 
 def handle_ac_properties_changed(if_name, changed, invalidated):
     if "OnBattery" in changed:
-        power['method'] = 'dbus'
-        power['source'] = 'BATTERY' if bool(unwrap_dbus_value(changed['OnBattery'])) else 'AC'
+        with config_lock:
+            power['method'] = 'dbus'
+            power['source'] = 'BATTERY' if bool(unwrap_dbus_value(changed['OnBattery'])) else 'AC'
 
 
 def should_listen_for_resume(config):
-    return config_is_enabled(config) and any(
+    if not config_is_enabled(config):
+        return False
+
+    if any(
         config.getfloat(key, plane, fallback=0) != 0
         for keys, planes in ((UNDERVOLT_KEYS, VOLTAGE_PLANES), (ICCMAX_KEYS, CURRENT_PLANES))
         for key in keys
         for plane in planes
+    ):
+        return True
+
+    if config.getboolean('AC', 'HWP_Mode', fallback=False):
+        return True
+
+    resume_options = (
+        'HWP_EPP',
+        'Disable_Turbo',
+        'BDPROCHOT_Enabled',
+        'Trip_Temp_C',
+        'cTDP',
+        'PL1_Tdp_W',
+        'PL1_Duration_s',
+        'PL2_Tdp_W',
+        'PL2_Duration_s',
+        'PL1_Enable',
+        'PL1_Clamp',
+        'PL2_Enable',
+        'PL2_Clamp',
+    )
+    return any(
+        profile in config
+        and (
+            any(config.has_option(profile, option) for option in resume_options)
+            or config.getboolean(profile, 'Disable_BDPROCHOT', fallback=False)
+        )
+        for profile in POWER_PROFILES
     )
 
 
@@ -647,15 +536,29 @@ def get_critical_temp():
 
 
 def get_cur_pkg_power_limits():
-    """Return the current PL1/PL2 power and time-window fields from
-    MSR_PKG_POWER_LIMIT."""
-    value = readmsr('MSR_PKG_POWER_LIMIT', 0, 55, flatten=True)
+    """Return the current package power-limit register and decoded fields."""
+    value = readmsr('MSR_PKG_POWER_LIMIT', flatten=True)
     return {
+        'RAW': value,
+        'LOCKED': bool(get_value_for_bits(value, PKG_POWER_LIMIT_LOCK_BIT, PKG_POWER_LIMIT_LOCK_BIT)),
         'PL1': get_value_for_bits(value, 0, 14),
+        'PL1_ENABLED': bool(get_value_for_bits(value, 15, 15)),
+        'PL1_CLAMP': bool(get_value_for_bits(value, 16, 16)),
         'TW1': get_value_for_bits(value, 17, 23),
         'PL2': get_value_for_bits(value, 32, 46),
+        'PL2_ENABLED': bool(get_value_for_bits(value, 47, 47)),
+        'PL2_CLAMP': bool(get_value_for_bits(value, 48, 48)),
         'TW2': get_value_for_bits(value, 49, 55),
     }
+
+
+def decode_time_window_field(field, time_unit=None):
+    """Decode a 7-bit RAPL time-window field to seconds."""
+    if time_unit is None:
+        time_unit = get_time_unit()
+    y = field & 0x1F
+    z = (field >> 5) & 0x3
+    return (2**y) * (1.0 + z / 4.0) * time_unit
 
 
 def calc_time_window_vars(t):
@@ -669,8 +572,19 @@ def calc_time_window_vars(t):
     raise ValueError('Unable to find a good combination!')
 
 
-def _encode_pkg_power_limit(pl1, tw1, pl2, tw2):
-    """Encode MSR_PKG_POWER_LIMIT fields without allowing adjacent-bit spill."""
+def _encode_pkg_power_limit(
+    pl1,
+    tw1,
+    pl2,
+    tw2,
+    *,
+    base_value=0,
+    pl1_enabled=True,
+    pl1_clamp=True,
+    pl2_enabled=True,
+    pl2_clamp=False,
+):
+    """Encode MSR_PKG_POWER_LIMIT while preserving unrelated/reserved bits."""
     fields = (
         ('PL1', pl1, PKG_POWER_LIMIT_POWER_MASK),
         ('TW1', tw1, PKG_POWER_LIMIT_TIME_WINDOW_MASK),
@@ -684,15 +598,31 @@ def _encode_pkg_power_limit(pl1, tw1, pl2, tw2):
         if name in ('PL1', 'PL2') and value == 0:
             raise ValueError(f'{name:s} must be at least one power-unit tick, got {value!r}.')
         encoded[name] = value
-    return (
-        encoded['PL1']
+
+    programmable_mask = (
+        PKG_POWER_LIMIT_POWER_MASK
         | (1 << 15)
         | (1 << 16)
-        | (encoded['TW1'] << 17)
-        | (encoded['PL2'] << 32)
+        | (PKG_POWER_LIMIT_TIME_WINDOW_MASK << 17)
+        | (PKG_POWER_LIMIT_POWER_MASK << 32)
         | (1 << 47)
-        | (encoded['TW2'] << 49)
+        | (1 << 48)
+        | (PKG_POWER_LIMIT_TIME_WINDOW_MASK << 49)
     )
+    value = base_value & ~programmable_mask
+    value |= encoded['PL1']
+    value |= encoded['TW1'] << 17
+    value |= encoded['PL2'] << 32
+    value |= encoded['TW2'] << 49
+    if pl1_enabled:
+        value |= 1 << 15
+    if pl1_clamp:
+        value |= 1 << 16
+    if pl2_enabled:
+        value |= 1 << 47
+    if pl2_clamp:
+        value |= 1 << 48
+    return value
 
 
 def _undervolt_offset_to_ticks(offset):
@@ -721,46 +651,192 @@ def calc_undervolt_msr(plane, offset):
     return 0x8000001100000000 | (VOLTAGE_PLANES[plane] << 40) | encoded_offset
 
 
+def calc_undervolt_ticks(msr_value):
+    """Return the signed 11-bit OC-mailbox voltage-offset field."""
+    offset = (msr_value & 0xFFE00000) >> 21
+    return offset if offset < 0x400 else offset - 0x800
+
+
 def calc_undervolt_mv(msr_value):
     """Return the offset voltage (in mV) from the given raw MSR 150h value."""
-    offset = (msr_value & 0xFFE00000) >> 21
-    # 11-bit two's complement: values >= 0x400 are negative
-    offset = offset if offset < 0x400 else -(0x800 - offset)
-    return int(round(offset / UNDERVOLT_TICKS_PER_MV))
+    return int(round(calc_undervolt_ticks(msr_value) / UNDERVOLT_TICKS_PER_MV))
+
+
+class OCMailboxError(OSError):
+    """OC mailbox command was rejected, timed out, or failed verification."""
+
+
+def wait_oc_mailbox_ready():
+    deadline = monotonic() + OC_MAILBOX_TIMEOUT_S
+    while True:
+        raw = readmsr('MSR_OC_MAILBOX', cpu=0)
+        if not ((raw >> OC_MAILBOX_BUSY_BIT) & 1):
+            return raw
+        if monotonic() >= deadline:
+            raise OCMailboxError('OC mailbox timed out waiting for completion.')
+        sleep(OC_MAILBOX_POLL_S)
+
+
+def execute_oc_mailbox(command):
+    """Execute one package OC-mailbox transaction through CPU0 and check status."""
+    wait_oc_mailbox_ready()
+    writemsr('MSR_OC_MAILBOX', command, cpu=0)
+    result = wait_oc_mailbox_ready()
+    status = (result >> OC_MAILBOX_STATUS_SHIFT) & OC_MAILBOX_STATUS_MASK
+    if status:
+        raise OCMailboxError(f'OC mailbox command failed with status {status:#04x}.')
+    return result
+
+
+def write_daemon_oc_recovery(kind, values):
+    """Persist pre-write OC state in the same schema consumed by throttlectl restore."""
+    try:
+        cpu = probe_read_cpuinfo()
+        dmi = probe_read_dmi()
+        payload = {
+            'schema_version': OC_BACKUP_SCHEMA_VERSION,
+            'target': TARGET_DMI_PRODUCT,
+            'dmi_product': dmi.get('product'),
+            'cpu': {
+                'vendor_id': cpu['vendor_id'],
+                'family': cpu['family'],
+                'model': cpu['model'],
+                'stepping': cpu['stepping'],
+            },
+            'kind': kind,
+            'values': {str(name).lower(): int(value) for name, value in values.items()},
+            'source': 'daemon',
+        }
+        os.makedirs(OC_BACKUP_DIR, mode=0o700, exist_ok=True)
+        os.chmod(OC_BACKUP_DIR, 0o700)
+        stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
+        path = os.path.join(OC_BACKUP_DIR, f'{kind}-{stamp}-{os.getpid():d}.json')
+        with open(path, 'x', encoding='utf-8') as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write('\n')
+        os.chmod(path, 0o600)
+        return path
+    except (OSError, KeyError, TypeError, ValueError) as exc:
+        raise OCMailboxError(
+            f'refusing {kind} update because the recovery backup could not be created: {exc}'
+        ) from exc
+
+
+def _rollback_undervolt_planes(planes, original):
+    errors = []
+    for plane in reversed(planes):
+        try:
+            current = get_undervolt(plane)[plane]
+            original_field = original[plane] & 0xFFE00000
+            if (current & 0xFFE00000) != original_field:
+                restore = (
+                    0x8000001100000000
+                    | (VOLTAGE_PLANES[plane] << 40)
+                    | original_field
+                )
+                execute_oc_mailbox(restore)
+            verify = get_undervolt(plane)[plane]
+            if (verify & 0xFFE00000) != original_field:
+                errors.append(f'{plane}: verify mismatch')
+        except (OSError, OCMailboxError) as exc:
+            errors.append(f'{plane}: {exc}')
+    return errors
+
+
+def _rollback_iccmax_planes(planes, original):
+    errors = []
+    for plane in reversed(planes):
+        try:
+            current = get_icc_max(plane)[plane]
+            original_field = original[plane] & ICCMAX_MAX_FIELD
+            if current != original_field:
+                restore = (
+                    0x8000001700000000
+                    | (CURRENT_PLANES[plane] << 40)
+                    | original_field
+                )
+                execute_oc_mailbox(restore)
+            verify = get_icc_max(plane)[plane]
+            if verify != original_field:
+                errors.append(f'{plane}: verify mismatch')
+        except (OSError, OCMailboxError) as exc:
+            errors.append(f'{plane}: {exc}')
+    return errors
 
 
 def get_undervolt(plane=None, convert=False):
-    """Read the current undervolt offset from one or all voltage planes."""
+    """Read current voltage offsets using the package OC mailbox protocol."""
     if 'UNDERVOLT' in UNSUPPORTED_FEATURES:
         return 0
     planes = [plane] if plane in VOLTAGE_PLANES else VOLTAGE_PLANES
     out = {}
     for plane in planes:
-        writemsr('MSR_OC_MAILBOX', 0x8000001000000000 | (VOLTAGE_PLANES[plane] << 40))
-        read_value = readmsr('MSR_OC_MAILBOX', flatten=True) & 0xFFFFFFFF
+        result = execute_oc_mailbox(0x8000001000000000 | (VOLTAGE_PLANES[plane] << 40))
+        read_value = result & 0xFFFFFFFF
         out[plane] = calc_undervolt_mv(read_value) if convert else read_value
 
     return out
 
 
 def undervolt(config, source=None):
-    """Apply the undervolt offsets from the config to all voltage planes."""
+    """Apply all configured voltage planes transactionally with persistent recovery."""
     source = source or power['source']
     section = f'UNDERVOLT.{source}'
     if (section not in config and 'UNDERVOLT' not in config) or 'UNDERVOLT' in UNSUPPORTED_FEATURES:
         return
+
+    original = {}
+    desired = {}
+    changed_planes = []
     for plane in VOLTAGE_PLANES:
-        write_offset_mv = config.getfloat(section, plane, fallback=config.getfloat('UNDERVOLT', plane, fallback=0.0))
+        write_offset_mv = config.getfloat(
+            section,
+            plane,
+            fallback=config.getfloat('UNDERVOLT', plane, fallback=0.0),
+        )
         write_value = calc_undervolt_msr(plane, write_offset_mv)
-        writemsr('MSR_OC_MAILBOX', write_value)
+        current_value = get_undervolt(plane)[plane]
+        original[plane] = current_value
+        desired[plane] = (write_value, write_value & 0xFFE00000, write_offset_mv)
+        if (current_value & 0xFFE00000) != desired[plane][1]:
+            changed_planes.append(plane)
+
+    if not changed_planes:
         if args.debug:
-            write_value &= 0xFFFFFFFF
+            log('[D] All configured undervolt planes already match; skipping writes.')
+        return
+
+    backup = write_daemon_oc_recovery(
+        'fivr',
+        {plane: calc_undervolt_ticks(value) for plane, value in original.items()},
+    )
+    log(f'[I] OC recovery backup written before daemon undervolt changes: {backup}')
+
+    try:
+        for plane in changed_planes:
+            write_value, desired_field, write_offset_mv = desired[plane]
+            execute_oc_mailbox(write_value)
             read_value = get_undervolt(plane)[plane]
-            read_offset_mv = calc_undervolt_mv(read_value)
-            match = OK if write_value == read_value else ERR
-            log(
-                f'[D] Undervolt plane {plane:s} - write {write_offset_mv:.0f} mV ({write_value:#x}) - read {read_offset_mv:.0f} mV ({read_value:#x}) - match {match}'
-            )
+            if (read_value & 0xFFE00000) != desired_field:
+                raise OCMailboxError(
+                    f'Undervolt verify failed for {plane:s}: requested {write_offset_mv:.0f} mV, '
+                    f'read {calc_undervolt_mv(read_value):.0f} mV.'
+                )
+            if args.debug:
+                log(
+                    f'[D] Undervolt plane {plane:s} - write {write_offset_mv:.0f} mV '
+                    f'- read {calc_undervolt_mv(read_value):.0f} mV - match {OK}'
+                )
+    except (OSError, OCMailboxError) as exc:
+        rollback_errors = _rollback_undervolt_planes(changed_planes, original)
+        suffix = (
+            f'; rollback issues: {"; ".join(rollback_errors)}'
+            if rollback_errors
+            else '; rollback verified'
+        )
+        raise OCMailboxError(
+            f'Daemon undervolt transaction failed: {exc}; recovery backup: {backup}{suffix}'
+        ) from exc
 
 
 def _icc_max_to_field(current):
@@ -813,45 +889,89 @@ def get_update_rate(config, power_source):
 
 
 def get_icc_max(plane=None, convert=False):
-    """Read the IccMax setting from one or all current planes."""
+    """Read IccMax through the package OC mailbox protocol."""
+    if 'ICCMAX' in UNSUPPORTED_FEATURES:
+        return 0
     planes = [plane] if plane in CURRENT_PLANES else CURRENT_PLANES
     out = {}
     for plane in planes:
-        writemsr('MSR_OC_MAILBOX', 0x8000001600000000 | (CURRENT_PLANES[plane] << 40))
-        read_value = readmsr('MSR_OC_MAILBOX', flatten=True) & 0x3FF
+        result = execute_oc_mailbox(0x8000001600000000 | (CURRENT_PLANES[plane] << 40))
+        read_value = result & ICCMAX_MAX_FIELD
         out[plane] = calc_icc_max_amp(read_value) if convert else read_value
 
     return out
 
 
 def set_icc_max(config, source=None):
-    """Apply the IccMax limits from the config to all current planes."""
+    """Apply configured IccMax planes transactionally with persistent recovery."""
     if 'ICCMAX' in UNSUPPORTED_FEATURES:
         return
     source = source or power['source']
     section = f'ICCMAX.{source}'
+
+    requested = {}
     for plane in CURRENT_PLANES:
         try:
             write_current_amp = config.getfloat(
-                section, plane, fallback=config.getfloat('ICCMAX', plane, fallback=-1.0)
+                section,
+                plane,
+                fallback=config.getfloat('ICCMAX', plane, fallback=-1.0),
             )
-            if write_current_amp <= 0 and any(
-                config.getfloat(key, plane, fallback=-1.0) > 0 for key in ICCMAX_KEYS
-            ):
-                warning(f'IccMax {plane:s} is not configured for the {source:s} profile: leaving it untouched.')
-            if write_current_amp > 0:
-                write_value = calc_icc_max_msr(plane, write_current_amp)
-                writemsr('MSR_OC_MAILBOX', write_value)
-                if args.debug:
-                    write_value &= 0x3FF
-                    read_value = get_icc_max(plane)[plane]
-                    read_current_A = calc_icc_max_amp(read_value)
-                    match = OK if write_value == read_value else ERR
-                    log(
-                        f'[D] IccMax plane {plane:s} - write {calc_icc_max_amp(write_value):.2f} A ({write_value:#x}) - read {read_current_A:.2f} A ({read_value:#x}) - match {match}'
-                    )
         except (configparser.NoSectionError, configparser.NoOptionError):
-            pass
+            continue
+        if write_current_amp <= 0:
+            if any(config.getfloat(key, plane, fallback=-1.0) > 0 for key in ICCMAX_KEYS):
+                warning(
+                    f'IccMax {plane:s} is not configured for the {source:s} profile: '
+                    'leaving it untouched.'
+                )
+            continue
+        write_value = calc_icc_max_msr(plane, write_current_amp)
+        requested[plane] = (write_value, write_value & ICCMAX_MAX_FIELD)
+
+    if not requested:
+        return
+
+    # Read every plane so the backup remains directly consumable by throttlectl restore.
+    original = {plane: get_icc_max(plane)[plane] for plane in CURRENT_PLANES}
+    changed_planes = [
+        plane for plane, (_, desired_field) in requested.items()
+        if original[plane] != desired_field
+    ]
+    if not changed_planes:
+        if args.debug:
+            log('[D] All configured IccMax planes already match; skipping writes.')
+        return
+
+    backup = write_daemon_oc_recovery('iccmax', original)
+    log(f'[I] OC recovery backup written before daemon IccMax changes: {backup}')
+
+    try:
+        for plane in changed_planes:
+            write_value, desired_field = requested[plane]
+            execute_oc_mailbox(write_value)
+            read_value = get_icc_max(plane)[plane]
+            if read_value != desired_field:
+                raise OCMailboxError(
+                    f'IccMax verify failed for {plane:s}: requested '
+                    f'{calc_icc_max_amp(desired_field):.2f} A, '
+                    f'read {calc_icc_max_amp(read_value):.2f} A.'
+                )
+            if args.debug:
+                log(
+                    f'[D] IccMax plane {plane:s} - write {calc_icc_max_amp(desired_field):.2f} A '
+                    f'- read {calc_icc_max_amp(read_value):.2f} A - match {OK}'
+                )
+    except (OSError, OCMailboxError) as exc:
+        rollback_errors = _rollback_iccmax_planes(changed_planes, original)
+        suffix = (
+            f'; rollback issues: {"; ".join(rollback_errors)}'
+            if rollback_errors
+            else '; rollback verified'
+        )
+        raise OCMailboxError(
+            f'Daemon IccMax transaction failed: {exc}; recovery backup: {backup}{suffix}'
+        ) from exc
 
 
 def _remove_config_option(config, section, option):
@@ -872,16 +992,30 @@ def load_config():
         fatal('At least one power profile ([AC] or [BATTERY]) is required.')
 
     boolean_options = [('GENERAL', 'Enabled'), ('GENERAL', 'Autoreload'), ('AC', 'HWP_Mode')]
-    boolean_options.extend((profile, 'Disable_BDPROCHOT') for profile in power_profiles)
+    boolean_options.extend(
+        (profile, option)
+        for profile in power_profiles
+        for option in ('Disable_BDPROCHOT', 'BDPROCHOT_Enabled', 'Disable_Turbo', 'PL1_Enable', 'PL1_Clamp', 'PL2_Enable', 'PL2_Clamp')
+    )
     for section, option in boolean_options:
         try:
             config.getboolean(section, option, fallback=None)
         except (ValueError, configparser.InterpolationError):
             fatal(f'The "{option:s}" parameter in [{section:s}] must be a boolean.')
 
+    # HWP_EPP is the direct ThrottleStop-style Speed Shift EPP value.
+    # Keep HWP_Mode for backward compatibility, but prefer per-profile HWP_EPP.
+    for power_source in power_profiles:
+        try:
+            hwp_epp = config.getint(power_source, 'HWP_EPP', fallback=None)
+        except (ValueError, configparser.InterpolationError):
+            fatal(f'The "HWP_EPP" parameter in [{power_source:s}] must be an integer from 0 to 255.')
+        if hwp_epp is not None and not 0 <= hwp_epp <= 255:
+            fatal(f'The "HWP_EPP" parameter in [{power_source:s}] must be an integer from 0 to 255.')
+
     # config values sanity check
     for power_source in power_profiles:
-        for option in ('Update_Rate_s', 'PL1_Tdp_W', 'PL1_Duration_s', 'PL2_Tdp_W', 'PL2_Duration_S'):
+        for option in ('Update_Rate_s', 'PL1_Tdp_W', 'PL1_Duration_s', 'PL2_Tdp_W', 'PL2_Duration_s'):
             value = None
             # a malformed profile value may mask a second malformed value inherited from [DEFAULT]
             for _ in range(2):
@@ -1037,10 +1171,15 @@ def calc_reg_values(platform_info, config):
         PL1_Duration_s = config.getfloat(power_source, 'PL1_Duration_s', fallback=None)
         PL2_Tdp_W = config.getfloat(power_source, 'PL2_Tdp_W', fallback=None)
         PL2_Duration_s = config.getfloat(power_source, 'PL2_Duration_s', fallback=None)
+        numeric_tpl_values = (PL1_Tdp_W, PL1_Duration_s, PL2_Tdp_W, PL2_Duration_s)
+        numeric_tpl_configured = any(value is not None for value in numeric_tpl_values)
+        tpl_boolean_options = ('PL1_Enable', 'PL1_Clamp', 'PL2_Enable', 'PL2_Clamp')
+        boolean_tpl_configured = any(config.has_option(power_source, option) for option in tpl_boolean_options)
 
-        if (PL1_Tdp_W, PL1_Duration_s, PL2_Tdp_W, PL2_Duration_s).count(None) < 4:
-            power_unit = get_power_unit()
+        if numeric_tpl_configured or boolean_tpl_configured:
             cur_pkg_power_limits = get_cur_pkg_power_limits()
+            power_unit = get_power_unit() if PL1_Tdp_W is not None or PL2_Tdp_W is not None else None
+
             if PL1_Tdp_W is None:
                 PL1 = cur_pkg_power_limits['PL1']
                 log(f'[I] {power_source:s} PL1_Tdp_W disabled in config.')
@@ -1067,10 +1206,43 @@ def calc_reg_values(platform_info, config):
                 Y, Z = calc_time_window_vars(PL2_Duration_s)
                 TW2 = Y | (Z << 5)
 
-            try:
-                regs[power_source]['MSR_PKG_POWER_LIMIT'] = _encode_pkg_power_limit(PL1, TW1, PL2, TW2)
-            except ValueError as e:
-                fatal(f'Invalid package power limits in [{power_source:s}]: {e}')
+            # Preserve upstream behavior for existing configs that specify numeric
+            # TPL values but not the new boolean knobs. For a boolean-only edit,
+            # unspecified flags inherit the live hardware state instead.
+            boolean_defaults = {
+                'PL1_Enable': True if numeric_tpl_configured else cur_pkg_power_limits['PL1_ENABLED'],
+                'PL1_Clamp': True if numeric_tpl_configured else cur_pkg_power_limits['PL1_CLAMP'],
+                'PL2_Enable': True if numeric_tpl_configured else cur_pkg_power_limits['PL2_ENABLED'],
+                'PL2_Clamp': False if numeric_tpl_configured else cur_pkg_power_limits['PL2_CLAMP'],
+            }
+
+            if cur_pkg_power_limits.get('LOCKED', False):
+                warning(
+                    f'MSR_PKG_POWER_LIMIT is locked; package power-limit writes for [{power_source:s}] are disabled.'
+                )
+            else:
+                try:
+                    regs[power_source]['MSR_PKG_POWER_LIMIT'] = _encode_pkg_power_limit(
+                        PL1,
+                        TW1,
+                        PL2,
+                        TW2,
+                        base_value=cur_pkg_power_limits.get('RAW', 0),
+                        pl1_enabled=config.getboolean(
+                            power_source, 'PL1_Enable', fallback=boolean_defaults['PL1_Enable']
+                        ),
+                        pl1_clamp=config.getboolean(
+                            power_source, 'PL1_Clamp', fallback=boolean_defaults['PL1_Clamp']
+                        ),
+                        pl2_enabled=config.getboolean(
+                            power_source, 'PL2_Enable', fallback=boolean_defaults['PL2_Enable']
+                        ),
+                        pl2_clamp=config.getboolean(
+                            power_source, 'PL2_Clamp', fallback=boolean_defaults['PL2_Clamp']
+                        ),
+                    )
+                except ValueError as e:
+                    fatal(f'Invalid package power limits in [{power_source:s}]: {e}')
         else:
             log(f'[I] {power_source:s} package power limits are disabled in config.')
 
@@ -1087,37 +1259,267 @@ def calc_reg_values(platform_info, config):
     return regs
 
 
-def set_hwp(performance_mode):
-    """Set the IA32_HWP_REQUEST energy/performance preference field."""
-    if performance_mode not in (True, False) or 'HWP' in UNSUPPORTED_FEATURES:
+def write_msr_field_verified(msr_name, cpu, mask, desired_bits, label):
+    """RMW one managed field, verify it, and restore that field on mismatch."""
+    original = readmsr(msr_name, cpu=cpu)
+    target = (original & ~mask) | (desired_bits & mask)
+    if target == original:
+        return original
+
+    writemsr(msr_name, target, cpu=cpu)
+    readback = readmsr(msr_name, cpu=cpu)
+    if (readback & mask) == (target & mask):
+        return readback
+
+    rollback_error = None
+    try:
+        rollback_target = (readback & ~mask) | (original & mask)
+        writemsr(msr_name, rollback_target, cpu=cpu)
+        rollback_readback = readmsr(msr_name, cpu=cpu)
+        if (rollback_readback & mask) != (original & mask):
+            rollback_error = 'rollback verify mismatch'
+    except (OSError, IOError) as exc:
+        rollback_error = str(exc)
+
+    suffix = f'; rollback issue: {rollback_error}' if rollback_error else '; managed field rollback verified'
+    raise OSError(
+        f'{label} verify failed on CPU {cpu:d}: expected 0x{target & mask:x}, '
+        f'read 0x{readback & mask:x}{suffix}'
+    )
+
+
+def write_msr_fields_transaction(fields):
+    """Apply multiple managed MSR fields atomically enough for daemon profile updates.
+
+    Each item is (msr_name, cpu, mask, desired_bits, label). On any write or
+    verify failure, every field whose write was attempted is restored to its
+    pre-transaction managed bits and verified.
+    """
+    prepared = []
+    for msr_name, cpu, mask, desired_bits, label in fields:
+        original = readmsr(msr_name, cpu=cpu)
+        target = (original & ~mask) | (desired_bits & mask)
+        prepared.append((msr_name, cpu, mask, original, target, label))
+
+    attempted = []
+    results = {}
+    try:
+        for msr_name, cpu, mask, original, target, label in prepared:
+            if target == original:
+                results[(msr_name, cpu)] = original
+                continue
+            attempted.append((msr_name, cpu, mask, original, label))
+            writemsr(msr_name, target, cpu=cpu)
+            readback = readmsr(msr_name, cpu=cpu)
+            if (readback & mask) != (target & mask):
+                raise OSError(
+                    f'{label} verify failed on CPU {cpu:d}: '
+                    f'expected 0x{target & mask:x}, read 0x{readback & mask:x}'
+                )
+            results[(msr_name, cpu)] = readback
+    except (OSError, IOError) as exc:
+        rollback_errors = []
+        for msr_name, cpu, mask, original, label in reversed(attempted):
+            try:
+                current = readmsr(msr_name, cpu=cpu)
+                rollback_target = (current & ~mask) | (original & mask)
+                if rollback_target != current:
+                    writemsr(msr_name, rollback_target, cpu=cpu)
+                verify = readmsr(msr_name, cpu=cpu)
+                if (verify & mask) != (original & mask):
+                    rollback_errors.append(f'{label} CPU {cpu:d}: verify mismatch')
+            except (OSError, IOError) as rollback_exc:
+                rollback_errors.append(f'{label} CPU {cpu:d}: {rollback_exc}')
+        suffix = (
+            f'; rollback issues: {"; ".join(rollback_errors)}'
+            if rollback_errors
+            else '; transaction rollback verified'
+        )
+        raise OSError(f'MSR field transaction failed: {exc}{suffix}') from exc
+
+    return results
+
+
+def set_hwp_epp(epp):
+    """Set HWP EPP as one package/per-CPU managed-field transaction."""
+    if epp is None or 'HWP' in UNSUPPORTED_FEATURES:
         return
-    hwp_mode = HWP_PERFORMANCE_VALUE if performance_mode is True else HWP_DEFAULT_VALUE
-    # a CPU that disappears mid-loop is fatal rather than falling back to a broadcast write
+    if not isinstance(epp, int) or not 0 <= epp <= 255:
+        raise ValueError(f'HWP EPP must be an integer from 0 to 255, got {epp!r}.')
+    if not (readmsr('IA32_PM_ENABLE', 0, 0, cpu=0) & 1):
+        warning('HWP/Speed Shift is disabled; skipping EPP write.')
+        return
+
+    requests = []
+    package_control = False
     for addr in _ensure_msr_module():
         cpu = int(os.path.basename(os.path.dirname(addr)))
         cur_val = readmsr('IA32_HWP_REQUEST', cpu=cpu)
-        new_val = (cur_val & 0xFFFFFFFF00FFFFFF) | (hwp_mode << 24)
-        writemsr('IA32_HWP_REQUEST', new_val, cpu=cpu)
-        if args.debug:
-            read_value = readmsr('IA32_HWP_REQUEST', from_bit=24, to_bit=31, cpu=cpu)
-            match = OK if hwp_mode == read_value else ERR
-            log(f'[D] HWP CPU {cpu:d} - write "{hwp_mode:#02x}" - read "{read_value:#02x}" - match {match}')
+        requests.append((cpu, cur_val))
+        package_control = package_control or bool((cur_val >> 42) & 1)
+
+    epp_mask = 0xFF << 24
+    fields = []
+    if package_control:
+        fields.append((
+            'IA32_HWP_REQUEST_PKG',
+            0,
+            epp_mask,
+            epp << 24,
+            'HWP package EPP',
+        ))
+    for cpu, _ in requests:
+        fields.append((
+            'IA32_HWP_REQUEST',
+            cpu,
+            epp_mask,
+            epp << 24,
+            f'HWP CPU {cpu:d} EPP',
+        ))
+
+    results = write_msr_fields_transaction(fields)
+    if args.debug:
+        if package_control:
+            readback = results[('IA32_HWP_REQUEST_PKG', 0)]
+            log(f'[D] HWP package - EPP "{(readback >> 24) & 0xFF:#02x}" - match {OK}')
+        for cpu, _ in requests:
+            readback = results[('IA32_HWP_REQUEST', cpu)]
+            log(f'[D] HWP CPU {cpu:d} - EPP "{(readback >> 24) & 0xFF:#02x}" - match {OK}')
+
+
+def set_hwp(performance_mode):
+    """Backward-compatible HWP_Mode wrapper."""
+    if performance_mode not in (True, False):
+        return
+    set_hwp_epp(HWP_PERFORMANCE_VALUE if performance_mode else HWP_DEFAULT_VALUE)
+
+
+def _hwp_epp(config, source=None):
+    source = source or power.get('source')
+    if source not in POWER_PROFILES:
+        return None
+
+    epp = config.getint(source, 'HWP_EPP', fallback=None) if source in config else None
+    if epp is not None:
+        return epp
+
+    legacy = config.getboolean('AC', 'HWP_Mode', fallback=None) if 'AC' in config else None
+    if legacy is None:
+        return None
+    return HWP_PERFORMANCE_VALUE if legacy and source == 'AC' else HWP_DEFAULT_VALUE
+
+
+def _turbo_setting(config, source=None):
+    source = source or power.get('source')
+    if source not in POWER_PROFILES or source not in config:
+        return None
+    disable = config.getboolean(source, 'Disable_Turbo', fallback=None)
+    return None if disable is None else not disable
 
 
 def _hwp_mode(config):
-    return config.getboolean('AC', 'HWP_Mode', fallback=None) and power['source'] == 'AC'
+    """Legacy helper retained for callers/tests that still use HWP_Mode."""
+    value = _hwp_epp(config)
+    if value is None:
+        return None
+    return value == HWP_PERFORMANCE_VALUE
+
+
+def _hwp_has_explicit_epp(config, source=None):
+    source = source or power.get('source')
+    return source in POWER_PROFILES and source in config and config.has_option(source, 'HWP_EPP')
+
+
+def _legacy_hwp_enabled(config):
+    return 'AC' in config and config.getboolean('AC', 'HWP_Mode', fallback=False)
+
+
+def _hwp_should_reassert(config, source=None):
+    """Return whether EPP should be periodically managed for this profile."""
+    source = source or power.get('source')
+    if _hwp_has_explicit_epp(config, source):
+        return True
+    return bool(_legacy_hwp_enabled(config) and source == 'AC')
+
+
+def _hwp_should_apply_event(config, source=None):
+    """Return whether source/resume events should actively reapply EPP."""
+    source = source or power.get('source')
+    return _hwp_has_explicit_epp(config, source) or _legacy_hwp_enabled(config)
+
+
+def _bdprochot_setting(config, source=None):
+    """Return explicit desired BD PROCHOT state while preserving legacy semantics.
+
+    BDPROCHOT_Enabled is the reversible profile control. The historical
+    Disable_BDPROCHOT option remains one-way: True disables; False/absent means
+    leave the current hardware state untouched.
+    """
+    source = source or power.get('source')
+    if source not in POWER_PROFILES or source not in config:
+        return None
+
+    explicit = config.getboolean(source, 'BDPROCHOT_Enabled', fallback=None)
+    if explicit is not None:
+        return explicit
+
+    legacy_disable = config.getboolean(source, 'Disable_BDPROCHOT', fallback=None)
+    if legacy_disable:
+        return False
+    return None
+
+
+def set_turbo(enabled):
+    """Set IA32_MISC_ENABLE[38] transactionally across online CPUs."""
+    if enabled is None:
+        return
+    mask = 1 << TURBO_DISABLE_BIT
+    desired = 0 if enabled else mask
+    cpus = [int(os.path.basename(os.path.dirname(addr))) for addr in _ensure_msr_module()]
+    fields = [
+        ('IA32_MISC_ENABLE', cpu, mask, desired, 'Turbo Disable')
+        for cpu in cpus
+    ]
+    results = write_msr_fields_transaction(fields)
+    if args.debug:
+        expected = 0 if enabled else 1
+        for cpu in cpus:
+            readback = results[('IA32_MISC_ENABLE', cpu)]
+            read_value = (readback >> TURBO_DISABLE_BIT) & 1
+            log(
+                f'[D] Turbo CPU {cpu:d} - disable={read_value:d} '
+                f'- match {OK if read_value == expected else ERR}'
+            )
+
+
+
+def set_bdprochot(enabled):
+    """Set MSR_POWER_CTL[0] transactionally across online CPUs."""
+    if enabled is None:
+        return
+    expected = 1 if enabled else 0
+    mask = 1 << BD_PROCHOT_ENABLE_BIT
+    desired = mask if enabled else 0
+    cpus = [int(os.path.basename(os.path.dirname(addr))) for addr in _ensure_msr_module()]
+    fields = [
+        ('MSR_POWER_CTL', cpu, mask, desired, 'BD PROCHOT')
+        for cpu in cpus
+    ]
+    results = write_msr_fields_transaction(fields)
+    if args.debug:
+        for cpu in cpus:
+            readback = results[('MSR_POWER_CTL', cpu)]
+            read_value = 1 if readback & mask else 0
+            log(
+                f'[D] BDPROCHOT CPU {cpu:d} - state "{read_value:#02x}" '
+                f'- match {OK if read_value == expected else ERR}'
+            )
+
 
 
 def set_disable_bdprochot():
-    """Clear bit 0 of MSR_POWER_CTL to disable BDPROCHOT."""
-    cur_val = readmsr('MSR_POWER_CTL', flatten=True)
-    new_val = cur_val & 0xFFFFFFFFFFFFFFFE
-
-    writemsr('MSR_POWER_CTL', new_val)
-    if args.debug:
-        read_value = readmsr('MSR_POWER_CTL', from_bit=0, to_bit=0)[0]
-        match = OK if read_value == 0 else ERR
-        log(f'[D] BDPROCHOT - write "{0:#02x}" - read "{read_value:#02x}" - match {match}')
+    """Backward-compatible helper for the historical one-way control."""
+    set_bdprochot(False)
 
 
 def get_config_write_time():
@@ -1129,15 +1531,16 @@ def get_config_write_time():
 
 
 def reload_config():
-    """Re-read the config and re-apply undervolt, IccMax and HWP settings."""
+    """Re-read config and compute a new register plan without touching hardware.
+
+    The power thread publishes the new config/plan under config_lock and then
+    applies the whole profile under hardware_lock, avoiding resume/reload races.
+    """
     config = load_config()
     if not config_is_enabled(config):
         log('[I] Reloading changes.')
         return config, defaultdict(dict)
     regs = calc_reg_values(get_cpu_platform_info(), config)
-    undervolt(config)
-    set_icc_max(config)
-    set_hwp(_hwp_mode(config))
     log('[I] Reloading changes.')
     return config, regs
 
@@ -1218,6 +1621,226 @@ def read_mchbar_base():
     return None
 
 
+def open_mchbar_power_limit_mmio(expected_msr=None):
+    """Open direct MCHBAR for writes only after a true read-only MMIO==MSR preflight."""
+    if expected_msr is None:
+        warning('Direct MCHBAR requires an MSR equality preflight; write mapping not opened.')
+        return None
+    mchbar_base = read_mchbar_base()
+    if mchbar_base is None:
+        return None
+    address = mchbar_base + MCHBAR_PACKAGE_POWER_LIMIT_OFFSET
+    try:
+        with MMIO(address, MCHBAR_PACKAGE_POWER_LIMIT_SIZE, readonly=True) as probe_mapping:
+            mmio_raw = probe_mapping.read64(0)
+        if mmio_raw != expected_msr:
+            warning(
+                f'Direct MCHBAR preflight mismatch: MMIO={mmio_raw:#x}, MSR={expected_msr:#x}; '
+                'direct MCHBAR writes are disabled for this run.'
+            )
+            return None
+
+        mapping = MMIO(address, MCHBAR_PACKAGE_POWER_LIMIT_SIZE)
+        # Re-check after reopening RW to close the TOCTOU window before callers write.
+        rw_raw = mapping.read64(0)
+        if rw_raw != expected_msr:
+            warning(
+                f'Direct MCHBAR changed after read-only preflight: MMIO={rw_raw:#x}, '
+                f'MSR={expected_msr:#x}; direct writes are disabled.'
+            )
+            mapping.close()
+            return None
+        return mapping
+    except (MMIOError, OSError) as e:
+        warning(f'Unable to open/read /dev/mem MCHBAR ({e}); direct MMIO writes are disabled.')
+        warning(
+            'Check CONFIG_DEVMEM=y and that kernel lockdown is disabled '
+            '(CONFIG_IO_STRICT_DEVMEM can also block this region).'
+        )
+        return None
+
+
+def apply_package_power_limit(write_value, mmio_powercap=None, mchbar_mmio=None):
+    """Apply one synchronized package-power value without control-plane drift.
+
+    Every synchronized TPL update requires a direct MCHBAR mirror that already
+    passed the same-run MMIO==MSR preflight. When kernel intel-rapl-mmio is
+    available it is additionally used for watts/Tau bounds and readback, but it
+    is never sufficient by itself.
+    """
+    msr_before = readmsr('MSR_PKG_POWER_LIMIT', cpu=0)
+    if (msr_before >> PKG_POWER_LIMIT_LOCK_BIT) & 1:
+        warning('MSR_PKG_POWER_LIMIT became locked; package power-limit write skipped.')
+        return mmio_powercap, mchbar_mmio
+
+    direct_before = None
+    if mchbar_mmio is not None:
+        try:
+            direct_before = mchbar_mmio.read64(0)
+        except OSError as e:
+            warning(f'Unable to read validated MCHBAR mirror ({e}); disabling direct MCHBAR writes.')
+            mchbar_mmio = None
+        else:
+            if direct_before != msr_before:
+                warning(
+                    f'MCHBAR/MSR diverged before write (MMIO={direct_before:#x}, MSR={msr_before:#x}); '
+                    'disabling direct MCHBAR writes.'
+                )
+                mchbar_mmio = None
+                direct_before = None
+
+    if mchbar_mmio is None:
+        warning(
+            'No MMIO==MSR-validated direct MCHBAR mirror is available; skipping the entire '
+            'TPL update to avoid preserving or deepening an MSR/MMIO split-brain state.'
+        )
+        return mmio_powercap, mchbar_mmio
+
+    powercap_before = mmio_powercap.snapshot() if mmio_powercap is not None else None
+    power_unit = None
+    time_unit = None
+    if mmio_powercap is not None:
+        # Read immutable RAPL units before any state-changing write. If this
+        # fails, fatal/readmsr exits before MSR/MMIO state can become partial.
+        power_unit = get_power_unit()
+        time_unit = get_time_unit()
+
+    msr_changed = False
+    try:
+        if msr_before != write_value:
+            writemsr('MSR_PKG_POWER_LIMIT', write_value, cpu=0)
+            msr_changed = True
+            readback = readmsr('MSR_PKG_POWER_LIMIT', cpu=0)
+            if readback != write_value:
+                raise OSError(
+                    f'MSR_PKG_POWER_LIMIT verify failed: wrote {write_value:#x}, read {readback:#x}'
+                )
+
+        if mmio_powercap is not None:
+            mmio_powercap.write(
+                pl1_w=get_value_for_bits(write_value, 0, 14) * power_unit,
+                pl2_w=get_value_for_bits(write_value, 32, 46) * power_unit,
+                tau1_s=decode_time_window_field(get_value_for_bits(write_value, 17, 23), time_unit),
+                tau2_s=decode_time_window_field(get_value_for_bits(write_value, 49, 55), time_unit),
+            )
+
+        if mchbar_mmio is not None:
+            mmio_current = mchbar_mmio.read64(0)
+            if (mmio_current >> PKG_POWER_LIMIT_LOCK_BIT) & 1:
+                raise OSError('MCHBAR package power limit is locked')
+            if mmio_current != write_value:
+                mchbar_mmio.write64(0, write_value)
+            mmio_readback = mchbar_mmio.read64(0)
+            if mmio_readback != write_value:
+                raise OSError(
+                    f'MCHBAR package-power verify failed: wrote {write_value:#x}, read {mmio_readback:#x}'
+                )
+    except (OSError, PowercapError) as e:
+        rollback_errors = []
+        # Restore the narrower kernel powercap view first, then the full direct
+        # mirror so powercap cannot overwrite a just-restored MCHBAR value.
+        if powercap_before is not None and mmio_powercap is not None:
+            try:
+                mmio_powercap.restore(powercap_before)
+            except PowercapError as rollback_error:
+                rollback_errors.append(f'powercap: {rollback_error}')
+        if mchbar_mmio is not None and direct_before is not None:
+            try:
+                if mchbar_mmio.read64(0) != direct_before:
+                    mchbar_mmio.write64(0, direct_before)
+                if mchbar_mmio.read64(0) != direct_before:
+                    rollback_errors.append('MCHBAR verify mismatch')
+            except (OSError, MMIOError) as rollback_error:
+                rollback_errors.append(f'MCHBAR: {rollback_error}')
+        if msr_changed:
+            try:
+                writemsr('MSR_PKG_POWER_LIMIT', msr_before, cpu=0)
+                if readmsr('MSR_PKG_POWER_LIMIT', cpu=0) != msr_before:
+                    rollback_errors.append('MSR verify mismatch')
+            except (OSError, IOError) as rollback_error:
+                rollback_errors.append(f'MSR: {rollback_error}')
+        suffix = f'; rollback issues: {"; ".join(rollback_errors)}' if rollback_errors else '; rollback attempted'
+        warning(f'Package power update failed: {e}{suffix}', oneshot=False)
+
+    return mmio_powercap, mchbar_mmio
+
+
+def apply_profile_registers(regs, power_source, mmio_powercap=None, mchbar_mmio=None):
+    """Apply directly readable profile MSRs for one source and return MMIO backends."""
+    if power_source not in regs:
+        return mmio_powercap, mchbar_mmio
+
+    profile_regs = regs[power_source]
+
+    if 'MSR_TEMPERATURE_TARGET' in profile_regs:
+        write_value = profile_regs['MSR_TEMPERATURE_TARGET']
+        current = readmsr('MSR_TEMPERATURE_TARGET', cpu=0)
+        if (current >> 31) & 1:
+            warning('MSR_TEMPERATURE_TARGET TCC offset is locked; temperature-target write skipped.')
+        else:
+            offset_mask = 0x3F << 24
+            write_msr_field_verified(
+                'MSR_TEMPERATURE_TARGET',
+                0,
+                offset_mask,
+                write_value,
+                'Temperature target offset',
+            )
+
+    if 'MSR_CONFIG_TDP_CONTROL' in profile_regs:
+        write_value = profile_regs['MSR_CONFIG_TDP_CONTROL']
+        current = readmsr('MSR_CONFIG_TDP_CONTROL', cpu=0)
+        if (current >> 31) & 1:
+            warning('MSR_CONFIG_TDP_CONTROL is locked; cTDP write skipped.')
+        else:
+            write_msr_field_verified(
+                'MSR_CONFIG_TDP_CONTROL',
+                0,
+                0x3,
+                write_value,
+                'cTDP target',
+            )
+
+    if 'MSR_PKG_POWER_LIMIT' in profile_regs:
+        mmio_powercap, mchbar_mmio = apply_package_power_limit(
+            profile_regs['MSR_PKG_POWER_LIMIT'],
+            mmio_powercap=mmio_powercap,
+            mchbar_mmio=mchbar_mmio,
+        )
+
+    return mmio_powercap, mchbar_mmio
+
+
+def apply_runtime_profile(
+    config,
+    regs,
+    power_source,
+    *,
+    mmio_powercap=None,
+    mchbar_mmio=None,
+    apply_mailbox=False,
+    apply_hwp=False,
+):
+    """Apply one internally consistent power profile while hardware_lock is held."""
+    if apply_mailbox:
+        undervolt(config, source=power_source)
+        set_icc_max(config, source=power_source)
+
+    if regs is not None:
+        mmio_powercap, mchbar_mmio = apply_profile_registers(
+            regs,
+            power_source,
+            mmio_powercap=mmio_powercap,
+            mchbar_mmio=mchbar_mmio,
+        )
+
+    set_bdprochot(_bdprochot_setting(config, power_source))
+    set_turbo(_turbo_setting(config, power_source))
+    if apply_hwp:
+        set_hwp_epp(_hwp_epp(config, power_source))
+    return mmio_powercap, mchbar_mmio
+
+
 def power_thread(state, exit_event):
     """Crash-loud wrapper for _power_thread: an uncaught exception (or a
     sys.exit() from a helper) would only kill this thread, leaving a zombie
@@ -1235,20 +1858,16 @@ def power_thread(state, exit_event):
 def _power_thread(state, exit_event):
     """Daemon main loop: periodically (re-)apply throttling MSRs."""
     config, regs = state['config'], state['regs']
-    mchbar_base = read_mchbar_base()
     mchbar_mmio = None
-    if mchbar_base is not None:
-        try:
-            mchbar_mmio = MMIO(
-                mchbar_base + MCHBAR_PACKAGE_POWER_LIMIT_OFFSET,
-                MCHBAR_PACKAGE_POWER_LIMIT_SIZE,
-            )
-        except MMIOError:
-            warning('Unable to open /dev/mem. MMIO package power-limit writes are disabled.')
-            warning(
-                'Check CONFIG_DEVMEM=y and that kernel lockdown is disabled '
-                '(CONFIG_IO_STRICT_DEVMEM can also block this region).'
-            )
+    has_tpl = any('MSR_PKG_POWER_LIMIT' in regs.get(profile, {}) for profile in POWER_PROFILES)
+    mmio_powercap = find_mmio_package_zone() if has_tpl else None
+    if has_tpl:
+        pkg_baseline = readmsr('MSR_PKG_POWER_LIMIT', cpu=0)
+        mchbar_mmio = open_mchbar_power_limit_mmio(expected_msr=pkg_baseline)
+    if mmio_powercap is not None:
+        log(f'[I] Using kernel intel-rapl-mmio zone: {mmio_powercap.path}')
+    if mchbar_mmio is not None:
+        log('[I] Direct MCHBAR package-power mirror passed MMIO==MSR preflight.')
 
     next_hwp_write = 0
     applied_source = power['source']
@@ -1256,22 +1875,44 @@ def _power_thread(state, exit_event):
         get_config_write_time() if config.getboolean('GENERAL', 'Autoreload', fallback=False) else None
     )
     while not exit_event.is_set():
+        config_reloaded = False
         # Reload config on changes (unless it's deleted)
         if config.getboolean('GENERAL', 'Autoreload', fallback=False):
             config_write_time = get_config_write_time()
             if config_write_time and last_config_write_time != config_write_time:
                 last_config_write_time = config_write_time
+                new_config, new_regs = reload_config()
                 with config_lock:
-                    state['config'], state['regs'] = reload_config()
-                config, regs = state['config'], state['regs']
+                    state['config'], state['regs'] = new_config, new_regs
+                    config, regs = new_config, new_regs
+                config_reloaded = True
 
-        # switch back to sysfs polling
+        # Switch back to sysfs polling and publish the source atomically.
         if power['method'] == 'polling':
-            power['source'] = 'BATTERY' if is_on_battery(config) else 'AC'
+            polled_source = 'BATTERY' if is_on_battery(config) else 'AC'
+            with config_lock:
+                power['source'] = polled_source
 
-        # snapshot the power source once per iteration: the D-Bus callback can
-        # flip it concurrently and every write below must agree on one profile
-        power_source = power['source']
+        # Snapshot the source under the same publication lock used by D-Bus.
+        with config_lock:
+            power_source = power['source']
+
+        # Reconcile privileged TPL backends immediately after reload, even when
+        # the new config disables the daemon. This shrinks privileges before
+        # the Enabled=False write barrier continues the loop.
+        if config_reloaded:
+            has_tpl = any('MSR_PKG_POWER_LIMIT' in regs.get(profile, {}) for profile in POWER_PROFILES)
+            if not has_tpl:
+                mmio_powercap = None
+                if mchbar_mmio is not None:
+                    mchbar_mmio.close()
+                    mchbar_mmio = None
+            else:
+                if mmio_powercap is None:
+                    mmio_powercap = find_mmio_package_zone()
+                if mchbar_mmio is None:
+                    pkg_baseline = readmsr('MSR_PKG_POWER_LIMIT', cpu=0)
+                    mchbar_mmio = open_mchbar_power_limit_mmio(expected_msr=pkg_baseline)
 
         # Enabled=False is a hard write barrier, including the iteration that
         # observes an enabled -> disabled autoreload transition.
@@ -1287,71 +1928,35 @@ def _power_thread(state, exit_event):
                 for key, value in core_thermal_status.items():
                     log(f'[D] core {index} thermal status: {key.replace("_", " ")} = {value}')
 
-        # re-apply the one-shot per-profile settings when the power source flips
-        if power_source != applied_source:
+        source_changed = power_source != applied_source
+        if source_changed:
             log(f'[I] Power source changed: {applied_source:s} -> {power_source:s}')
-            undervolt(config, source=power_source)
-            set_icc_max(config, source=power_source)
-            if config.getboolean('AC', 'HWP_Mode', fallback=False):
-                if power_source == 'AC':
-                    next_hwp_write = 0
-                else:
-                    # restore the default energy/performance preference on battery
-                    set_hwp(False)
-            applied_source = power_source
 
-        # set temperature trip point
-        if 'MSR_TEMPERATURE_TARGET' in regs[power_source]:
-            write_value = regs[power_source]['MSR_TEMPERATURE_TARGET']
-            writemsr('MSR_TEMPERATURE_TARGET', write_value)
-            if args.debug:
-                read_value = readmsr('MSR_TEMPERATURE_TARGET', 24, 29, flatten=True)
-                match = OK if write_value >> 24 == read_value else ERR
-                log(f'[D] TEMPERATURE_TARGET - write {write_value >> 24:#x} - read {read_value:#x} - match {match}')
-
-        # set cTDP
-        if 'MSR_CONFIG_TDP_CONTROL' in regs[power_source]:
-            write_value = regs[power_source]['MSR_CONFIG_TDP_CONTROL']
-            writemsr('MSR_CONFIG_TDP_CONTROL', write_value)
-            if args.debug:
-                read_value = readmsr('MSR_CONFIG_TDP_CONTROL', 0, 1, flatten=True)
-                match = OK if write_value == read_value else ERR
-                log(f'[D] CONFIG_TDP_CONTROL - write {write_value:#x} - read {read_value:#x} - match {match}')
-
-        # set PL1/2 on MSR
-        if 'MSR_PKG_POWER_LIMIT' in regs[power_source]:
-            write_value = regs[power_source]['MSR_PKG_POWER_LIMIT']
-            writemsr('MSR_PKG_POWER_LIMIT', write_value)
-            if args.debug:
-                read_value = readmsr('MSR_PKG_POWER_LIMIT', 0, 55, flatten=True)
-                match = OK if write_value == read_value else ERR
-                log(f'[D] MSR PACKAGE_POWER_LIMIT - write {write_value:#x} - read {read_value:#x} - match {match}')
-            if mchbar_mmio is not None:
-                # set MCHBAR register to the same PL1/2 values
-                try:
-                    mchbar_mmio.write64(0, write_value)
-                    if args.debug:
-                        read_value = mchbar_mmio.read64(0)
-                        match = OK if write_value == read_value else ERR
-                        log(
-                            f'[D] MCHBAR PACKAGE_POWER_LIMIT - write {write_value:#x} - read {read_value:#x} - match {match}'
-                        )
-                except OSError as e:
-                    warning(f'Unable to write MCHBAR package power limits ({e}); disabling only MMIO writes.')
-                    mchbar_mmio = None
-
-        # Disable BDPROCHOT
-        disable_bdprochot = config.getboolean(power_source, 'Disable_BDPROCHOT', fallback=None)
-        if disable_bdprochot:
-            set_disable_bdprochot()
-
-        wait_t = get_update_rate(config, power_source)
-        enable_hwp_mode = config.getboolean('AC', 'HWP_Mode', fallback=None)
-        # set HWP less frequently. Just to be safe since (e.g.) TLP might reset this value
-        if enable_hwp_mode and next_hwp_write <= time() and power_source == 'AC':
-            set_hwp(enable_hwp_mode)
+        hwp_epp = _hwp_epp(config, power_source)
+        event_hwp_due = hwp_epp is not None and (
+            config_reloaded or (source_changed and _hwp_should_apply_event(config, power_source))
+        )
+        periodic_hwp_due = (
+            hwp_epp is not None
+            and _hwp_should_reassert(config, power_source)
+            and next_hwp_write <= time()
+        )
+        hwp_due = event_hwp_due or periodic_hwp_due
+        with hardware_lock:
+            mmio_powercap, mchbar_mmio = apply_runtime_profile(
+                config,
+                regs,
+                power_source,
+                mmio_powercap=mmio_powercap,
+                mchbar_mmio=mchbar_mmio,
+                apply_mailbox=source_changed or config_reloaded,
+                apply_hwp=hwp_due,
+            )
+        applied_source = power_source
+        if hwp_due:
             next_hwp_write = time() + HWP_INTERVAL
 
+        wait_t = get_update_rate(config, power_source)
         exit_event.wait(wait_t)
 
 
@@ -1384,7 +1989,7 @@ def check_kernel():
         log('[W] Unable to obtain and validate kernel config.')
         return
     elif not re.search('CONFIG_DEVMEM=y', kernel_config):
-        warning('Bad kernel config: you need CONFIG_DEVMEM=y.')
+        warning('CONFIG_DEVMEM is unavailable; direct /dev/mem MCHBAR fallback will be disabled.')
     if not re.search('CONFIG_X86_MSR=(y|m)', kernel_config):
         fatal('Bad kernel config: you need CONFIG_X86_MSR builtin or as module.')
 
@@ -1428,32 +2033,61 @@ def check_cpu():
         fatal(f'Unable to identify CPU model: {e}')
 
 
-def test_msr_rw_capabilities():
-    """Probe optional MSR features and mark unavailable ones as such."""
+def _has_configured_section(config, sections):
+    return config is not None and any(section in config for section in sections)
+
+
+def _hwp_is_configured(config):
+    if config is None:
+        return True
+    return (
+        ('AC' in config and (
+            config.has_option('AC', 'HWP_Mode')
+            or config.has_option('AC', 'HWP_EPP')
+        ))
+        or ('BATTERY' in config and config.has_option('BATTERY', 'HWP_EPP'))
+    )
+
+
+def test_msr_rw_capabilities(config=None):
+    """Probe only optional features that the active configuration will use.
+
+    Passing None preserves the historical explicit self-test behavior for
+    callers/tests. The daemon passes its config so unused OC-mailbox features
+    never receive hidden WRMSR selector transactions.
+    """
     global TESTMSR
     TESTMSR = True
     try:
-        try:
-            log('[I] Testing if undervolt is supported...')
-            get_undervolt()
-        except (IOError, OSError):
-            warning('Undervolt seems not to be supported by your system, disabling.')
-            UNSUPPORTED_FEATURES.append('UNDERVOLT')
+        if config is None or _has_configured_section(config, UNDERVOLT_KEYS):
+            try:
+                log('[I] Testing if undervolt is supported...')
+                get_undervolt()
+            except (IOError, OSError):
+                warning('Undervolt seems not to be supported by your system, disabling.')
+                UNSUPPORTED_FEATURES.append('UNDERVOLT')
+        else:
+            log('[I] Undervolt is not configured; OC mailbox capability probe skipped.')
 
-        try:
-            log('[I] Testing if IccMax is supported...')
-            get_icc_max()
-        except (IOError, OSError):
-            warning('IccMax seems not to be supported by your system, disabling.')
-            UNSUPPORTED_FEATURES.append('ICCMAX')
+        if config is None or _has_configured_section(config, ICCMAX_KEYS):
+            try:
+                log('[I] Testing if IccMax is supported...')
+                get_icc_max()
+            except (IOError, OSError):
+                warning('IccMax seems not to be supported by your system, disabling.')
+                UNSUPPORTED_FEATURES.append('ICCMAX')
+        else:
+            log('[I] IccMax is not configured; OC mailbox capability probe skipped.')
 
-        try:
-            log('[I] Testing if HWP is supported...')
-            cur_val = readmsr('IA32_HWP_REQUEST', cpu=0)
-            writemsr('IA32_HWP_REQUEST', cur_val, cpu=0)
-        except (IOError, OSError):
-            warning('HWP seems not to be supported by your system, disabling.')
-            UNSUPPORTED_FEATURES.append('HWP')
+        if _hwp_is_configured(config):
+            try:
+                log('[I] Testing if HWP is supported...')
+                if not (readmsr('IA32_PM_ENABLE', 0, 0, cpu=0) & 1):
+                    raise OSError('HWP/Speed Shift is disabled')
+                readmsr('IA32_HWP_REQUEST', cpu=0)
+            except (IOError, OSError):
+                warning('HWP seems not to be supported/enabled by your system, disabling.')
+                UNSUPPORTED_FEATURES.append('HWP')
 
         if args.monitor is not None:
             for domain, msr in tuple(MONITOR_POWER_DOMAINS.items()):
@@ -1466,8 +2100,8 @@ def test_msr_rw_capabilities():
         TESTMSR = False
 
 
-def monitor(exit_event, wait, cpuid=None):
-    """Live-display throttling causes and per-domain power until exit_event is set."""
+def monitor(exit_event, wait, cpuid=None, config=None):
+    """Live-display throttling causes and power without implicit OC-mailbox queries."""
     wait = max(0.1, wait)
     prev_energy = {}
     if MONITOR_POWER_DOMAINS:
@@ -1481,14 +2115,18 @@ def monitor(exit_event, wait, cpuid=None):
             for domain, msr in MONITOR_POWER_DOMAINS.items()
         }
 
-    if 'UNDERVOLT' in UNSUPPORTED_FEATURES:
+    if config is not None and not _has_configured_section(config, UNDERVOLT_KEYS):
+        log('[D] Undervolt offsets: not configured (OC mailbox not queried)')
+    elif 'UNDERVOLT' in UNSUPPORTED_FEATURES:
         log('[D] Undervolt offsets: unsupported')
     else:
         undervolt_values = get_undervolt(convert=True)
         undervolt_output = ' | '.join(f'{plane:s}: {undervolt_values[plane]:.2f} mV' for plane in VOLTAGE_PLANES)
         log(f'[D] Undervolt offsets: {undervolt_output:s}')
 
-    if 'ICCMAX' in UNSUPPORTED_FEATURES:
+    if config is not None and not _has_configured_section(config, ICCMAX_KEYS):
+        log('[D] IccMax: not configured (OC mailbox not queried)')
+    elif 'ICCMAX' in UNSUPPORTED_FEATURES:
         log('[D] IccMax: unsupported')
     else:
         iccmax_values = get_icc_max(convert=True)
@@ -1527,6 +2165,27 @@ def monitor(exit_event, wait, cpuid=None):
         exit_event.wait(wait)
 
 
+def acquire_daemon_lock():
+    """Hold a process-wide lock so one-shot controls can detect manual daemons too."""
+    global _daemon_lock_file
+    directory = os.path.dirname(DAEMON_LOCK_PATH)
+    try:
+        os.makedirs(directory, mode=0o755, exist_ok=True)
+        handle = open(DAEMON_LOCK_PATH, 'a+', encoding='ascii')
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f'{os.getpid()}\n')
+        handle.flush()
+    except (OSError, BlockingIOError) as exc:
+        try:
+            handle.close()
+        except (NameError, OSError):
+            pass
+        fatal(f'Another throttled daemon instance is already active or the daemon lock cannot be acquired: {exc}')
+    _daemon_lock_file = handle
+
+
 def positive_finite_float(value):
     """Parse a finite, positive command-line float."""
     try:
@@ -1546,6 +2205,7 @@ def build_arg_parser():
         parser = argparse.ArgumentParser()
     exclusive_group = parser.add_mutually_exclusive_group()
     exclusive_group.add_argument('--debug', action='store_true', help='add some debug info and additional checks')
+    exclusive_group.add_argument('--probe', action='store_true', help='read-only HP EliteBook 830 G6 bring-up probe')
     exclusive_group.add_argument(
         '--monitor',
         metavar='update_rate',
@@ -1554,6 +2214,8 @@ def build_arg_parser():
         nargs='?',
         help='realtime monitoring of throttling causes (default 1s)',
     )
+    parser.add_argument('--json', action='store_true', help='with --probe: print JSON output')
+    parser.add_argument('--snapshot', metavar='PATH', help='with --probe: save a read-only stock snapshot')
     parser.add_argument('--config', default='/etc/throttled.conf', help='override default config file path')
     parser.add_argument('--force', action='store_true', help='bypass compatibility checks (EXPERTS only)')
     parser.add_argument('--log', metavar='/path/to/file', help='log to file instead of stdout')
@@ -1565,7 +2227,22 @@ def main():
     """Daemon entrypoint: parse args, validate platform, start power thread."""
     global args
 
-    args = build_arg_parser().parse_args()
+    parser = build_arg_parser()
+    args = parser.parse_args()
+
+    if getattr(args, 'probe', False):
+        from throttled_probe import main as probe_main
+
+        probe_args = []
+        if getattr(args, 'json', False):
+            probe_args.append('--json')
+        snapshot_path = getattr(args, 'snapshot', None)
+        if snapshot_path:
+            probe_args.extend(('--snapshot', snapshot_path))
+        return probe_main(probe_args)
+
+    if getattr(args, 'json', False) or getattr(args, 'snapshot', None):
+        parser.error('--json/--snapshot are valid only together with --probe')
 
     if args.log:
         try:
@@ -1580,14 +2257,19 @@ def main():
         log('[I] Throttled is disabled in config file... Quitting. :(')
         return
 
+    if os.geteuid() != 0:
+        fatal('No root no party. Try again with sudo.')
+
     cpuid = None
     if not args.force:
         check_kernel()
         cpuid = check_cpu()
 
+    acquire_daemon_lock()
+
     set_msr_allow_writes()
 
-    test_msr_rw_capabilities()
+    test_msr_rw_capabilities(config)
 
     power['source'] = 'BATTERY' if is_on_battery(config) else 'AC'
 
@@ -1599,7 +2281,9 @@ def main():
 
     undervolt(config)
     set_icc_max(config)
-    set_hwp(_hwp_mode(config))
+    set_hwp_epp(_hwp_epp(config, power['source']))
+    set_turbo(_turbo_setting(config, power['source']))
+    set_bdprochot(_bdprochot_setting(config, power['source']))
 
     state = {'config': config, 'regs': regs}
 
@@ -1612,7 +2296,7 @@ def main():
 
     monitor_thread = None
     if args.monitor is not None:
-        monitor_thread = Thread(target=monitor, args=(exit_event, args.monitor, cpuid))
+        monitor_thread = Thread(target=monitor, args=(exit_event, args.monitor, cpuid, config))
         monitor_thread.daemon = True
         monitor_thread.start()
 
@@ -1628,4 +2312,4 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())
