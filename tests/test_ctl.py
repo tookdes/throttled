@@ -50,6 +50,12 @@ class ControlEncodingTests(unittest.TestCase):
         self.assertFalse(disabled & 1)
         self.assertEqual(raw & ~1, disabled)
 
+    def test_bd_prochot_refuses_locked_state_change(self):
+        raw = (1 << ctl.BD_PROCHOT_LOCK_BIT) | 1
+        self.assertEqual(ctl.update_bd_prochot(raw, True), raw)
+        with self.assertRaises(ctl.ControlError):
+            ctl.update_bd_prochot(raw, False)
+
     def test_power_update_preserves_unrelated_bits(self):
         units = {"power_w": 0.125, "time_s": 1 / 1024}
         original = (
