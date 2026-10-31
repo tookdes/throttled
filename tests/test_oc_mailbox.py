@@ -141,6 +141,28 @@ class OcMailboxTests(unittest.TestCase):
                 throttled.undervolt(config, source="AC")
         execute.assert_not_called()
 
+    def test_daemon_undervolt_backup_failure_refuses_first_hardware_change(self):
+        throttled = load_throttled()
+        config = configparser.ConfigParser()
+        config.read_dict({"UNDERVOLT.AC": {"CORE": "-50"}})
+        state = {plane: 0 for plane in throttled.VOLTAGE_PLANES}
+
+        def get_uv(plane=None, convert=False):
+            return {plane: state[plane]}
+
+        with mock.patch.object(throttled, "get_undervolt", side_effect=get_uv):
+            with mock.patch.object(throttled, "execute_oc_mailbox") as execute:
+                with mock.patch.object(
+                    throttled,
+                    "write_daemon_oc_recovery",
+                    side_effect=throttled.OCMailboxError("read-only filesystem"),
+                ):
+                    with self.assertRaises(throttled.OCMailboxError):
+                        throttled.undervolt(config, source="AC")
+
+        execute.assert_not_called()
+        self.assertTrue(all(value == 0 for value in state.values()))
+
     def test_daemon_undervolt_rolls_back_all_changed_planes_after_partial_failure(self):
         throttled = load_throttled()
         config = configparser.ConfigParser()
