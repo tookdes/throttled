@@ -230,8 +230,13 @@ FIXED_DRAM_ENERGY_UNIT_MODELS = {63, 79, 85, 86, 87}
 # rest on coreboot's MCH_PKG_POWER_LIMIT_LO (the MSR 0x610 mirror) and a live
 # MMIO == MSR equality check on 0x3ec4. Groups follow Linux igen6/ie31200 EDAC.
 MCHBAR_ADDRESS_MASKS_BY_PCI_DEVICE = {
-    # Kaby Lake-U/R and Coffee Lake-H target systems (T480/T480s/X1C6, P53).
+    # Kaby Lake-U/R and Coffee/Whiskey Lake target systems.
+    # coreboot inteltool groups 8th-gen U/Whiskey Lake with a 32 KiB MCHBAR
+    # at address bits 38:15; coreboot Cannon Lake/Whiskey Lake systemagent
+    # defines MCH_PKG_POWER_LIMIT at MCHBAR + 0x59a0.
     0x5914: MCHBAR_ADDRESS_MASK_39_15,
+    0x3E34: MCHBAR_ADDRESS_MASK_39_15,  # Whiskey Lake-U 4-core
+    0x3E35: MCHBAR_ADDRESS_MASK_39_15,  # Whiskey Lake-U 2-core
     0x3EC4: MCHBAR_ADDRESS_MASK_39_15,
     # Comet Lake-H (Intel doc 615212; coreboot PCI_DID_INTEL_CML_H).
     0x9B54: MCHBAR_ADDRESS_MASK_39_15,
