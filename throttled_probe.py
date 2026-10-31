@@ -563,8 +563,9 @@ def build_restore_plan(snapshot, current_cpus):
         item = snapshot.get("package_msrs", {}).get(name, {})
         if "value" in item:
             value = _snapshot_hex_value(item, name)
-            for cpu in current_cpus:
-                plan.append((cpu, name, value))
+            # 830 G6 is a single-package target. Package-scoped state is
+            # snapshotted from CPU0 and restored through CPU0 only.
+            plan.append((0, name, value))
 
     saved_per_cpu = snapshot.get("per_cpu_msrs", {})
     for cpu in current_cpus:
