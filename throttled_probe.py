@@ -19,6 +19,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from throttled_powercap import probe_powercap
+
 try:
     from mmio import MMIO, MMIOError
 except ImportError:
@@ -570,6 +572,7 @@ def probe_machine(msr):
     if rapl_error is None and pkg_error is None:
         power["package"] = decode_pkg_power_limit(pkg_raw, power["units"])
     report["power"] = power
+    report["powercap"] = probe_powercap()
     report["mmio"] = probe_mmio(pkg_raw if pkg_error is None else None)
 
     hwp = {
@@ -728,9 +731,23 @@ def format_report(report):
         )
         lines.append(f"  MSR lock: {fmt_bool(pkg['locked'])}")
 
+    powercap = report.get("powercap", {})
+    for label, title in (("msr", "Kernel intel-rapl"), ("mmio", "Kernel intel-rapl-mmio")):
+        zone = powercap.get(label)
+        if zone is None:
+            lines.append(f"  {title}: unavailable")
+            continue
+        pl1 = zone.get("pl1") or {}
+        pl2 = zone.get("pl2") or {}
+        pl1_w = pl1.get("power_limit_uw")
+        pl2_w = pl2.get("power_limit_uw")
+        rendered1 = "?" if pl1_w is None else f"{pl1_w / 1_000_000:.3f} W"
+        rendered2 = "?" if pl2_w is None else f"{pl2_w / 1_000_000:.3f} W"
+        lines.append(f"  {title}: {zone.get('path')} (PL1 {rendered1}, PL2 {rendered2})")
+
     mmio = report["mmio"]
     lines.append(
-        f"  MMIO mirror: {'readable' if mmio.get('available') else 'unavailable'}"
+        f"  Direct MCHBAR mirror: {'readable' if mmio.get('available') else 'unavailable'}"
         + (f", matches MSR={fmt_bool(mmio.get('matches_msr'))}" if mmio.get("available") else f" ({mmio.get('reason', 'unknown')})")
     )
     if "device_id" in mmio:
