@@ -392,7 +392,7 @@ def handle_sleep_prepare(sleeping, config_or_state):
                 mmio_powercap=mmio_powercap,
                 mchbar_mmio=mchbar_mmio,
                 apply_mailbox=True,
-                apply_hwp=True,
+                apply_hwp=_hwp_should_apply_event(config, source),
             )
         finally:
             if mchbar_mmio is not None:
@@ -1187,6 +1187,29 @@ def _hwp_mode(config):
     return value == HWP_PERFORMANCE_VALUE
 
 
+def _hwp_has_explicit_epp(config, source=None):
+    source = source or power.get('source')
+    return source in POWER_PROFILES and source in config and config.has_option(source, 'HWP_EPP')
+
+
+def _legacy_hwp_enabled(config):
+    return 'AC' in config and config.getboolean('AC', 'HWP_Mode', fallback=False)
+
+
+def _hwp_should_reassert(config, source=None):
+    """Return whether EPP should be periodically managed for this profile."""
+    source = source or power.get('source')
+    if _hwp_has_explicit_epp(config, source):
+        return True
+    return bool(_legacy_hwp_enabled(config) and source == 'AC')
+
+
+def _hwp_should_apply_event(config, source=None):
+    """Return whether source/resume events should actively reapply EPP."""
+    source = source or power.get('source')
+    return _hwp_has_explicit_epp(config, source) or _legacy_hwp_enabled(config)
+
+
 def _bdprochot_setting(config, source=None):
     """Return explicit desired BD PROCHOT state while preserving legacy semantics.
 
@@ -1444,6 +1467,14 @@ def apply_package_power_limit(write_value, mmio_powercap=None, mchbar_mmio=None)
         return mmio_powercap, mchbar_mmio
 
     powercap_before = mmio_powercap.snapshot() if mmio_powercap is not None else None
+    power_unit = None
+    time_unit = None
+    if mmio_powercap is not None:
+        # Read immutable RAPL units before any state-changing write. If this
+        # fails, fatal/readmsr exits before MSR/MMIO state can become partial.
+        power_unit = get_power_unit()
+        time_unit = get_time_unit()
+
     msr_changed = False
     direct_changed = False
     try:
@@ -1457,8 +1488,6 @@ def apply_package_power_limit(write_value, mmio_powercap=None, mchbar_mmio=None)
                 )
 
         if mmio_powercap is not None:
-            power_unit = get_power_unit()
-            time_unit = get_time_unit()
             mmio_powercap.write(
                 pl1_w=get_value_for_bits(write_value, 0, 14) * power_unit,
                 pl2_w=get_value_for_bits(write_value, 32, 46) * power_unit,
@@ -1657,7 +1686,15 @@ def _power_thread(state, exit_event):
                 mchbar_mmio = open_mchbar_power_limit_mmio(expected_msr=pkg_baseline)
 
         hwp_epp = _hwp_epp(config, power_source)
-        hwp_due = hwp_epp is not None and (source_changed or config_reloaded or next_hwp_write <= time())
+        event_hwp_due = hwp_epp is not None and (
+            config_reloaded or (source_changed and _hwp_should_apply_event(config, power_source))
+        )
+        periodic_hwp_due = (
+            hwp_epp is not None
+            and _hwp_should_reassert(config, power_source)
+            and next_hwp_write <= time()
+        )
+        hwp_due = event_hwp_due or periodic_hwp_due
         with hardware_lock:
             mmio_powercap, mchbar_mmio = apply_runtime_profile(
                 config,
