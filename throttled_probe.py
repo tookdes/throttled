@@ -32,7 +32,9 @@ except ImportError:
 
 TARGET_DMI_PRODUCT = "HP EliteBook 830 G6"
 TARGET_CPUIDS = {
-    (6, 142, 11): "Whiskey Lake-U",
+    # Intel microcode guidance identifies Whiskey Lake-U as CPUID 806EB/806EC.
+    (6, 142, 11): "Whiskey Lake-U (806EB)",
+    (6, 142, 12): "Whiskey Lake-U (806EC)",
 }
 
 MSR = {
