@@ -6,6 +6,7 @@ powercap zone over /dev/mem when it exists: the kernel owns platform discovery,
 addressing, and access policy.
 """
 
+import math
 from pathlib import Path
 import re
 
@@ -15,6 +16,16 @@ DEFAULT_POWERCAP_ROOT = Path("/sys/devices/virtual/powercap")
 
 class PowercapError(RuntimeError):
     pass
+
+
+def _positive_finite(value, label):
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise PowercapError(f"{label} must be a number") from exc
+    if not math.isfinite(number) or number <= 0:
+        raise PowercapError(f"{label} must be finite and greater than zero")
+    return number
 
 
 def _read_text(path):
@@ -131,10 +142,11 @@ class PowercapZone:
                     continue
 
                 if values["power"] is not None:
+                    power_value = _positive_finite(values["power"], f"{role.upper()} power")
                     before = _read_int(paths["power"])
                     if before is None:
                         raise PowercapError(f"unable to read {paths['power']}")
-                    target = round(values["power"] * 1_000_000)
+                    target = round(power_value * 1_000_000)
                     minimum = _read_int(paths["min_power"])
                     maximum = _read_int(paths["max_power"])
                     if minimum is not None and target < minimum:
@@ -146,10 +158,11 @@ class PowercapZone:
                         self._write_int(paths["power"], target)
 
                 if values["time"] is not None:
+                    time_value = _positive_finite(values["time"], f"{role.upper()} time window")
                     before = _read_int(paths["time"])
                     if before is None:
                         raise PowercapError(f"unable to read {paths['time']}")
-                    target = round(values["time"] * 1_000_000)
+                    target = round(time_value * 1_000_000)
                     minimum = _read_int(paths["min_time"])
                     maximum = _read_int(paths["max_time"])
                     if minimum is not None and target < minimum:
