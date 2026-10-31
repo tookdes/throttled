@@ -72,6 +72,8 @@ class ProfileControlTests(unittest.TestCase):
         }
 
         def readmsr(name, *args, cpu=None, **kwargs):
+            if name == "IA32_PM_ENABLE":
+                return 1
             self.assertEqual(name, "IA32_HWP_REQUEST")
             return current[cpu]
 
@@ -97,6 +99,8 @@ class ProfileControlTests(unittest.TestCase):
         package = 0xABCDEF0012345678
 
         def readmsr(name, *args, cpu=None, **kwargs):
+            if name == "IA32_PM_ENABLE":
+                return 1
             if name == "IA32_HWP_REQUEST_PKG":
                 return package
             return current[cpu]
@@ -112,6 +116,16 @@ class ProfileControlTests(unittest.TestCase):
             cpu=0,
         ))
         self.assertEqual(len(write.call_args_list), 3)
+
+    def test_set_hwp_epp_skips_when_hwp_is_disabled(self):
+        throttled = load_throttled()
+        with mock.patch.object(throttled, "readmsr", return_value=0):
+            with mock.patch.object(throttled, "_ensure_msr_module") as ensure:
+                with mock.patch.object(throttled, "writemsr") as write:
+                    with mock.patch.object(throttled, "warning"):
+                        throttled.set_hwp_epp(0x20)
+        ensure.assert_not_called()
+        write.assert_not_called()
 
     def test_bdprochot_profile_setting_preserves_legacy_semantics(self):
         throttled = load_throttled()
