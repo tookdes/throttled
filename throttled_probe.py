@@ -128,18 +128,20 @@ MCHBAR_ADDRESS_MASKS_BY_PCI_DEVICE = {
     0x7D30: MCHBAR_ADDRESS_MASK_42_17,
 }
 
+# MSR 0x64F layout for Skylake/Kaby/Coffee/Whiskey Lake (Intel SDM
+# Table 2-39). Do not substitute the Haswell/Broadwell 0x690 layout.
 CORE_PERF_LIMIT_BITS = {
     0: "PROCHOT",
     1: "Thermal",
-    4: "Graphics",
-    5: "Auto-HWP",
+    4: "Residency-Regulation",
+    5: "RATL",
     6: "VR-Thermal",
-    8: "Current/EDP",
-    9: "Core-Power",
+    7: "VR-TDC",
+    8: "Other/EDP",
     10: "Package-PL1",
     11: "Package-PL2",
-    12: "Multi-Core-Turbo",
-    13: "Transitions",
+    12: "Max-Turbo",
+    13: "Turbo-Transition",
 }
 
 THERM_STATUS_BITS = {
