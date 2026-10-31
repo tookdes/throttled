@@ -499,7 +499,7 @@ def collect_snapshot(msr, cpu, dmi):
     return snapshot
 
 
-def validate_snapshot_identity(snapshot, cpu):
+def validate_snapshot_identity(snapshot, cpu, dmi=None):
     saved = snapshot.get("cpu", {})
     current = (cpu["vendor_id"], cpu["family"], cpu["model"], cpu["stepping"])
     expected = (
@@ -510,6 +510,14 @@ def validate_snapshot_identity(snapshot, cpu):
     )
     if current != expected:
         raise ProbeError(f"snapshot CPU identity {expected!r} does not match current CPU {current!r}")
+
+    if dmi is not None:
+        saved_product = (snapshot.get("dmi") or {}).get("product")
+        current_product = dmi.get("product")
+        if saved_product and current_product and saved_product != current_product:
+            raise ProbeError(
+                f"snapshot DMI product {saved_product!r} does not match current product {current_product!r}"
+            )
 
 
 def build_restore_plan(snapshot, current_cpus):
@@ -532,19 +540,56 @@ def build_restore_plan(snapshot, current_cpus):
 
 
 def apply_restore_plan(msr, plan):
-    results = []
+    """Apply and verify a restore plan, rolling back partial progress on failure."""
+    prepared = []
     for cpu, name, value in plan:
-        msr.write(cpu, name, value)
-        readback = msr.read(cpu, name)
-        results.append(
-            {
-                "cpu": cpu,
-                "register": name,
-                "written": value,
-                "readback": readback,
-                "match": readback == value,
-            }
-        )
+        prepared.append((cpu, name, msr.read(cpu, name), value))
+
+    completed = []
+    results = []
+    try:
+        for cpu, name, original, value in prepared:
+            if value == original:
+                results.append(
+                    {
+                        "cpu": cpu,
+                        "register": name,
+                        "written": value,
+                        "readback": original,
+                        "match": True,
+                    }
+                )
+                continue
+
+            completed.append((cpu, name, original))
+            msr.write(cpu, name, value)
+            readback = msr.read(cpu, name)
+            if readback != value:
+                raise ProbeError(
+                    f"restore verify failed for cpu{cpu} {name}: "
+                    f"wrote 0x{value:016x}, read 0x{readback:016x}"
+                )
+            results.append(
+                {
+                    "cpu": cpu,
+                    "register": name,
+                    "written": value,
+                    "readback": readback,
+                    "match": True,
+                }
+            )
+    except ProbeError as exc:
+        rollback_errors = []
+        for cpu, name, original in reversed(completed):
+            try:
+                msr.write(cpu, name, original)
+                if msr.read(cpu, name) != original:
+                    rollback_errors.append(f"cpu{cpu} {name}: verify mismatch")
+            except ProbeError as rollback_exc:
+                rollback_errors.append(f"cpu{cpu} {name}: {rollback_exc}")
+        suffix = f"; rollback issues: {'; '.join(rollback_errors)}" if rollback_errors else "; rollback attempted"
+        raise ProbeError(str(exc) + suffix) from exc
+
     return results
 
 
@@ -845,7 +890,7 @@ def main(argv=None):
 
     if args.restore_snapshot:
         snapshot = json.loads(Path(args.restore_snapshot).read_text(encoding="utf-8"))
-        validate_snapshot_identity(snapshot, cpu)
+        validate_snapshot_identity(snapshot, cpu, dmi)
         plan = build_restore_plan(snapshot, msr.cpus())
         print(f"Restore plan: {len(plan)} WRMSR operations")
         for logical_cpu, name, value in plan:
