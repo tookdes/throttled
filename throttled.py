@@ -226,9 +226,10 @@ FIXED_DRAM_ENERGY_UNIT_MODELS = {63, 79, 85, 86, 87}
 #
 # TGL/ADL/RPL/Core Ultra datasheets document PACKAGE_RAPL_LIMIT_0_0_0_MCHBAR_PCU
 # at MCHBAR + 0x59a0 (Intel docs 631122, 767625/767626, 764981/767624, 795258,
-# 819323, 844345). Kaby and Coffee Lake do not publish the offset: those two
-# rest on coreboot's MCH_PKG_POWER_LIMIT_LO (the MSR 0x610 mirror) and a live
-# MMIO == MSR equality check on 0x3ec4. Groups follow Linux igen6/ie31200 EDAC.
+# 819323, 844345). For older 32 KiB layouts, coreboot independently defines
+# MCH_PKG_POWER_LIMIT_LO at +0x59a0. Its inteltool also identifies Whiskey
+# Lake-U 0x3e34/0x3e35 and masks their MCHBAR to address bits 38:15. Groups for
+# newer platforms follow Linux igen6/ie31200 EDAC where applicable.
 MCHBAR_ADDRESS_MASKS_BY_PCI_DEVICE = {
     # Kaby Lake-U/R and Coffee/Whiskey Lake target systems.
     # coreboot inteltool groups 8th-gen U/Whiskey Lake with a 32 KiB MCHBAR
