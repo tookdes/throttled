@@ -1823,33 +1823,61 @@ def check_cpu():
         fatal(f'Unable to identify CPU model: {e}')
 
 
-def test_msr_rw_capabilities():
-    """Probe optional MSR features and mark unavailable ones as such."""
+def _has_configured_section(config, sections):
+    return config is not None and any(section in config for section in sections)
+
+
+def _hwp_is_configured(config):
+    if config is None:
+        return True
+    return (
+        ('AC' in config and (
+            config.has_option('AC', 'HWP_Mode')
+            or config.has_option('AC', 'HWP_EPP')
+        ))
+        or ('BATTERY' in config and config.has_option('BATTERY', 'HWP_EPP'))
+    )
+
+
+def test_msr_rw_capabilities(config=None):
+    """Probe only optional features that the active configuration will use.
+
+    Passing None preserves the historical explicit self-test behavior for
+    callers/tests. The daemon passes its config so unused OC-mailbox features
+    never receive hidden WRMSR selector transactions.
+    """
     global TESTMSR
     TESTMSR = True
     try:
-        try:
-            log('[I] Testing if undervolt is supported...')
-            get_undervolt()
-        except (IOError, OSError):
-            warning('Undervolt seems not to be supported by your system, disabling.')
-            UNSUPPORTED_FEATURES.append('UNDERVOLT')
+        if config is None or _has_configured_section(config, UNDERVOLT_KEYS):
+            try:
+                log('[I] Testing if undervolt is supported...')
+                get_undervolt()
+            except (IOError, OSError):
+                warning('Undervolt seems not to be supported by your system, disabling.')
+                UNSUPPORTED_FEATURES.append('UNDERVOLT')
+        else:
+            log('[I] Undervolt is not configured; OC mailbox capability probe skipped.')
 
-        try:
-            log('[I] Testing if IccMax is supported...')
-            get_icc_max()
-        except (IOError, OSError):
-            warning('IccMax seems not to be supported by your system, disabling.')
-            UNSUPPORTED_FEATURES.append('ICCMAX')
+        if config is None or _has_configured_section(config, ICCMAX_KEYS):
+            try:
+                log('[I] Testing if IccMax is supported...')
+                get_icc_max()
+            except (IOError, OSError):
+                warning('IccMax seems not to be supported by your system, disabling.')
+                UNSUPPORTED_FEATURES.append('ICCMAX')
+        else:
+            log('[I] IccMax is not configured; OC mailbox capability probe skipped.')
 
-        try:
-            log('[I] Testing if HWP is supported...')
-            if not (readmsr('IA32_PM_ENABLE', 0, 0, cpu=0) & 1):
-                raise OSError('HWP/Speed Shift is disabled')
-            readmsr('IA32_HWP_REQUEST', cpu=0)
-        except (IOError, OSError):
-            warning('HWP seems not to be supported/enabled by your system, disabling.')
-            UNSUPPORTED_FEATURES.append('HWP')
+        if _hwp_is_configured(config):
+            try:
+                log('[I] Testing if HWP is supported...')
+                if not (readmsr('IA32_PM_ENABLE', 0, 0, cpu=0) & 1):
+                    raise OSError('HWP/Speed Shift is disabled')
+                readmsr('IA32_HWP_REQUEST', cpu=0)
+            except (IOError, OSError):
+                warning('HWP seems not to be supported/enabled by your system, disabling.')
+                UNSUPPORTED_FEATURES.append('HWP')
 
         if args.monitor is not None:
             for domain, msr in tuple(MONITOR_POWER_DOMAINS.items()):
@@ -1862,8 +1890,8 @@ def test_msr_rw_capabilities():
         TESTMSR = False
 
 
-def monitor(exit_event, wait, cpuid=None):
-    """Live-display throttling causes and per-domain power until exit_event is set."""
+def monitor(exit_event, wait, cpuid=None, config=None):
+    """Live-display throttling causes and power without implicit OC-mailbox queries."""
     wait = max(0.1, wait)
     prev_energy = {}
     if MONITOR_POWER_DOMAINS:
@@ -1877,14 +1905,18 @@ def monitor(exit_event, wait, cpuid=None):
             for domain, msr in MONITOR_POWER_DOMAINS.items()
         }
 
-    if 'UNDERVOLT' in UNSUPPORTED_FEATURES:
+    if config is not None and not _has_configured_section(config, UNDERVOLT_KEYS):
+        log('[D] Undervolt offsets: not configured (OC mailbox not queried)')
+    elif 'UNDERVOLT' in UNSUPPORTED_FEATURES:
         log('[D] Undervolt offsets: unsupported')
     else:
         undervolt_values = get_undervolt(convert=True)
         undervolt_output = ' | '.join(f'{plane:s}: {undervolt_values[plane]:.2f} mV' for plane in VOLTAGE_PLANES)
         log(f'[D] Undervolt offsets: {undervolt_output:s}')
 
-    if 'ICCMAX' in UNSUPPORTED_FEATURES:
+    if config is not None and not _has_configured_section(config, ICCMAX_KEYS):
+        log('[D] IccMax: not configured (OC mailbox not queried)')
+    elif 'ICCMAX' in UNSUPPORTED_FEATURES:
         log('[D] IccMax: unsupported')
     else:
         iccmax_values = get_icc_max(convert=True)
@@ -2025,7 +2057,7 @@ def main():
 
     set_msr_allow_writes()
 
-    test_msr_rw_capabilities()
+    test_msr_rw_capabilities(config)
 
     power['source'] = 'BATTERY' if is_on_battery(config) else 'AC'
 
@@ -2052,7 +2084,7 @@ def main():
 
     monitor_thread = None
     if args.monitor is not None:
-        monitor_thread = Thread(target=monitor, args=(exit_event, args.monitor, cpuid))
+        monitor_thread = Thread(target=monitor, args=(exit_event, args.monitor, cpuid, config))
         monitor_thread.daemon = True
         monitor_thread.start()
 
