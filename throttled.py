@@ -551,6 +551,12 @@ def handle_sleep_prepare(sleeping, config_or_state):
             if config_is_enabled(config):
                 undervolt(config)
                 set_icc_max(config)
+                source = power['source']
+                set_hwp_epp(_hwp_epp(config, source))
+                disable_turbo = config.getboolean(source, 'Disable_Turbo', fallback=None)
+                set_turbo(None if disable_turbo is None else not disable_turbo)
+                disable_bdprochot = config.getboolean(source, 'Disable_BDPROCHOT', fallback=None)
+                set_bdprochot(None if disable_bdprochot is None else not disable_bdprochot)
 
 
 def handle_ac_properties_changed(if_name, changed, invalidated):
@@ -560,11 +566,25 @@ def handle_ac_properties_changed(if_name, changed, invalidated):
 
 
 def should_listen_for_resume(config):
-    return config_is_enabled(config) and any(
+    if not config_is_enabled(config):
+        return False
+
+    if any(
         config.getfloat(key, plane, fallback=0) != 0
         for keys, planes in ((UNDERVOLT_KEYS, VOLTAGE_PLANES), (ICCMAX_KEYS, CURRENT_PLANES))
         for key in keys
         for plane in planes
+    ):
+        return True
+
+    if config.has_option('AC', 'HWP_Mode'):
+        return True
+    return any(
+        profile in config and any(
+            config.has_option(profile, option)
+            for option in ('HWP_EPP', 'Disable_Turbo', 'Disable_BDPROCHOT')
+        )
+        for profile in POWER_PROFILES
     )
 
 
