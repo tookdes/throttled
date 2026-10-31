@@ -1961,8 +1961,10 @@ def acquire_daemon_lock():
     directory = os.path.dirname(DAEMON_LOCK_PATH)
     try:
         os.makedirs(directory, mode=0o755, exist_ok=True)
-        handle = open(DAEMON_LOCK_PATH, 'w', encoding='ascii')
+        handle = open(DAEMON_LOCK_PATH, 'a+', encoding='ascii')
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        handle.seek(0)
+        handle.truncate()
         handle.write(f'{os.getpid()}\n')
         handle.flush()
     except (OSError, BlockingIOError) as exc:
