@@ -300,6 +300,22 @@ class PowerCommandTests(unittest.TestCase):
         self.assertEqual(msr.values[(0, "MSR_PKG_POWER_LIMIT")], 120 | (1 << ctl.PKG_PL1_ENABLE_BIT))
         self.assertEqual(msr.write_count, 0)
 
+    def test_powercap_present_still_requires_direct_mchbar_preflight(self):
+        current = 120 | (1 << ctl.PKG_PL1_ENABLE_BIT)
+        msr = self._msr(current)
+        args = ctl.build_parser().parse_args(["power", "--pl1", "25"])
+        zone = mock.Mock()
+
+        with mock.patch.object(ctl, "validate_write_environment"):
+            with mock.patch.object(ctl, "find_mmio_package_zone", return_value=zone):
+                with mock.patch.object(ctl, "open_validated_ctl_mchbar", return_value=None):
+                    with self.assertRaises(ctl.ControlError):
+                        ctl.command_power(args, msr)
+
+        self.assertEqual(msr.write_count, 0)
+        zone.snapshot.assert_not_called()
+        zone.write.assert_not_called()
+
     def test_powercap_receives_msr_quantized_value_after_direct_preflight(self):
         current = 120 | (1 << ctl.PKG_PL1_ENABLE_BIT)
         msr = self._msr(current)
