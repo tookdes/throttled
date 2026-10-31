@@ -19,26 +19,26 @@ interfaces must fail closed instead of pretending a setting was accepted.
 | --- | --- | --- |
 | Speed Shift EPP | IA32_HWP_REQUEST + package request when active | implemented |
 | Turbo checkbox | IA32_MISC_ENABLE bit 38 | implemented |
-| SpeedStep | IA32_MISC_ENABLE bit 16 | implemented |
+| SpeedStep | IA32_MISC_ENABLE bit 16 | legacy-only; CLI refuses while HWP is enabled |
 | BD PROCHOT | MSR_POWER_CTL bit 0 | implemented, reversible |
 | Clock Mod 100% | IA32_CLOCK_MODULATION enable bit | implemented |
-| Set Multiplier | IA32_PERF_CTL target ratio | implemented |
+| Set Multiplier | IA32_PERF_CTL target ratio | legacy-only; CLI refuses while HWP is enabled |
 | Turbo Ratio Limits | MSR_TURBO_RATIO_LIMIT | implemented |
 | PL1 / PL2 | MSR_PKG_POWER_LIMIT | implemented |
 | PL1 / PL2 Enable | MSR_PKG_POWER_LIMIT | implemented |
 | Clamp | MSR_PKG_POWER_LIMIT | implemented |
 | Tau | RAPL time-window fields | implemented |
-| MMIO power limits | kernel intel-rapl-mmio first | implemented |
-| direct MCHBAR | validated PCI allow-list only | fallback only |
+| MMIO watts/Tau | kernel intel-rapl-mmio | implemented with bounds + readback |
+| full TPL MMIO | direct MCHBAR | same-run MMIO==MSR preflight required |
 | FIVR voltage offsets | OC mailbox MSR 0x150 | implemented in explicit control CLI |
 | FIVR IccMax | OC mailbox MSR 0x150 | implemented in explicit control CLI |
 | Temperature target | MSR_TEMPERATURE_TARGET | implemented in daemon and direct control |
-| Limits | Whiskey/SKL performance-limit reasons + thermal state | implemented |
+| Limits | package MSR 0x64F Whiskey Lake layout + thermal state | implemented |
 | Ratio / MHz | IA32_PERF_STATUS | implemented |
 | Effective MHz | APERF / MPERF deltas | implemented |
 | C0% | MPERF vs reference-rate elapsed time | implemented |
 | Package power | RAPL energy delta | implemented |
-| Stock reset | raw MSR snapshot + verified restore | implemented for non-mailbox state |
+| Stock reset | schema-v2 managed-field restore + captured TPL backends | implemented for non-OC-mailbox state |
 | AC / battery profiles | existing throttled profile engine | implemented |
 | resume reapply | login1 resume callback | implemented |
 
@@ -68,19 +68,22 @@ be treated like a normal directly readable register.
 
 ### Package power
 
-MSR_PKG_POWER_LIMIT bit 63 is treated as a hard lock. The code never sets that
-bit and refuses direct TPL writes when it is already set.
+MSR_PKG_POWER_LIMIT bit 63 is a hard lock. Neither daemon nor CLI sets it.
 
-For the chipset copy of PL1/PL2, the preferred order is:
+The package-power control plane is intentionally fail-closed:
 
-1. kernel `intel-rapl-mmio` powercap zone;
-2. existing direct MCHBAR implementation only for host bridges already in the
-   validated allow-list;
-3. direct MCHBAR on Whiskey Lake host bridges `0x3E34/0x3E35` using the coreboot-validated 32 KiB bits-38:15 layout and `+0x59A0` package-power mirror;
-4. no MMIO write if none of the validated interfaces is available.
-
-This is intentional. A guessed Whiskey Lake PCI ID / MCHBAR offset must not be
-added merely to make the feature appear supported.
+1. `intel-rapl-mmio` is used for watts/Tau and its kernel min/max bounds are
+   enforced and read back;
+2. direct MCHBAR is required for Enable/Clamp changes or when no kernel MMIO
+   zone exists;
+3. direct MCHBAR uses the shared allow-list (including Whiskey Lake-U
+   `0x3E34/0x3E35`), bits 38:15 MCHBAR decoding and `+0x59A0` package-power
+   mirror;
+4. before any direct write, a separate read-only mapping must equal the current
+   MSR 0x610 value; the RW mapping is then reopened and equality checked again;
+5. kernel powercap rejection triggers rollback; it is never bypassed by falling
+   through to raw `/dev/mem`;
+6. if neither safe backend is available, persistent TPL updates are skipped.
 
 ## Persistent profiles
 
@@ -113,9 +116,11 @@ profile control. The historical `Disable_BDPROCHOT` keeps its original
 one-way semantics: `True` disables BD PROCHOT, while `False` leaves the
 current hardware state untouched.
 
-Profile controls are reapplied on AC/battery transitions, periodically where
-firmware or another power manager may overwrite them, and immediately after
-resume.
+Profile controls are serialized through a hardware-write lock. AC/battery
+changes and config reloads apply one coherent profile; resume immediately
+replays mailbox controls, configured HWP policy, TCC/cTDP and TPL instead of
+waiting for the next polling interval. Legacy `HWP_Mode=False` is not
+periodically reasserted, avoiding a new fight with desktop EPP managers.
 
 ## One-shot controls
 
@@ -132,16 +137,22 @@ sudo throttlectl epp 32
 sudo throttlectl power --pl1 25 --pl2 44 --tau1 28
 sudo throttlectl turbo on
 sudo throttlectl bd-prochot on
+# Only when HWP/Speed Shift is disabled:
 sudo throttlectl speedstep on
-sudo throttlectl clock-mod
 sudo throttlectl multiplier 38
+
+sudo throttlectl clock-mod
 sudo throttlectl temp-target 90
 sudo throttlectl turbo-ratio --1c 42 --2c 41 --3c 39 --4c 39
 
 sudo throttlectl fivr read
 sudo throttlectl fivr set --core -80 --cache -80
+# The set command prints an automatic /var/lib/throttled/oc-backups/... path.
+sudo throttlectl fivr restore /var/lib/throttled/oc-backups/fivr-....json
+
 sudo throttlectl iccmax read
 sudo throttlectl iccmax set --core 100 --cache 100
+sudo throttlectl iccmax restore /var/lib/throttled/oc-backups/iccmax-....json
 ```
 
 Values in these examples demonstrate syntax only; they are not recommended
@@ -149,22 +160,28 @@ settings for every 830 G6 CPU or cooling configuration.
 
 ## Stock snapshot
 
-The strict snapshot captures directly readable control state:
+Snapshot schema v2 records full raw values for diagnostics but restores only
+the fields this fork can change:
 
-- MSR_PKG_POWER_LIMIT
-- MSR_TEMPERATURE_TARGET
-- MSR_CONFIG_TDP_CONTROL
-- MSR_TURBO_RATIO_LIMIT
-- IA32_HWP_REQUEST_PKG
-- per-CPU MSR_POWER_CTL
-- per-CPU IA32_HWP_REQUEST
-- per-CPU IA32_MISC_ENABLE
-- per-CPU IA32_CLOCK_MODULATION
-- per-CPU IA32_PERF_CTL
+- package power: PL1/PL2 watts, Tau, Enable and Clamp (never the lock bit);
+- temperature target: TCC offset only;
+- cTDP target bits only;
+- Turbo Ratio bytes when programmable;
+- HWP package/per-CPU EPP only;
+- BD PROCHOT bit only;
+- Turbo/SpeedStep bits only;
+- clock-modulation enable bit only;
+- PERF_CTL ratio only, and only when HWP is disabled.
 
-FIVR and IccMax are excluded because reading their current state requires an
-OC-mailbox write. MMIO powercap state is also not yet stored in the strict raw
-MSR snapshot.
+It additionally captures `intel-rapl-mmio` constraints when present and the
+direct MCHBAR package-power raw value only when the read-only mirror equals MSR
+0x610. Restore preflights all captured backends before the first write and
+rolls back already restored state if a backend fails.
+
+FIVR/IccMax stay outside this strict snapshot because querying them requires an
+OC-mailbox WRMSR. Every explicit FIVR/IccMax set creates a root-only recovery
+JSON before changing hardware, and dedicated restore subcommands consume those
+records.
 
 ## Remaining hardware-validation gates
 
