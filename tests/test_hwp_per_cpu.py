@@ -30,6 +30,7 @@ class HWPPerCpuTests(unittest.TestCase):
             0: 0xAAAABBBB01020304,
             2: 0x1111222233445566,
         }
+        original = dict(current)
 
         def readmsr(msr, *args, cpu=None, **kwargs):
             if msr == 'IA32_PM_ENABLE':
@@ -37,23 +38,28 @@ class HWPPerCpuTests(unittest.TestCase):
             self.assertEqual(msr, 'IA32_HWP_REQUEST')
             return current[cpu]
 
+        def writemsr(msr, value, cpu=None):
+            self.assertEqual(msr, 'IA32_HWP_REQUEST')
+            current[cpu] = value
+
         with mock.patch.object(throttled, '_ensure_msr_module', return_value=['/dev/cpu/0/msr', '/dev/cpu/2/msr']):
             with mock.patch.object(throttled, 'readmsr', side_effect=readmsr):
-                with mock.patch.object(throttled, 'writemsr') as writemsr:
+                with mock.patch.object(throttled, 'writemsr', side_effect=writemsr) as write:
                     throttled.set_hwp(True)
 
         expected = [
             mock.call(
                 'IA32_HWP_REQUEST',
-                (current[0] & 0xFFFFFFFF00FFFFFF) | (throttled.HWP_PERFORMANCE_VALUE << 24),
+                (original[0] & 0xFFFFFFFF00FFFFFF) | (throttled.HWP_PERFORMANCE_VALUE << 24),
                 cpu=0,
             ),
             mock.call(
                 'IA32_HWP_REQUEST',
-                (current[2] & 0xFFFFFFFF00FFFFFF) | (throttled.HWP_PERFORMANCE_VALUE << 24),
+                (original[2] & 0xFFFFFFFF00FFFFFF) | (throttled.HWP_PERFORMANCE_VALUE << 24),
                 cpu=2,
             ),
         ]
+        writemsr = write
         self.assertEqual(writemsr.call_args_list, expected)
 
     def test_writemsr_cpu_targets_one_msr_device(self):
