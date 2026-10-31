@@ -1650,7 +1650,7 @@ def main():
             args.log = None
             fatal(f'Unable to write to the log file: {e}')
 
-    if args.probe:
+    if getattr(args, 'probe', False):
         from throttled_probe import main as probe_main
 
         return probe_main([])
