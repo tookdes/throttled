@@ -2,6 +2,7 @@
 import argparse
 import asyncio
 import configparser
+import fcntl
 import glob
 import gzip
 import math
@@ -49,6 +50,8 @@ PKG_POWER_LIMIT_CONTROL_MASK = (1 << 15) | (1 << 16) | (1 << 47) | (1 << 48)
 POWER_PROFILES = ('AC', 'BATTERY')
 UNDERVOLT_KEYS = ('UNDERVOLT', 'UNDERVOLT.AC', 'UNDERVOLT.BATTERY')
 ICCMAX_KEYS = ('ICCMAX', 'ICCMAX.AC', 'ICCMAX.BATTERY')
+DAEMON_LOCK_PATH = '/run/throttled/daemon.lock'
+_daemon_lock_file = None
 power = {'source': None, 'method': 'polling'}
 # Serialize config/source publication separately from low-level hardware writes.
 config_lock = Lock()
@@ -1886,6 +1889,25 @@ def monitor(exit_event, wait, cpuid=None):
         exit_event.wait(wait)
 
 
+def acquire_daemon_lock():
+    """Hold a process-wide lock so one-shot controls can detect manual daemons too."""
+    global _daemon_lock_file
+    directory = os.path.dirname(DAEMON_LOCK_PATH)
+    try:
+        os.makedirs(directory, mode=0o755, exist_ok=True)
+        handle = open(DAEMON_LOCK_PATH, 'w', encoding='ascii')
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        handle.write(f'{os.getpid()}\n')
+        handle.flush()
+    except (OSError, BlockingIOError) as exc:
+        try:
+            handle.close()
+        except (NameError, OSError):
+            pass
+        fatal(f'Another throttled daemon instance is already active or the daemon lock cannot be acquired: {exc}')
+    _daemon_lock_file = handle
+
+
 def positive_finite_float(value):
     """Parse a finite, positive command-line float."""
     try:
@@ -1956,6 +1978,8 @@ def main():
     if not config_is_enabled(config):
         log('[I] Throttled is disabled in config file... Quitting. :(')
         return
+
+    acquire_daemon_lock()
 
     cpuid = None
     if not args.force:
