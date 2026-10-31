@@ -22,6 +22,45 @@ def load_throttled():
 
 
 class OcMailboxTests(unittest.TestCase):
+    def test_capability_probe_skips_unconfigured_oc_mailbox_features(self):
+        throttled = load_throttled()
+        config = configparser.ConfigParser()
+        config.read_dict({
+            "GENERAL": {"Enabled": "True"},
+            "AC": {"Update_Rate_s": "5", "HWP_EPP": "32"},
+        })
+        throttled.args.monitor = None
+
+        with mock.patch.object(throttled, "get_undervolt") as get_uv:
+            with mock.patch.object(throttled, "get_icc_max") as get_icc:
+                with mock.patch.object(
+                    throttled,
+                    "readmsr",
+                    side_effect=lambda name, *args, **kwargs: 1 if name == "IA32_PM_ENABLE" else 0,
+                ):
+                    throttled.test_msr_rw_capabilities(config)
+
+        get_uv.assert_not_called()
+        get_icc.assert_not_called()
+
+    def test_monitor_skips_oc_mailbox_queries_when_features_are_unconfigured(self):
+        throttled = load_throttled()
+        config = configparser.ConfigParser()
+        config.read_dict({"GENERAL": {"Enabled": "True"}, "AC": {"Update_Rate_s": "5"}})
+
+        class StopImmediately:
+            def is_set(self):
+                return True
+
+        with mock.patch.object(throttled, "get_undervolt") as get_uv:
+            with mock.patch.object(throttled, "get_icc_max") as get_icc:
+                with mock.patch.object(throttled, "log"):
+                    throttled.MONITOR_POWER_DOMAINS.clear()
+                    throttled.monitor(StopImmediately(), 1, None, config)
+
+        get_uv.assert_not_called()
+        get_icc.assert_not_called()
+
     def test_execute_waits_for_ready_and_checks_completion_status(self):
         throttled = load_throttled()
         command = 0x8000001000000000
