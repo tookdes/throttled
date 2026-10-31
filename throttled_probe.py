@@ -556,6 +556,33 @@ def snapshot_completeness_errors(snapshot, current_cpus):
                 errors.append(f"cpu{cpu} {name}: missing entry")
             elif "value" not in item:
                 errors.append(f"cpu{cpu} {name}: {item.get('error', 'missing value')}")
+
+    backends = snapshot.get("power_backends")
+    if not isinstance(backends, dict):
+        errors.append("power_backends is missing or is not an object")
+        return errors
+    if "kernel_mmio" not in backends:
+        errors.append("power_backends.kernel_mmio is missing")
+    elif backends["kernel_mmio"] is not None:
+        kernel_mmio = backends["kernel_mmio"]
+        if not isinstance(kernel_mmio, dict):
+            errors.append("power_backends.kernel_mmio is not an object")
+        else:
+            for role in ("pl1", "pl2"):
+                if role not in kernel_mmio:
+                    errors.append(f"power_backends.kernel_mmio.{role} is missing")
+
+    if "direct_mchbar" not in backends:
+        errors.append("power_backends.direct_mchbar is missing")
+    else:
+        direct = backends["direct_mchbar"]
+        if not isinstance(direct, dict):
+            errors.append("power_backends.direct_mchbar is not an object")
+        elif direct.get("available"):
+            if direct.get("matches_msr") is not True:
+                errors.append("captured direct MCHBAR was not equal to MSR_PKG_POWER_LIMIT")
+            if not isinstance(direct.get("pkg_power_limit_raw"), int):
+                errors.append("captured direct MCHBAR raw value is missing")
     return errors
 
 
@@ -717,6 +744,7 @@ def _open_snapshot_mchbar(snapshot, current_msr_raw):
     if base is None or MMIO is None:
         raise ProbeError("snapshot captured direct MCHBAR but current validated mapping is unavailable")
 
+    mapping = None
     try:
         mapping = MMIO(
             base + MCHBAR_PACKAGE_POWER_LIMIT_OFFSET,
@@ -724,6 +752,8 @@ def _open_snapshot_mchbar(snapshot, current_msr_raw):
         )
         current_raw = mapping.read64(0)
     except (MMIOError, OSError, AttributeError) as exc:
+        if mapping is not None:
+            mapping.close()
         raise ProbeError(f"unable to open current direct MCHBAR for restore: {exc}") from exc
 
     if current_raw != current_msr_raw:
@@ -771,7 +801,20 @@ def apply_full_restore(msr, plan, snapshot):
         apply_restore_plan(msr, plan)
 
         if powercap_zone is not None:
-            powercap_zone.restore(saved_powercap)
+            restored_powercap = powercap_zone.restore(saved_powercap)
+            for role in ("pl1", "pl2"):
+                expected = saved_powercap.get(role)
+                actual = restored_powercap.get(role)
+                if expected is None:
+                    continue
+                if actual is None:
+                    raise ProbeError(f"restored powercap {role.upper()} constraint disappeared")
+                for field in ("power_limit_uw", "time_window_us"):
+                    if expected.get(field) is not None and actual.get(field) != expected.get(field):
+                        raise ProbeError(
+                            f"powercap {role.upper()} {field} restore mismatch: "
+                            f"expected {expected.get(field)}, read {actual.get(field)}"
+                        )
 
         if direct_mapping is not None:
             _restore_direct_mchbar(direct_mapping, direct_target)
@@ -1139,6 +1182,15 @@ def _main(argv=None):
         print(f"Restore plan: {len(plan)} WRMSR operations")
         for logical_cpu, name, value in plan:
             print(f"  cpu{logical_cpu}: {name} <- 0x{value:016x}")
+        backends = snapshot.get("power_backends") or {}
+        if backends.get("kernel_mmio") is not None:
+            print("  backend: restore captured intel-rapl-mmio PL1/PL2 watts/Tau")
+        direct = backends.get("direct_mchbar") or {}
+        if direct.get("available") and direct.get("matches_msr"):
+            print(
+                "  backend: restore validated direct MCHBAR PACKAGE_POWER_LIMIT "
+                f"<- 0x{direct['pkg_power_limit_raw']:016x}"
+            )
         if not args.apply_restore:
             print("Dry run only. Add --apply-restore to write and verify these values.")
             return 0
