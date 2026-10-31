@@ -213,16 +213,23 @@ class ProfileControlTests(unittest.TestCase):
                     throttled.set_turbo(True)
         write.assert_not_called()
 
-    def test_set_bdprochot_respects_lock_bit(self):
+    def test_set_bdprochot_preserves_reserved_bit23(self):
         throttled = load_throttled()
-        locked_enabled = (1 << throttled.BD_PROCHOT_LOCK_BIT) | 1
+        state = {"value": (1 << 23) | 1}
+
+        def readmsr(name, *args, cpu=None, **kwargs):
+            return state["value"]
+
+        def writemsr(name, value, cpu=None):
+            state["value"] = value
+
         with mock.patch.object(throttled, "_ensure_msr_module", return_value=["/dev/cpu/0/msr"]):
-            with mock.patch.object(throttled, "readmsr", return_value=locked_enabled):
-                with mock.patch.object(throttled, "writemsr") as write:
-                    with mock.patch.object(throttled, "warning") as warning:
-                        throttled.set_bdprochot(False)
-        write.assert_not_called()
-        self.assertIn("locked", warning.call_args.args[0])
+            with mock.patch.object(throttled, "readmsr", side_effect=readmsr):
+                with mock.patch.object(throttled, "writemsr", side_effect=writemsr):
+                    throttled.set_bdprochot(False)
+
+        self.assertTrue(state["value"] & (1 << 23))
+        self.assertFalse(state["value"] & 1)
 
     def test_load_config_validates_hwp_epp_and_new_booleans(self):
         throttled = load_throttled()
