@@ -29,6 +29,9 @@ class FakeMsr:
             raise probe.ProbeError("synthetic restore write failure")
         self.values[(cpu, register)] = value
 
+    def cpus(self):
+        return sorted({cpu for cpu, _ in self.values})
+
 
 class ProbeDecodeTests(unittest.TestCase):
     def test_parse_cpuinfo(self):
@@ -272,6 +275,78 @@ flags : fpu hwp hwp_epp hwp_act_window hwp_pkg_req
         self.assertEqual(result["msr"]["status"], "restored")
         self.assertEqual(result["direct_mchbar"]["status"], "unavailable")
         self.assertFalse(result["complete"])
+
+    def test_package_restore_verifies_all_online_cpu_views_without_broadcast_writes(self):
+        values = {
+            (0, "MSR_PKG_POWER_LIMIT"): 0x3333,
+            (1, "MSR_PKG_POWER_LIMIT"): 0x3333,
+        }
+        msr = FakeMsr(values)
+        plan = [(0, "MSR_PKG_POWER_LIMIT", 0x1111)]
+
+        # Package-scoped fake hardware mirrors the CPU0 write into CPU1.
+        original_write = msr.write
+        def package_write(cpu, register, value):
+            original_write(cpu, register, value)
+            if register == "MSR_PKG_POWER_LIMIT":
+                msr.values[(1, register)] = value
+        msr.write = package_write
+
+        snapshot = {
+            "package_msrs": {"MSR_PKG_POWER_LIMIT": {"value": "0x0000000000001111"}},
+            "power_backends": {
+                "kernel_mmio": None,
+                "direct_mchbar": {"available": False},
+            },
+        }
+        result = probe.apply_full_restore(msr, plan, snapshot)
+        self.assertEqual(result["msr"]["status"], "restored")
+        self.assertEqual(msr.write_count, 1)
+
+    def test_package_restore_reports_secondary_cpu_view_mismatch(self):
+        msr = FakeMsr({
+            (0, "MSR_PKG_POWER_LIMIT"): 0x3333,
+            (1, "MSR_PKG_POWER_LIMIT"): 0x2222,
+        })
+        plan = [(0, "MSR_PKG_POWER_LIMIT", 0x1111)]
+        snapshot = {
+            "package_msrs": {"MSR_PKG_POWER_LIMIT": {"value": "0x0000000000001111"}},
+            "power_backends": {
+                "kernel_mmio": None,
+                "direct_mchbar": {"available": False},
+            },
+        }
+        result = probe.apply_full_restore(msr, plan, snapshot)
+        self.assertEqual(result["msr"]["status"], "failed")
+        self.assertIn("cpu1", result["msr"]["reason"])
+
+    def test_snapshot_recovery_grade_distinguishes_msr_and_tpl_control(self):
+        cpu = {
+            "vendor_id": "GenuineIntel",
+            "family": 6,
+            "model": 142,
+            "stepping": 12,
+            "model_name": "test",
+        }
+        dmi = {"product": probe.TARGET_DMI_PRODUCT}
+        values = {}
+        for name in probe.SNAPSHOT_PACKAGE_REGS:
+            values[(0, name)] = 0
+        for name in probe.SNAPSHOT_PER_CPU_REGS:
+            values[(0, name)] = 0
+        msr = FakeMsr(values)
+
+        with mock.patch.object(probe, "probe_powercap", return_value={"mmio": None, "msr": None}):
+            with mock.patch.object(
+                probe,
+                "probe_mmio",
+                return_value={"available": True, "matches_msr": False},
+            ):
+                snapshot = probe.collect_snapshot(msr, cpu, dmi)
+
+        self.assertTrue(snapshot["recovery"]["msr_complete"])
+        self.assertFalse(snapshot["recovery"]["tpl_control_complete"])
+        self.assertTrue(snapshot["complete"])
 
     def test_safe_restore_preserves_unmanaged_temperature_target_bits(self):
         current = (100 << 16) | (5 << 24) | (1 << 40)
