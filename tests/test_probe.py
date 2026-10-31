@@ -4,6 +4,27 @@ import unittest
 import throttled_probe as probe
 
 
+class FakeMsr:
+    def __init__(self, values, fail_on_write=None, mismatch_after_write=None):
+        self.values = dict(values)
+        self.fail_on_write = fail_on_write
+        self.mismatch_after_write = mismatch_after_write
+        self.write_count = 0
+
+    def read(self, cpu, register):
+        value = self.values[(cpu, register)]
+        if self.mismatch_after_write == (cpu, register, self.write_count):
+            self.mismatch_after_write = None
+            return value ^ 1
+        return value
+
+    def write(self, cpu, register, value):
+        self.write_count += 1
+        if self.fail_on_write == (cpu, register, self.write_count):
+            raise probe.ProbeError("synthetic restore write failure")
+        self.values[(cpu, register)] = value
+
+
 class ProbeDecodeTests(unittest.TestCase):
     def test_parse_cpuinfo(self):
         cpu = probe.parse_cpuinfo(
@@ -93,6 +114,46 @@ flags : fpu hwp hwp_epp hwp_act_window hwp_pkg_req
                 snapshot,
                 {"vendor_id": "GenuineIntel", "family": 6, "model": 158, "stepping": 10},
             )
+
+    def test_snapshot_identity_rejects_other_dmi_product(self):
+        snapshot = {
+            "cpu": {
+                "vendor_id": "GenuineIntel",
+                "family": 6,
+                "model": 142,
+                "stepping": 12,
+            },
+            "dmi": {"product": "HP EliteBook 830 G6"},
+        }
+        cpu = {"vendor_id": "GenuineIntel", "family": 6, "model": 142, "stepping": 12}
+        with self.assertRaises(probe.ProbeError):
+            probe.validate_snapshot_identity(snapshot, cpu, {"product": "Other Laptop"})
+
+    def test_restore_rolls_back_after_write_failure(self):
+        msr = FakeMsr(
+            {
+                (0, "MSR_POWER_CTL"): 1,
+                (1, "MSR_POWER_CTL"): 1,
+            },
+            fail_on_write=(1, "MSR_POWER_CTL", 2),
+        )
+        plan = [
+            (0, "MSR_POWER_CTL", 0),
+            (1, "MSR_POWER_CTL", 0),
+        ]
+        with self.assertRaises(probe.ProbeError):
+            probe.apply_restore_plan(msr, plan)
+        self.assertEqual(msr.values[(0, "MSR_POWER_CTL")], 1)
+        self.assertEqual(msr.values[(1, "MSR_POWER_CTL")], 1)
+
+    def test_restore_rolls_back_after_verify_mismatch(self):
+        msr = FakeMsr(
+            {(0, "MSR_POWER_CTL"): 1},
+            mismatch_after_write=(0, "MSR_POWER_CTL", 1),
+        )
+        with self.assertRaises(probe.ProbeError):
+            probe.apply_restore_plan(msr, [(0, "MSR_POWER_CTL", 0)])
+        self.assertEqual(msr.values[(0, "MSR_POWER_CTL")], 1)
 
 
 if __name__ == "__main__":
