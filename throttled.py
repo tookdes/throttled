@@ -36,6 +36,7 @@ TRIP_TEMP_RANGE = [40, 97]
 PKG_POWER_LIMIT_POWER_MASK = (1 << 15) - 1
 PKG_POWER_LIMIT_TIME_WINDOW_MASK = (1 << 7) - 1
 PKG_POWER_LIMIT_LOCK_BIT = 63
+PKG_POWER_LIMIT_CONTROL_MASK = (1 << 15) | (1 << 16) | (1 << 47) | (1 << 48)
 POWER_PROFILES = ('AC', 'BATTERY')
 UNDERVOLT_KEYS = ('UNDERVOLT', 'UNDERVOLT.AC', 'UNDERVOLT.BATTERY')
 ICCMAX_KEYS = ('ICCMAX', 'ICCMAX.AC', 'ICCMAX.BATTERY')
@@ -702,11 +703,13 @@ def get_cur_pkg_power_limits():
     }
 
 
-def decode_time_window_field(field):
+def decode_time_window_field(field, time_unit=None):
     """Decode a 7-bit RAPL time-window field to seconds."""
+    if time_unit is None:
+        time_unit = get_time_unit()
     y = field & 0x1F
     z = (field >> 5) & 0x3
-    return (2**y) * (1.0 + z / 4.0) * get_time_unit()
+    return (2**y) * (1.0 + z / 4.0) * time_unit
 
 
 def calc_time_window_vars(t):
@@ -1512,23 +1515,176 @@ def read_mchbar_base():
     return None
 
 
-def open_mchbar_power_limit_mmio():
-    """Open the validated direct MCHBAR package-power mirror, or return None."""
+def open_mchbar_power_limit_mmio(expected_msr=None):
+    """Open the allow-listed MCHBAR package-power mirror after a read-only equality gate."""
     mchbar_base = read_mchbar_base()
     if mchbar_base is None:
         return None
     try:
-        return MMIO(
+        mapping = MMIO(
             mchbar_base + MCHBAR_PACKAGE_POWER_LIMIT_OFFSET,
             MCHBAR_PACKAGE_POWER_LIMIT_SIZE,
         )
-    except MMIOError:
-        warning('Unable to open /dev/mem. MMIO package power-limit writes are disabled.')
+        if expected_msr is not None:
+            mmio_raw = mapping.read64(0)
+            if mmio_raw != expected_msr:
+                warning(
+                    f'Direct MCHBAR preflight mismatch: MMIO={mmio_raw:#x}, MSR={expected_msr:#x}; '
+                    'direct MCHBAR writes are disabled for this run.'
+                )
+                mapping.close()
+                return None
+        return mapping
+    except (MMIOError, OSError) as e:
+        warning(f'Unable to open/read /dev/mem MCHBAR ({e}); direct MMIO writes are disabled.')
         warning(
             'Check CONFIG_DEVMEM=y and that kernel lockdown is disabled '
             '(CONFIG_IO_STRICT_DEVMEM can also block this region).'
         )
         return None
+
+
+def apply_package_power_limit(write_value, mmio_powercap=None, mchbar_mmio=None):
+    """Apply one package-power value without allowing MSR/MMIO control-plane drift.
+
+    The kernel powercap interface is used for watts/Tau because it enforces
+    platform bounds. Enable/Clamp bits require the full MCHBAR mirror, which is
+    used only after a same-run MMIO==MSR preflight.
+    """
+    msr_before = readmsr('MSR_PKG_POWER_LIMIT', cpu=0)
+    if (msr_before >> PKG_POWER_LIMIT_LOCK_BIT) & 1:
+        warning('MSR_PKG_POWER_LIMIT became locked; package power-limit write skipped.')
+        return mmio_powercap, mchbar_mmio
+
+    direct_before = None
+    if mchbar_mmio is not None:
+        try:
+            direct_before = mchbar_mmio.read64(0)
+        except OSError as e:
+            warning(f'Unable to read validated MCHBAR mirror ({e}); disabling direct MCHBAR writes.')
+            mchbar_mmio = None
+        else:
+            if direct_before != msr_before:
+                warning(
+                    f'MCHBAR/MSR diverged before write (MMIO={direct_before:#x}, MSR={msr_before:#x}); '
+                    'disabling direct MCHBAR writes.'
+                )
+                mchbar_mmio = None
+                direct_before = None
+
+    control_change = bool((write_value ^ msr_before) & PKG_POWER_LIMIT_CONTROL_MASK)
+    if control_change and mchbar_mmio is None:
+        warning(
+            'TPL update would change Enable/Clamp bits but no MMIO==MSR-validated direct MCHBAR '
+            'mirror is available; skipping this package power update.'
+        )
+        return mmio_powercap, mchbar_mmio
+
+    if mmio_powercap is None and mchbar_mmio is None:
+        warning(
+            'No safe MMIO package-power backend is available; skipping package power update '
+            'instead of applying an unverifiable MSR-only daemon state.'
+        )
+        return mmio_powercap, mchbar_mmio
+
+    powercap_before = mmio_powercap.snapshot() if mmio_powercap is not None else None
+    msr_changed = False
+    direct_changed = False
+    try:
+        if msr_before != write_value:
+            writemsr('MSR_PKG_POWER_LIMIT', write_value, cpu=0)
+            msr_changed = True
+            readback = readmsr('MSR_PKG_POWER_LIMIT', cpu=0)
+            if readback != write_value:
+                raise OSError(
+                    f'MSR_PKG_POWER_LIMIT verify failed: wrote {write_value:#x}, read {readback:#x}'
+                )
+
+        power_unit = get_power_unit()
+        time_unit = get_time_unit()
+        if mmio_powercap is not None:
+            mmio_powercap.write(
+                pl1_w=get_value_for_bits(write_value, 0, 14) * power_unit,
+                pl2_w=get_value_for_bits(write_value, 32, 46) * power_unit,
+                tau1_s=decode_time_window_field(get_value_for_bits(write_value, 17, 23), time_unit),
+                tau2_s=decode_time_window_field(get_value_for_bits(write_value, 49, 55), time_unit),
+            )
+
+        if mchbar_mmio is not None:
+            mmio_current = mchbar_mmio.read64(0)
+            if (mmio_current >> PKG_POWER_LIMIT_LOCK_BIT) & 1:
+                raise OSError('MCHBAR package power limit is locked')
+            if mmio_current != write_value:
+                mchbar_mmio.write64(0, write_value)
+                direct_changed = True
+            mmio_readback = mchbar_mmio.read64(0)
+            if mmio_readback != write_value:
+                raise OSError(
+                    f'MCHBAR package-power verify failed: wrote {write_value:#x}, read {mmio_readback:#x}'
+                )
+    except (OSError, PowercapError) as e:
+        rollback_errors = []
+        if direct_changed and mchbar_mmio is not None and direct_before is not None:
+            try:
+                mchbar_mmio.write64(0, direct_before)
+                if mchbar_mmio.read64(0) != direct_before:
+                    rollback_errors.append('MCHBAR verify mismatch')
+            except OSError as rollback_error:
+                rollback_errors.append(f'MCHBAR: {rollback_error}')
+        if powercap_before is not None and mmio_powercap is not None:
+            try:
+                mmio_powercap.restore(powercap_before)
+            except PowercapError as rollback_error:
+                rollback_errors.append(f'powercap: {rollback_error}')
+        if msr_changed:
+            try:
+                writemsr('MSR_PKG_POWER_LIMIT', msr_before, cpu=0)
+                if readmsr('MSR_PKG_POWER_LIMIT', cpu=0) != msr_before:
+                    rollback_errors.append('MSR verify mismatch')
+            except (OSError, IOError) as rollback_error:
+                rollback_errors.append(f'MSR: {rollback_error}')
+        suffix = f'; rollback issues: {"; ".join(rollback_errors)}' if rollback_errors else '; rollback attempted'
+        warning(f'Package power update failed: {e}{suffix}', oneshot=False)
+
+    return mmio_powercap, mchbar_mmio
+
+
+def apply_profile_registers(regs, power_source, mmio_powercap=None, mchbar_mmio=None):
+    """Apply directly readable profile MSRs for one source and return MMIO backends."""
+    if power_source not in regs:
+        return mmio_powercap, mchbar_mmio
+
+    profile_regs = regs[power_source]
+
+    if 'MSR_TEMPERATURE_TARGET' in profile_regs:
+        write_value = profile_regs['MSR_TEMPERATURE_TARGET']
+        current = readmsr('MSR_TEMPERATURE_TARGET', cpu=0)
+        if (current >> 31) & 1:
+            warning('MSR_TEMPERATURE_TARGET TCC offset is locked; temperature-target write skipped.')
+        else:
+            offset_mask = 0x3F << 24
+            new_value = (current & ~offset_mask) | (write_value & offset_mask)
+            if new_value != current:
+                writemsr('MSR_TEMPERATURE_TARGET', new_value, cpu=0)
+
+    if 'MSR_CONFIG_TDP_CONTROL' in profile_regs:
+        write_value = profile_regs['MSR_CONFIG_TDP_CONTROL']
+        current = readmsr('MSR_CONFIG_TDP_CONTROL', cpu=0)
+        if (current >> 31) & 1:
+            warning('MSR_CONFIG_TDP_CONTROL is locked; cTDP write skipped.')
+        else:
+            new_value = (current & ~0x3) | (write_value & 0x3)
+            if new_value != current:
+                writemsr('MSR_CONFIG_TDP_CONTROL', new_value, cpu=0)
+
+    if 'MSR_PKG_POWER_LIMIT' in profile_regs:
+        mmio_powercap, mchbar_mmio = apply_package_power_limit(
+            profile_regs['MSR_PKG_POWER_LIMIT'],
+            mmio_powercap=mmio_powercap,
+            mchbar_mmio=mchbar_mmio,
+        )
+
+    return mmio_powercap, mchbar_mmio
 
 
 def power_thread(state, exit_event):
@@ -1550,10 +1706,14 @@ def _power_thread(state, exit_event):
     config, regs = state['config'], state['regs']
     mmio_powercap = find_mmio_package_zone()
     mchbar_mmio = None
+    has_tpl = any('MSR_PKG_POWER_LIMIT' in regs.get(profile, {}) for profile in POWER_PROFILES)
+    if has_tpl:
+        pkg_baseline = readmsr('MSR_PKG_POWER_LIMIT', cpu=0)
+        mchbar_mmio = open_mchbar_power_limit_mmio(expected_msr=pkg_baseline)
     if mmio_powercap is not None:
         log(f'[I] Using kernel intel-rapl-mmio zone: {mmio_powercap.path}')
-    else:
-        mchbar_mmio = open_mchbar_power_limit_mmio()
+    if mchbar_mmio is not None:
+        log('[I] Direct MCHBAR package-power mirror passed MMIO==MSR preflight.')
 
     next_hwp_write = 0
     applied_source = power['source']
@@ -1603,86 +1763,12 @@ def _power_thread(state, exit_event):
             set_bdprochot(_bdprochot_setting(config, power_source))
             applied_source = power_source
 
-        # set temperature trip point
-        if 'MSR_TEMPERATURE_TARGET' in regs[power_source]:
-            write_value = regs[power_source]['MSR_TEMPERATURE_TARGET']
-            current = readmsr('MSR_TEMPERATURE_TARGET', cpu=0)
-            if (current >> 31) & 1:
-                warning('MSR_TEMPERATURE_TARGET TCC offset is locked; temperature-target write skipped.')
-            else:
-                offset_mask = 0x3F << 24
-                new_value = (current & ~offset_mask) | (write_value & offset_mask)
-                writemsr('MSR_TEMPERATURE_TARGET', new_value)
-                if args.debug:
-                    read_value = readmsr('MSR_TEMPERATURE_TARGET', 24, 29, flatten=True)
-                    match = OK if (write_value >> 24) == read_value else ERR
-                    log(
-                        f'[D] TEMPERATURE_TARGET - write {write_value >> 24:#x} '
-                        f'- read {read_value:#x} - match {match}'
-                    )
-
-        # set cTDP target bits without touching the lock/reserved fields
-        if 'MSR_CONFIG_TDP_CONTROL' in regs[power_source]:
-            write_value = regs[power_source]['MSR_CONFIG_TDP_CONTROL']
-            current = readmsr('MSR_CONFIG_TDP_CONTROL', cpu=0)
-            if (current >> 31) & 1:
-                warning('MSR_CONFIG_TDP_CONTROL is locked; cTDP write skipped.')
-            else:
-                new_value = (current & ~0x3) | (write_value & 0x3)
-                writemsr('MSR_CONFIG_TDP_CONTROL', new_value)
-                if args.debug:
-                    read_value = readmsr('MSR_CONFIG_TDP_CONTROL', 0, 1, flatten=True)
-                    match = OK if write_value == read_value else ERR
-                    log(f'[D] CONFIG_TDP_CONTROL - write {write_value:#x} - read {read_value:#x} - match {match}')
-
-        # set PL1/2 on MSR
-        if 'MSR_PKG_POWER_LIMIT' in regs[power_source]:
-            write_value = regs[power_source]['MSR_PKG_POWER_LIMIT']
-            writemsr('MSR_PKG_POWER_LIMIT', write_value)
-            if args.debug:
-                read_value = readmsr('MSR_PKG_POWER_LIMIT', flatten=True)
-                match = OK if write_value == read_value else ERR
-                log(f'[D] MSR PACKAGE_POWER_LIMIT - write {write_value:#x} - read {read_value:#x} - match {match}')
-            if mmio_powercap is not None:
-                try:
-                    power_unit = get_power_unit()
-                    pl1_ticks = get_value_for_bits(write_value, 0, 14)
-                    pl2_ticks = get_value_for_bits(write_value, 32, 46)
-                    tw1 = get_value_for_bits(write_value, 17, 23)
-                    tw2 = get_value_for_bits(write_value, 49, 55)
-                    mmio_powercap.write(
-                        pl1_w=pl1_ticks * power_unit,
-                        pl2_w=pl2_ticks * power_unit,
-                        tau1_s=decode_time_window_field(tw1),
-                        tau2_s=decode_time_window_field(tw2),
-                    )
-                except PowercapError as e:
-                    warning(
-                        f'Unable to write intel-rapl-mmio power limits ({e}); '
-                        'falling back to validated direct MCHBAR if available.'
-                    )
-                    mmio_powercap = None
-                    if mchbar_mmio is None:
-                        mchbar_mmio = open_mchbar_power_limit_mmio()
-
-            if mmio_powercap is None and mchbar_mmio is not None:
-                # Fallback for kernels that do not expose a usable intel-rapl-mmio zone.
-                try:
-                    mmio_current = mchbar_mmio.read64(0)
-                    if (mmio_current >> PKG_POWER_LIMIT_LOCK_BIT) & 1:
-                        warning('MCHBAR package power limit is locked; disabling only MMIO writes.')
-                        mchbar_mmio = None
-                    else:
-                        mchbar_mmio.write64(0, write_value)
-                        if args.debug:
-                            read_value = mchbar_mmio.read64(0)
-                            match = OK if write_value == read_value else ERR
-                            log(
-                                f'[D] MCHBAR PACKAGE_POWER_LIMIT - write {write_value:#x} - read {read_value:#x} - match {match}'
-                            )
-                except OSError as e:
-                    warning(f'Unable to write MCHBAR package power limits ({e}); disabling only MMIO writes.')
-                    mchbar_mmio = None
+        mmio_powercap, mchbar_mmio = apply_profile_registers(
+            regs,
+            power_source,
+            mmio_powercap=mmio_powercap,
+            mchbar_mmio=mchbar_mmio,
+        )
 
         # Re-assert profile controls in case firmware or another power manager changed them.
         set_bdprochot(_bdprochot_setting(config, power_source))
