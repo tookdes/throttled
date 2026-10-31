@@ -359,6 +359,30 @@ class PR394FixTests(unittest.TestCase):
 
         writemsr.assert_not_called()
         self.assertTrue(any('No MMIO==MSR-validated direct MCHBAR' in call.args[0] for call in warning.call_args_list))
+    def test_powercap_alone_is_not_enough_for_watts_only_tpl_update(self):
+        throttled = load_throttled()
+        powercap = mock.Mock()
+        msr_state = {'value': 0x8000}
+
+        with mock.patch.object(throttled, 'readmsr', return_value=msr_state['value']):
+            with mock.patch.object(throttled, 'writemsr') as writemsr:
+                with mock.patch.object(throttled, 'warning') as warning:
+                    throttled.apply_package_power_limit(
+                        0x8001,
+                        mmio_powercap=powercap,
+                        mchbar_mmio=None,
+                    )
+
+        writemsr.assert_not_called()
+        powercap.snapshot.assert_not_called()
+        powercap.write.assert_not_called()
+        self.assertTrue(
+            any(
+                'No MMIO==MSR-validated direct MCHBAR' in call.args[0]
+                for call in warning.call_args_list
+            )
+        )
+
     def test_validated_direct_mchbar_and_package_msr_update_together(self):
         throttled = load_throttled()
         msr_state = {'value': 0x8000}
