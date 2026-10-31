@@ -555,8 +555,7 @@ def handle_sleep_prepare(sleeping, config_or_state):
                 set_hwp_epp(_hwp_epp(config, source))
                 disable_turbo = config.getboolean(source, 'Disable_Turbo', fallback=None)
                 set_turbo(None if disable_turbo is None else not disable_turbo)
-                disable_bdprochot = config.getboolean(source, 'Disable_BDPROCHOT', fallback=None)
-                set_bdprochot(None if disable_bdprochot is None else not disable_bdprochot)
+                set_bdprochot(_bdprochot_setting(config, source))
 
 
 def handle_ac_properties_changed(if_name, changed, invalidated):
@@ -580,9 +579,12 @@ def should_listen_for_resume(config):
     if config.has_option('AC', 'HWP_Mode'):
         return True
     return any(
-        profile in config and any(
-            config.has_option(profile, option)
-            for option in ('HWP_EPP', 'Disable_Turbo', 'Disable_BDPROCHOT')
+        profile in config
+        and (
+            config.has_option(profile, 'HWP_EPP')
+            or config.has_option(profile, 'Disable_Turbo')
+            or config.has_option(profile, 'BDPROCHOT_Enabled')
+            or config.getboolean(profile, 'Disable_BDPROCHOT', fallback=False)
         )
         for profile in POWER_PROFILES
     )
@@ -940,7 +942,7 @@ def load_config():
     boolean_options.extend(
         (profile, option)
         for profile in power_profiles
-        for option in ('Disable_BDPROCHOT', 'Disable_Turbo', 'PL1_Enable', 'PL1_Clamp', 'PL2_Enable', 'PL2_Clamp')
+        for option in ('Disable_BDPROCHOT', 'BDPROCHOT_Enabled', 'Disable_Turbo', 'PL1_Enable', 'PL1_Clamp', 'PL2_Enable', 'PL2_Clamp')
     )
     for section, option in boolean_options:
         try:
@@ -1242,6 +1244,24 @@ def _hwp_mode(config):
     return value == HWP_PERFORMANCE_VALUE
 
 
+def _bdprochot_setting(config, source=None):
+    """Return explicit desired BD PROCHOT state while preserving legacy semantics.
+
+    BDPROCHOT_Enabled is the reversible profile control. The historical
+    Disable_BDPROCHOT option remains one-way: True disables; False/absent means
+    leave the current hardware state untouched.
+    """
+    source = source or power['source']
+    explicit = config.getboolean(source, 'BDPROCHOT_Enabled', fallback=None)
+    if explicit is not None:
+        return explicit
+
+    legacy_disable = config.getboolean(source, 'Disable_BDPROCHOT', fallback=None)
+    if legacy_disable:
+        return False
+    return None
+
+
 def set_turbo(enabled):
     """Set IA32_MISC_ENABLE[38] without disturbing unrelated bits."""
     if enabled is None:
@@ -1312,8 +1332,7 @@ def reload_config():
     set_hwp_epp(_hwp_epp(config, source))
     disable_turbo = config.getboolean(source, 'Disable_Turbo', fallback=None)
     set_turbo(None if disable_turbo is None else not disable_turbo)
-    disable_bdprochot = config.getboolean(source, 'Disable_BDPROCHOT', fallback=None)
-    set_bdprochot(None if disable_bdprochot is None else not disable_bdprochot)
+    set_bdprochot(_bdprochot_setting(config, source))
     log('[I] Reloading changes.')
     return config, regs
 
@@ -1476,8 +1495,7 @@ def _power_thread(state, exit_event):
             next_hwp_write = time() + HWP_INTERVAL
             disable_turbo = config.getboolean(power_source, 'Disable_Turbo', fallback=None)
             set_turbo(None if disable_turbo is None else not disable_turbo)
-            disable_bdprochot = config.getboolean(power_source, 'Disable_BDPROCHOT', fallback=None)
-            set_bdprochot(None if disable_bdprochot is None else not disable_bdprochot)
+            set_bdprochot(_bdprochot_setting(config, power_source))
             applied_source = power_source
 
         # set temperature trip point
@@ -1550,8 +1568,7 @@ def _power_thread(state, exit_event):
                     mchbar_mmio = None
 
         # Re-assert profile controls in case firmware or another power manager changed them.
-        disable_bdprochot = config.getboolean(power_source, 'Disable_BDPROCHOT', fallback=None)
-        set_bdprochot(None if disable_bdprochot is None else not disable_bdprochot)
+        set_bdprochot(_bdprochot_setting(config, power_source))
 
         disable_turbo = config.getboolean(power_source, 'Disable_Turbo', fallback=None)
         set_turbo(None if disable_turbo is None else not disable_turbo)
@@ -1819,8 +1836,7 @@ def main():
     set_hwp_epp(_hwp_epp(config, power['source']))
     disable_turbo = config.getboolean(power['source'], 'Disable_Turbo', fallback=None)
     set_turbo(None if disable_turbo is None else not disable_turbo)
-    disable_bdprochot = config.getboolean(power['source'], 'Disable_BDPROCHOT', fallback=None)
-    set_bdprochot(None if disable_bdprochot is None else not disable_bdprochot)
+    set_bdprochot(_bdprochot_setting(config, power['source']))
 
     state = {'config': config, 'regs': regs}
 
