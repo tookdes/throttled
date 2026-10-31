@@ -41,8 +41,9 @@ POWER_PROFILES = ('AC', 'BATTERY')
 UNDERVOLT_KEYS = ('UNDERVOLT', 'UNDERVOLT.AC', 'UNDERVOLT.BATTERY')
 ICCMAX_KEYS = ('ICCMAX', 'ICCMAX.AC', 'ICCMAX.BATTERY')
 power = {'source': None, 'method': 'polling'}
-# serializes config publication with the resume callback's read-then-write
+# Serialize config/source publication separately from low-level hardware writes.
 config_lock = Lock()
+hardware_lock = Lock()
 MSR_DICT = {
     'MSR_PLATFORM_INFO': 0xCE,
     'MSR_OC_MAILBOX': 0x150,
@@ -552,28 +553,53 @@ def _current_config(config_or_state):
     return config_or_state['config'] if isinstance(config_or_state, dict) else config_or_state
 
 
+def _current_regs(config_or_state):
+    return config_or_state.get('regs') if isinstance(config_or_state, dict) else None
+
+
 def config_is_enabled(config):
     """Return whether hardware changes are enabled in the loaded config."""
     return config.getboolean('GENERAL', 'Enabled', fallback=False)
 
 
 def handle_sleep_prepare(sleeping, config_or_state):
-    if not sleeping:
-        with config_lock:
-            config = _current_config(config_or_state)
-            if config_is_enabled(config):
-                undervolt(config)
-                set_icc_max(config)
-                source = power['source']
-                set_hwp_epp(_hwp_epp(config, source))
-                set_turbo(_turbo_setting(config, source))
-                set_bdprochot(_bdprochot_setting(config, source))
+    if sleeping:
+        return
+
+    with config_lock:
+        config = _current_config(config_or_state)
+        regs = _current_regs(config_or_state)
+        source = power['source']
+
+    if not config_is_enabled(config) or source not in POWER_PROFILES:
+        return
+
+    with hardware_lock:
+        mmio_powercap = find_mmio_package_zone()
+        mchbar_mmio = None
+        if regs is not None and 'MSR_PKG_POWER_LIMIT' in regs.get(source, {}):
+            baseline = readmsr('MSR_PKG_POWER_LIMIT', cpu=0)
+            mchbar_mmio = open_mchbar_power_limit_mmio(expected_msr=baseline)
+        try:
+            apply_runtime_profile(
+                config,
+                regs,
+                source,
+                mmio_powercap=mmio_powercap,
+                mchbar_mmio=mchbar_mmio,
+                apply_mailbox=True,
+                apply_hwp=True,
+            )
+        finally:
+            if mchbar_mmio is not None:
+                mchbar_mmio.close()
 
 
 def handle_ac_properties_changed(if_name, changed, invalidated):
     if "OnBattery" in changed:
-        power['method'] = 'dbus'
-        power['source'] = 'BATTERY' if bool(unwrap_dbus_value(changed['OnBattery'])) else 'AC'
+        with config_lock:
+            power['method'] = 'dbus'
+            power['source'] = 'BATTERY' if bool(unwrap_dbus_value(changed['OnBattery'])) else 'AC'
 
 
 def should_listen_for_resume(config):
@@ -588,14 +614,28 @@ def should_listen_for_resume(config):
     ):
         return True
 
-    if config.has_option('AC', 'HWP_Mode'):
+    if config.getboolean('AC', 'HWP_Mode', fallback=False):
         return True
+
+    resume_options = (
+        'HWP_EPP',
+        'Disable_Turbo',
+        'BDPROCHOT_Enabled',
+        'Trip_Temp_C',
+        'cTDP',
+        'PL1_Tdp_W',
+        'PL1_Duration_s',
+        'PL2_Tdp_W',
+        'PL2_Duration_s',
+        'PL1_Enable',
+        'PL1_Clamp',
+        'PL2_Enable',
+        'PL2_Clamp',
+    )
     return any(
         profile in config
         and (
-            config.has_option(profile, 'HWP_EPP')
-            or config.has_option(profile, 'Disable_Turbo')
-            or config.has_option(profile, 'BDPROCHOT_Enabled')
+            any(config.has_option(profile, option) for option in resume_options)
             or config.getboolean(profile, 'Disable_BDPROCHOT', fallback=False)
         )
         for profile in POWER_PROFILES
@@ -1687,6 +1727,36 @@ def apply_profile_registers(regs, power_source, mmio_powercap=None, mchbar_mmio=
     return mmio_powercap, mchbar_mmio
 
 
+def apply_runtime_profile(
+    config,
+    regs,
+    power_source,
+    *,
+    mmio_powercap=None,
+    mchbar_mmio=None,
+    apply_mailbox=False,
+    apply_hwp=False,
+):
+    """Apply one internally consistent power profile while hardware_lock is held."""
+    if apply_mailbox:
+        undervolt(config, source=power_source)
+        set_icc_max(config, source=power_source)
+
+    if regs is not None:
+        mmio_powercap, mchbar_mmio = apply_profile_registers(
+            regs,
+            power_source,
+            mmio_powercap=mmio_powercap,
+            mchbar_mmio=mchbar_mmio,
+        )
+
+    set_bdprochot(_bdprochot_setting(config, power_source))
+    set_turbo(_turbo_setting(config, power_source))
+    if apply_hwp:
+        set_hwp_epp(_hwp_epp(config, power_source))
+    return mmio_powercap, mchbar_mmio
+
+
 def power_thread(state, exit_event):
     """Crash-loud wrapper for _power_thread: an uncaught exception (or a
     sys.exit() from a helper) would only kill this thread, leaving a zombie
@@ -1734,9 +1804,9 @@ def _power_thread(state, exit_event):
         if power['method'] == 'polling':
             power['source'] = 'BATTERY' if is_on_battery(config) else 'AC'
 
-        # snapshot the power source once per iteration: the D-Bus callback can
-        # flip it concurrently and every write below must agree on one profile
-        power_source = power['source']
+        # Snapshot the source under the same publication lock used by D-Bus.
+        with config_lock:
+            power_source = power['source']
 
         # Enabled=False is a hard write barrier, including the iteration that
         # observes an enabled -> disabled autoreload transition.
@@ -1752,36 +1822,27 @@ def _power_thread(state, exit_event):
                 for key, value in core_thermal_status.items():
                     log(f'[D] core {index} thermal status: {key.replace("_", " ")} = {value}')
 
-        # re-apply the one-shot per-profile settings when the power source flips
-        if power_source != applied_source:
+        source_changed = power_source != applied_source
+        if source_changed:
             log(f'[I] Power source changed: {applied_source:s} -> {power_source:s}')
-            undervolt(config, source=power_source)
-            set_icc_max(config, source=power_source)
-            set_hwp_epp(_hwp_epp(config, power_source))
+
+        hwp_epp = _hwp_epp(config, power_source)
+        hwp_due = hwp_epp is not None and (source_changed or next_hwp_write <= time())
+        with hardware_lock:
+            mmio_powercap, mchbar_mmio = apply_runtime_profile(
+                config,
+                regs,
+                power_source,
+                mmio_powercap=mmio_powercap,
+                mchbar_mmio=mchbar_mmio,
+                apply_mailbox=source_changed,
+                apply_hwp=hwp_due,
+            )
+        applied_source = power_source
+        if hwp_due:
             next_hwp_write = time() + HWP_INTERVAL
-            set_turbo(_turbo_setting(config, power_source))
-            set_bdprochot(_bdprochot_setting(config, power_source))
-            applied_source = power_source
-
-        mmio_powercap, mchbar_mmio = apply_profile_registers(
-            regs,
-            power_source,
-            mmio_powercap=mmio_powercap,
-            mchbar_mmio=mchbar_mmio,
-        )
-
-        # Re-assert profile controls in case firmware or another power manager changed them.
-        set_bdprochot(_bdprochot_setting(config, power_source))
-
-        set_turbo(_turbo_setting(config, power_source))
 
         wait_t = get_update_rate(config, power_source)
-        hwp_epp = _hwp_epp(config, power_source)
-        # Set HWP less frequently since desktop power managers may also manage EPP.
-        if hwp_epp is not None and next_hwp_write <= time():
-            set_hwp_epp(hwp_epp)
-            next_hwp_write = time() + HWP_INTERVAL
-
         exit_event.wait(wait_t)
 
 
