@@ -71,23 +71,29 @@ class PowerSourceFlipTests(unittest.TestCase):
         throttled = load_throttled()
         throttled.power['source'] = 'BATTERY'
         config = make_config({'ICCMAX.AC': {'CORE': 100}})
+        desired = throttled.calc_icc_max_msr('CORE', 100) & throttled.ICCMAX_MAX_FIELD
 
-        with mock.patch.object(throttled, 'writemsr') as writemsr:
-            with mock.patch.object(throttled, 'warning'):
-                throttled.set_icc_max(config, source='AC')
+        with mock.patch.object(
+            throttled,
+            'get_icc_max',
+            side_effect=[{'CORE': 0}, {'CORE': desired}],
+        ):
+            with mock.patch.object(throttled, 'execute_oc_mailbox') as execute:
+                with mock.patch.object(throttled, 'warning'):
+                    throttled.set_icc_max(config, source='AC')
 
-        writemsr.assert_called_once_with('MSR_OC_MAILBOX', throttled.calc_icc_max_msr('CORE', 100))
+        execute.assert_called_once_with(throttled.calc_icc_max_msr('CORE', 100))
 
     def test_set_icc_max_warning_honors_an_explicit_power_source(self):
         throttled = load_throttled()
         throttled.power['source'] = 'AC'
         config = make_config({'ICCMAX.AC': {'CORE': 100}})
 
-        with mock.patch.object(throttled, 'writemsr') as writemsr:
+        with mock.patch.object(throttled, 'execute_oc_mailbox') as execute:
             with mock.patch.object(throttled, 'warning') as warning:
                 throttled.set_icc_max(config, source='BATTERY')
 
-        writemsr.assert_not_called()
+        execute.assert_not_called()
         warning.assert_called_once_with('IccMax CORE is not configured for the BATTERY profile: leaving it untouched.')
 
     def test_power_flip_reapplies_undervolt_and_iccmax(self):
