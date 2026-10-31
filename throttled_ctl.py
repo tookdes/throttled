@@ -10,9 +10,9 @@ small, explicit register-control tool used to reach ThrottleStop parity on the
   * verifies readback;
   * attempts rollback if a write or verification fails.
 
-Kernel-managed intel-rapl-mmio is used when available. Direct /dev/mem MCHBAR
-writes are intentionally not guessed for the 830 G6 and remain restricted to
-the daemon's existing validated PCI allow-list.
+Synchronized TPL writes require a read-only-validated direct MCHBAR mirror.
+Kernel intel-rapl-mmio is additionally used for watts/Tau bounds when present;
+raw /dev/mem writes remain restricted to the shared validated PCI allow-list.
 """
 
 import argparse
