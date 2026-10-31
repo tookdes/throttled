@@ -43,6 +43,7 @@ config_lock = Lock()
 MSR_DICT = {
     'MSR_PLATFORM_INFO': 0xCE,
     'MSR_OC_MAILBOX': 0x150,
+    'IA32_MISC_ENABLE': 0x1A0,
     'IA32_PERF_STATUS': 0x198,
     'IA32_THERM_STATUS': 0x19C,
     'MSR_TEMPERATURE_TARGET': 0x1A2,
@@ -59,6 +60,8 @@ MSR_DICT = {
 HWP_PERFORMANCE_VALUE = 0x20
 HWP_DEFAULT_VALUE = 0x80
 HWP_INTERVAL = 60
+TURBO_DISABLE_BIT = 38
+BD_PROCHOT_ENABLE_BIT = 0
 UNDERVOLT_TICKS_PER_MV = 1.024
 UNDERVOLT_MIN_TICKS = -(1 << 10)
 UNDERVOLT_MAX_TICKS = 0
@@ -872,12 +875,22 @@ def load_config():
         fatal('At least one power profile ([AC] or [BATTERY]) is required.')
 
     boolean_options = [('GENERAL', 'Enabled'), ('GENERAL', 'Autoreload'), ('AC', 'HWP_Mode')]
-    boolean_options.extend((profile, 'Disable_BDPROCHOT') for profile in power_profiles)
+    boolean_options.extend((profile, option) for profile in power_profiles for option in ('Disable_BDPROCHOT', 'Disable_Turbo'))
     for section, option in boolean_options:
         try:
             config.getboolean(section, option, fallback=None)
         except (ValueError, configparser.InterpolationError):
             fatal(f'The "{option:s}" parameter in [{section:s}] must be a boolean.')
+
+    # HWP_EPP is the direct ThrottleStop-style Speed Shift EPP value.
+    # Keep HWP_Mode for backward compatibility, but prefer per-profile HWP_EPP.
+    for power_source in power_profiles:
+        try:
+            hwp_epp = config.getint(power_source, 'HWP_EPP', fallback=None)
+        except (ValueError, configparser.InterpolationError):
+            fatal(f'The "HWP_EPP" parameter in [{power_source:s}] must be an integer from 0 to 255.')
+        if hwp_epp is not None and not 0 <= hwp_epp <= 255:
+            fatal(f'The "HWP_EPP" parameter in [{power_source:s}] must be an integer from 0 to 255.')
 
     # config values sanity check
     for power_source in power_profiles:
@@ -1087,37 +1100,92 @@ def calc_reg_values(platform_info, config):
     return regs
 
 
-def set_hwp(performance_mode):
-    """Set the IA32_HWP_REQUEST energy/performance preference field."""
-    if performance_mode not in (True, False) or 'HWP' in UNSUPPORTED_FEATURES:
+def set_hwp_epp(epp):
+    """Set IA32_HWP_REQUEST.EPP on every online logical CPU."""
+    if epp is None or 'HWP' in UNSUPPORTED_FEATURES:
         return
-    hwp_mode = HWP_PERFORMANCE_VALUE if performance_mode is True else HWP_DEFAULT_VALUE
-    # a CPU that disappears mid-loop is fatal rather than falling back to a broadcast write
+    if not isinstance(epp, int) or not 0 <= epp <= 255:
+        raise ValueError(f'HWP EPP must be an integer from 0 to 255, got {epp!r}.')
+
+    # A CPU that disappears mid-loop is fatal rather than falling back to a broadcast write.
     for addr in _ensure_msr_module():
         cpu = int(os.path.basename(os.path.dirname(addr)))
         cur_val = readmsr('IA32_HWP_REQUEST', cpu=cpu)
-        new_val = (cur_val & 0xFFFFFFFF00FFFFFF) | (hwp_mode << 24)
+        new_val = (cur_val & 0xFFFFFFFF00FFFFFF) | (epp << 24)
         writemsr('IA32_HWP_REQUEST', new_val, cpu=cpu)
         if args.debug:
             read_value = readmsr('IA32_HWP_REQUEST', from_bit=24, to_bit=31, cpu=cpu)
-            match = OK if hwp_mode == read_value else ERR
-            log(f'[D] HWP CPU {cpu:d} - write "{hwp_mode:#02x}" - read "{read_value:#02x}" - match {match}')
+            match = OK if epp == read_value else ERR
+            log(f'[D] HWP CPU {cpu:d} - write EPP "{epp:#02x}" - read "{read_value:#02x}" - match {match}')
+
+
+def set_hwp(performance_mode):
+    """Backward-compatible HWP_Mode wrapper."""
+    if performance_mode not in (True, False):
+        return
+    set_hwp_epp(HWP_PERFORMANCE_VALUE if performance_mode else HWP_DEFAULT_VALUE)
+
+
+def _hwp_epp(config, source=None):
+    source = source or power['source']
+    epp = config.getint(source, 'HWP_EPP', fallback=None)
+    if epp is not None:
+        return epp
+
+    legacy = config.getboolean('AC', 'HWP_Mode', fallback=None)
+    if legacy is None:
+        return None
+    return HWP_PERFORMANCE_VALUE if legacy and source == 'AC' else HWP_DEFAULT_VALUE
 
 
 def _hwp_mode(config):
-    return config.getboolean('AC', 'HWP_Mode', fallback=None) and power['source'] == 'AC'
+    """Legacy helper retained for callers/tests that still use HWP_Mode."""
+    value = _hwp_epp(config)
+    if value is None:
+        return None
+    return value == HWP_PERFORMANCE_VALUE
 
 
-def set_disable_bdprochot():
-    """Clear bit 0 of MSR_POWER_CTL to disable BDPROCHOT."""
+def set_turbo(enabled):
+    """Set IA32_MISC_ENABLE[38] without disturbing unrelated bits."""
+    if enabled is None:
+        return
+    for addr in _ensure_msr_module():
+        cpu = int(os.path.basename(os.path.dirname(addr)))
+        cur_val = readmsr('IA32_MISC_ENABLE', cpu=cpu)
+        if enabled:
+            new_val = cur_val & ~(1 << TURBO_DISABLE_BIT)
+        else:
+            new_val = cur_val | (1 << TURBO_DISABLE_BIT)
+        writemsr('IA32_MISC_ENABLE', new_val, cpu=cpu)
+        if args.debug:
+            read_value = readmsr('IA32_MISC_ENABLE', from_bit=TURBO_DISABLE_BIT, to_bit=TURBO_DISABLE_BIT, cpu=cpu)
+            expected = 0 if enabled else 1
+            match = OK if read_value == expected else ERR
+            log(f'[D] Turbo CPU {cpu:d} - write disable={expected:d} - read "{read_value:#02x}" - match {match}')
+
+
+def set_bdprochot(enabled):
+    """Set or clear MSR_POWER_CTL[0] so profile changes can restore BD PROCHOT."""
+    if enabled is None:
+        return
     cur_val = readmsr('MSR_POWER_CTL', flatten=True)
-    new_val = cur_val & 0xFFFFFFFFFFFFFFFE
+    if enabled:
+        new_val = cur_val | (1 << BD_PROCHOT_ENABLE_BIT)
+    else:
+        new_val = cur_val & ~(1 << BD_PROCHOT_ENABLE_BIT)
 
     writemsr('MSR_POWER_CTL', new_val)
     if args.debug:
-        read_value = readmsr('MSR_POWER_CTL', from_bit=0, to_bit=0)[0]
-        match = OK if read_value == 0 else ERR
-        log(f'[D] BDPROCHOT - write "{0:#02x}" - read "{read_value:#02x}" - match {match}')
+        read_value = readmsr('MSR_POWER_CTL', from_bit=BD_PROCHOT_ENABLE_BIT, to_bit=BD_PROCHOT_ENABLE_BIT)[0]
+        expected = 1 if enabled else 0
+        match = OK if read_value == expected else ERR
+        log(f'[D] BDPROCHOT - write "{expected:#02x}" - read "{read_value:#02x}" - match {match}')
+
+
+def set_disable_bdprochot():
+    """Backward-compatible helper for the historical one-way control."""
+    set_bdprochot(False)
 
 
 def get_config_write_time():
@@ -1137,7 +1205,12 @@ def reload_config():
     regs = calc_reg_values(get_cpu_platform_info(), config)
     undervolt(config)
     set_icc_max(config)
-    set_hwp(_hwp_mode(config))
+    source = power['source']
+    set_hwp_epp(_hwp_epp(config, source))
+    disable_turbo = config.getboolean(source, 'Disable_Turbo', fallback=None)
+    set_turbo(None if disable_turbo is None else not disable_turbo)
+    disable_bdprochot = config.getboolean(source, 'Disable_BDPROCHOT', fallback=None)
+    set_bdprochot(None if disable_bdprochot is None else not disable_bdprochot)
     log('[I] Reloading changes.')
     return config, regs
 
@@ -1292,12 +1365,12 @@ def _power_thread(state, exit_event):
             log(f'[I] Power source changed: {applied_source:s} -> {power_source:s}')
             undervolt(config, source=power_source)
             set_icc_max(config, source=power_source)
-            if config.getboolean('AC', 'HWP_Mode', fallback=False):
-                if power_source == 'AC':
-                    next_hwp_write = 0
-                else:
-                    # restore the default energy/performance preference on battery
-                    set_hwp(False)
+            set_hwp_epp(_hwp_epp(config, power_source))
+            next_hwp_write = time() + HWP_INTERVAL
+            disable_turbo = config.getboolean(power_source, 'Disable_Turbo', fallback=None)
+            set_turbo(None if disable_turbo is None else not disable_turbo)
+            disable_bdprochot = config.getboolean(power_source, 'Disable_BDPROCHOT', fallback=None)
+            set_bdprochot(None if disable_bdprochot is None else not disable_bdprochot)
             applied_source = power_source
 
         # set temperature trip point
@@ -1340,16 +1413,18 @@ def _power_thread(state, exit_event):
                     warning(f'Unable to write MCHBAR package power limits ({e}); disabling only MMIO writes.')
                     mchbar_mmio = None
 
-        # Disable BDPROCHOT
+        # Re-assert profile controls in case firmware or another power manager changed them.
         disable_bdprochot = config.getboolean(power_source, 'Disable_BDPROCHOT', fallback=None)
-        if disable_bdprochot:
-            set_disable_bdprochot()
+        set_bdprochot(None if disable_bdprochot is None else not disable_bdprochot)
+
+        disable_turbo = config.getboolean(power_source, 'Disable_Turbo', fallback=None)
+        set_turbo(None if disable_turbo is None else not disable_turbo)
 
         wait_t = get_update_rate(config, power_source)
-        enable_hwp_mode = config.getboolean('AC', 'HWP_Mode', fallback=None)
-        # set HWP less frequently. Just to be safe since (e.g.) TLP might reset this value
-        if enable_hwp_mode and next_hwp_write <= time() and power_source == 'AC':
-            set_hwp(enable_hwp_mode)
+        hwp_epp = _hwp_epp(config, power_source)
+        # Set HWP less frequently since desktop power managers may also manage EPP.
+        if hwp_epp is not None and next_hwp_write <= time():
+            set_hwp_epp(hwp_epp)
             next_hwp_write = time() + HWP_INTERVAL
 
         exit_event.wait(wait_t)
@@ -1605,7 +1680,11 @@ def main():
 
     undervolt(config)
     set_icc_max(config)
-    set_hwp(_hwp_mode(config))
+    set_hwp_epp(_hwp_epp(config, power['source']))
+    disable_turbo = config.getboolean(power['source'], 'Disable_Turbo', fallback=None)
+    set_turbo(None if disable_turbo is None else not disable_turbo)
+    disable_bdprochot = config.getboolean(power['source'], 'Disable_BDPROCHOT', fallback=None)
+    set_bdprochot(None if disable_bdprochot is None else not disable_bdprochot)
 
     state = {'config': config, 'regs': regs}
 
