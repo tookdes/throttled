@@ -295,35 +295,20 @@ class PR394FixTests(unittest.TestCase):
                 read.assert_not_called()
                 warning.assert_called_once()
 
-    def test_power_thread_gates_mmio_on_the_pci_identity(self):
+    def test_open_mchbar_requires_same_run_msr_equality_preflight(self):
         throttled = load_throttled()
-        config = make_config()
-        state = {'config': config, 'regs': {'AC': {'MSR_PKG_POWER_LIMIT': 0x1234}, 'BATTERY': {}}}
         mapping = mock.Mock()
-        mapping.read64.return_value = 0
+        mapping.read64.return_value = 0x1111
 
-        with mock.patch.object(throttled, 'find_mmio_package_zone', return_value=None):
-            with mock.patch.object(throttled, '_read_host_bridge_identity', return_value=(0x8086, 0x5914)):
-                with mock.patch.object(throttled, '_read_mchbar_dword', side_effect=(0xFED10001, 0)):
-                    with mock.patch.object(throttled, 'MMIO', return_value=mapping) as mmio:
-                        with mock.patch.object(throttled, 'writemsr'):
-                            throttled._power_thread(state, StopAfterWait())
+        with mock.patch.object(throttled, 'read_mchbar_base', return_value=0xFED10000):
+            with mock.patch.object(throttled, 'MMIO', return_value=mapping) as mmio:
+                with mock.patch.object(throttled, 'warning') as warning:
+                    opened = throttled.open_mchbar_power_limit_mmio(expected_msr=0x2222)
 
+        self.assertIsNone(opened)
         mmio.assert_called_once_with(0xFED159A0, 8)
-        mapping.write64.assert_called_once_with(0, 0x1234)
-
-        with mock.patch.object(throttled, 'find_mmio_package_zone', return_value=None):
-            with mock.patch.object(throttled, '_read_host_bridge_identity', return_value=(0x8086, 0xFFFF)):
-                with mock.patch.object(throttled, '_read_mchbar_dword') as read:
-                    with mock.patch.object(throttled, 'MMIO') as mmio:
-                        with mock.patch.object(throttled, 'writemsr') as writemsr:
-                            with mock.patch.object(throttled, 'warning'):
-                                throttled._power_thread(state, StopAfterWait())
-
-        read.assert_not_called()
-        mmio.assert_not_called()
-        writemsr.assert_called_once_with('MSR_PKG_POWER_LIMIT', 0x1234)
-
+        mapping.close.assert_called_once_with()
+        self.assertIn('preflight mismatch', warning.call_args.args[0])
     def test_mchbar_reader_retries_a_complete_pair_after_either_ecam_read_fails(self):
         throttled = load_throttled()
         values = {'48.l': b'fedc0001\n', '4c.l': b'00000001\n'}
@@ -364,81 +349,89 @@ class PR394FixTests(unittest.TestCase):
                 with mock.patch.object(throttled, 'check_output', side_effect=error):
                     self.assertIsNone(throttled._read_mchbar_dword('ecam'))
 
-    def test_invalid_mchbar_never_opens_dev_mem_and_keeps_msr_writes(self):
+    def test_package_power_update_without_safe_mmio_backend_is_fail_closed(self):
         throttled = load_throttled()
-        config = make_config()
-        state = {'config': config, 'regs': {'AC': {'MSR_PKG_POWER_LIMIT': 0x1234}, 'BATTERY': {}}}
-        values = {'48.l': b'fed1f001\n', '4c.l': b'00000000\n'}
 
-        with mock.patch.object(throttled, 'find_mmio_package_zone', return_value=None):
-            with mock.patch.object(throttled, '_read_host_bridge_identity', return_value=(0x8086, 0xA706)):
-                with mock.patch.object(throttled, 'check_output', side_effect=lambda cmd, stderr: values[cmd[-1]]) as check:
-                    with mock.patch.object(throttled, 'MMIO') as mmio:
-                        with mock.patch.object(throttled, 'writemsr') as writemsr:
-                            with mock.patch.object(throttled, 'warning'):
-                                throttled._power_thread(state, StopAfterWait())
+        with mock.patch.object(throttled, 'readmsr', return_value=0x8000):
+            with mock.patch.object(throttled, 'writemsr') as writemsr:
+                with mock.patch.object(throttled, 'warning') as warning:
+                    throttled.apply_package_power_limit(0x8001)
 
-        self.assertEqual(check.call_count, 4)
-        mmio.assert_not_called()
-        writemsr.assert_called_once_with('MSR_PKG_POWER_LIMIT', 0x1234)
-
-    def test_mchbar_mapping_uses_the_clean_base_and_documented_offset(self):
+        writemsr.assert_not_called()
+        self.assertTrue(any('No safe MMIO' in call.args[0] for call in warning.call_args_list))
+    def test_validated_direct_mchbar_and_package_msr_update_together(self):
         throttled = load_throttled()
-        config = make_config()
-        state = {'config': config, 'regs': {'AC': {'MSR_PKG_POWER_LIMIT': 0x1234}, 'BATTERY': {}}}
+        msr_state = {'value': 0x8000}
+        mmio_state = {'value': 0x8000}
         mapping = mock.Mock()
-        mapping.read64.return_value = 0
+        mapping.read64.side_effect = lambda offset: mmio_state['value']
+        mapping.write64.side_effect = lambda offset, value: mmio_state.__setitem__('value', value)
 
-        with mock.patch.object(throttled, 'find_mmio_package_zone', return_value=None):
-            with mock.patch.object(throttled, 'read_mchbar_base', return_value=0xFED10000):
-                with mock.patch.object(throttled, 'MMIO', return_value=mapping) as mmio:
-                    with mock.patch.object(throttled, 'writemsr'):
-                        throttled._power_thread(state, StopAfterWait())
+        def readmsr(name, *args, **kwargs):
+            self.assertEqual(name, 'MSR_PKG_POWER_LIMIT')
+            return msr_state['value']
 
-        mmio.assert_called_once_with(0xFED159A0, 8)
-        mapping.write64.assert_called_once_with(0, 0x1234)
+        def writemsr(name, value, cpu=None):
+            self.assertEqual(cpu, 0)
+            msr_state['value'] = value
 
-    def test_kernel_mmio_failure_falls_back_to_direct_mchbar_in_same_iteration(self):
+        with mock.patch.object(throttled, 'readmsr', side_effect=readmsr):
+            with mock.patch.object(throttled, 'writemsr', side_effect=writemsr) as write:
+                throttled.apply_package_power_limit(0x8001, mchbar_mmio=mapping)
+
+        self.assertEqual(msr_state['value'], 0x8001)
+        self.assertEqual(mmio_state['value'], 0x8001)
+        write.assert_called_once_with('MSR_PKG_POWER_LIMIT', 0x8001, cpu=0)
+    def test_kernel_powercap_failure_rolls_back_instead_of_bypassing_bounds(self):
         throttled = load_throttled()
-        config = make_config()
-        state = {'config': config, 'regs': {'AC': {'MSR_PKG_POWER_LIMIT': 0x1234}, 'BATTERY': {}}}
+        msr_state = {'value': 0x8000}
         powercap = mock.Mock()
-        powercap.path = '/sys/devices/virtual/powercap/intel-rapl-mmio/intel-rapl-mmio:0'
-        powercap.write.side_effect = throttled.PowercapError('read-only')
-        mapping = mock.Mock()
-        mapping.read64.return_value = 0
+        before = {
+            'pl1': {'power_limit_uw': 15000000, 'time_window_us': 28000000},
+            'pl2': {'power_limit_uw': 44000000, 'time_window_us': 2440},
+        }
+        powercap.snapshot.return_value = before
+        powercap.write.side_effect = throttled.PowercapError('above kernel maximum')
 
-        with mock.patch.object(throttled, 'find_mmio_package_zone', return_value=powercap):
-            with mock.patch.object(throttled, 'read_mchbar_base', return_value=0xFED10000):
-                with mock.patch.object(throttled, 'MMIO', return_value=mapping) as mmio:
-                    with mock.patch.object(throttled, 'writemsr'):
-                        with mock.patch.object(throttled, 'warning') as warning:
-                            throttled._power_thread(state, StopAfterWait())
+        def readmsr(name, *args, **kwargs):
+            if name == 'MSR_PKG_POWER_LIMIT':
+                return msr_state['value']
+            raise AssertionError(name)
 
-        powercap.write.assert_called_once()
-        mmio.assert_called_once_with(0xFED159A0, 8)
-        mapping.write64.assert_called_once_with(0, 0x1234)
-        self.assertIn('falling back', warning.call_args_list[0].args[0])
+        def writemsr(name, value, cpu=None):
+            msr_state['value'] = value
 
-    def test_mchbar_write_error_disables_only_the_mmio_path(self):
+        with mock.patch.object(throttled, 'readmsr', side_effect=readmsr):
+            with mock.patch.object(throttled, 'writemsr', side_effect=writemsr) as write:
+                with mock.patch.object(throttled, 'get_power_unit', return_value=0.125):
+                    with mock.patch.object(throttled, 'get_time_unit', return_value=1 / 1024):
+                        with mock.patch.object(throttled, 'warning'):
+                            throttled.apply_package_power_limit(0x8001, mmio_powercap=powercap)
+
+        self.assertEqual(msr_state['value'], 0x8000)
+        self.assertEqual(write.call_args_list[-1], mock.call('MSR_PKG_POWER_LIMIT', 0x8000, cpu=0))
+        powercap.restore.assert_called_once_with(before)
+    def test_direct_mchbar_failure_rolls_package_msr_back(self):
         throttled = load_throttled()
-        config = make_config()
-        state = {'config': config, 'regs': {'AC': {'MSR_PKG_POWER_LIMIT': 0x1234}, 'BATTERY': {}}}
+        msr_state = {'value': 0x8000}
         mapping = mock.Mock()
-        mapping.read64.return_value = 0
+        mapping.read64.return_value = 0x8000
         mapping.write64.side_effect = throttled.MMIOError('blocked')
 
-        with mock.patch.object(throttled, 'find_mmio_package_zone', return_value=None):
-            with mock.patch.object(throttled, 'read_mchbar_base', return_value=0xFED10000):
-                with mock.patch.object(throttled, 'MMIO', return_value=mapping):
-                    with mock.patch.object(throttled, 'writemsr') as writemsr:
-                        with mock.patch.object(throttled, 'warning') as warning:
-                            throttled._power_thread(state, StopAfterWait())
+        def readmsr(name, *args, **kwargs):
+            return msr_state['value']
 
-        writemsr.assert_called_once_with('MSR_PKG_POWER_LIMIT', 0x1234)
-        mapping.write64.assert_called_once_with(0, 0x1234)
-        self.assertIn('disabling only MMIO writes', warning.call_args.args[0])
+        def writemsr(name, value, cpu=None):
+            msr_state['value'] = value
 
+        with mock.patch.object(throttled, 'readmsr', side_effect=readmsr):
+            with mock.patch.object(throttled, 'writemsr', side_effect=writemsr) as write:
+                with mock.patch.object(throttled, 'warning') as warning:
+                    throttled.apply_package_power_limit(0x8001, mchbar_mmio=mapping)
+
+        self.assertEqual(msr_state['value'], 0x8000)
+        self.assertEqual(write.call_args_list[-1], mock.call('MSR_PKG_POWER_LIMIT', 0x8000, cpu=0))
+        self.assertTrue(any('Package power update failed' in call.args[0] for call in warning.call_args_list))
     def test_power_thread_autoreload_updates_shared_state_for_dbus_callbacks(self):
         throttled = load_throttled()
         old_config = make_config(autoreload=True)
@@ -456,18 +449,20 @@ class PR394FixTests(unittest.TestCase):
         self.assertIs(state['config'], new_config)
         self.assertIs(state['regs'], new_regs)
 
-    def test_sleep_callback_reads_current_config_from_state(self):
+    def test_sleep_callback_reads_current_config_and_regs_from_state(self):
         throttled = load_throttled()
         updated_config = make_config()
-        state = {'config': updated_config}
-        calls = []
+        updated_regs = {'AC': {}, 'BATTERY': {}}
+        state = {'config': updated_config, 'regs': updated_regs}
 
-        with mock.patch.object(throttled, 'undervolt', lambda config: calls.append(('undervolt', config))):
-            with mock.patch.object(throttled, 'set_icc_max', lambda config: calls.append(('iccmax', config))):
+        with mock.patch.object(throttled, 'find_mmio_package_zone', return_value=None):
+            with mock.patch.object(throttled, 'apply_runtime_profile') as apply:
                 throttled.handle_sleep_prepare(False, state)
 
-        self.assertEqual(calls, [('undervolt', updated_config), ('iccmax', updated_config)])
-
+        apply.assert_called_once()
+        self.assertEqual(apply.call_args.args[:3], (updated_config, updated_regs, 'AC'))
+        self.assertTrue(apply.call_args.kwargs['apply_mailbox'])
+        self.assertTrue(apply.call_args.kwargs['apply_hwp'])
 
 if __name__ == '__main__':
     unittest.main()
