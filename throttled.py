@@ -1117,10 +1117,15 @@ def calc_reg_values(platform_info, config):
         PL1_Duration_s = config.getfloat(power_source, 'PL1_Duration_s', fallback=None)
         PL2_Tdp_W = config.getfloat(power_source, 'PL2_Tdp_W', fallback=None)
         PL2_Duration_s = config.getfloat(power_source, 'PL2_Duration_s', fallback=None)
+        numeric_tpl_values = (PL1_Tdp_W, PL1_Duration_s, PL2_Tdp_W, PL2_Duration_s)
+        numeric_tpl_configured = any(value is not None for value in numeric_tpl_values)
+        tpl_boolean_options = ('PL1_Enable', 'PL1_Clamp', 'PL2_Enable', 'PL2_Clamp')
+        boolean_tpl_configured = any(config.has_option(power_source, option) for option in tpl_boolean_options)
 
-        if (PL1_Tdp_W, PL1_Duration_s, PL2_Tdp_W, PL2_Duration_s).count(None) < 4:
-            power_unit = get_power_unit()
+        if numeric_tpl_configured or boolean_tpl_configured:
             cur_pkg_power_limits = get_cur_pkg_power_limits()
+            power_unit = get_power_unit() if PL1_Tdp_W is not None or PL2_Tdp_W is not None else None
+
             if PL1_Tdp_W is None:
                 PL1 = cur_pkg_power_limits['PL1']
                 log(f'[I] {power_source:s} PL1_Tdp_W disabled in config.')
@@ -1147,6 +1152,16 @@ def calc_reg_values(platform_info, config):
                 Y, Z = calc_time_window_vars(PL2_Duration_s)
                 TW2 = Y | (Z << 5)
 
+            # Preserve upstream behavior for existing configs that specify numeric
+            # TPL values but not the new boolean knobs. For a boolean-only edit,
+            # unspecified flags inherit the live hardware state instead.
+            boolean_defaults = {
+                'PL1_Enable': True if numeric_tpl_configured else cur_pkg_power_limits['PL1_ENABLED'],
+                'PL1_Clamp': True if numeric_tpl_configured else cur_pkg_power_limits['PL1_CLAMP'],
+                'PL2_Enable': True if numeric_tpl_configured else cur_pkg_power_limits['PL2_ENABLED'],
+                'PL2_Clamp': False if numeric_tpl_configured else cur_pkg_power_limits['PL2_CLAMP'],
+            }
+
             if cur_pkg_power_limits.get('LOCKED', False):
                 warning(
                     f'MSR_PKG_POWER_LIMIT is locked; package power-limit writes for [{power_source:s}] are disabled.'
@@ -1159,10 +1174,18 @@ def calc_reg_values(platform_info, config):
                         PL2,
                         TW2,
                         base_value=cur_pkg_power_limits.get('RAW', 0),
-                        pl1_enabled=config.getboolean(power_source, 'PL1_Enable', fallback=True),
-                        pl1_clamp=config.getboolean(power_source, 'PL1_Clamp', fallback=True),
-                        pl2_enabled=config.getboolean(power_source, 'PL2_Enable', fallback=True),
-                        pl2_clamp=config.getboolean(power_source, 'PL2_Clamp', fallback=False),
+                        pl1_enabled=config.getboolean(
+                            power_source, 'PL1_Enable', fallback=boolean_defaults['PL1_Enable']
+                        ),
+                        pl1_clamp=config.getboolean(
+                            power_source, 'PL1_Clamp', fallback=boolean_defaults['PL1_Clamp']
+                        ),
+                        pl2_enabled=config.getboolean(
+                            power_source, 'PL2_Enable', fallback=boolean_defaults['PL2_Enable']
+                        ),
+                        pl2_clamp=config.getboolean(
+                            power_source, 'PL2_Clamp', fallback=boolean_defaults['PL2_Clamp']
+                        ),
                     )
                 except ValueError as e:
                     fatal(f'Invalid package power limits in [{power_source:s}]: {e}')
@@ -1228,11 +1251,11 @@ def _hwp_epp(config, source=None):
     if source not in POWER_PROFILES:
         return None
 
-    epp = config.getint(source, 'HWP_EPP', fallback=None)
+    epp = config.getint(source, 'HWP_EPP', fallback=None) if source in config else None
     if epp is not None:
         return epp
 
-    legacy = config.getboolean('AC', 'HWP_Mode', fallback=None)
+    legacy = config.getboolean('AC', 'HWP_Mode', fallback=None) if 'AC' in config else None
     if legacy is None:
         return None
     return HWP_PERFORMANCE_VALUE if legacy and source == 'AC' else HWP_DEFAULT_VALUE
@@ -1240,7 +1263,7 @@ def _hwp_epp(config, source=None):
 
 def _turbo_setting(config, source=None):
     source = source or power.get('source')
-    if source not in POWER_PROFILES:
+    if source not in POWER_PROFILES or source not in config:
         return None
     disable = config.getboolean(source, 'Disable_Turbo', fallback=None)
     return None if disable is None else not disable
@@ -1262,7 +1285,7 @@ def _bdprochot_setting(config, source=None):
     leave the current hardware state untouched.
     """
     source = source or power.get('source')
-    if source not in POWER_PROFILES:
+    if source not in POWER_PROFILES or source not in config:
         return None
 
     explicit = config.getboolean(source, 'BDPROCHOT_Enabled', fallback=None)
