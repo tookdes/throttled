@@ -21,6 +21,15 @@ from time import monotonic, sleep, time
 
 from mmio import MMIO, MMIOError
 from throttled_powercap import PowercapError, find_mmio_package_zone
+from throttled_mchbar import (
+    MCHBAR_ADDRESS_MASKS_BY_PCI_DEVICE,
+    MCHBAR_ENABLE_BIT,
+    MCHBAR_PACKAGE_POWER_LIMIT_OFFSET,
+    MCHBAR_PACKAGE_POWER_LIMIT_SIZE,
+    MCHBAR_ADDRESS_MASK_39_15,
+    MCHBAR_ADDRESS_MASK_39_17,
+    MCHBAR_ADDRESS_MASK_42_17,
+)
 from throttled_version import __version__
 
 DEFAULT_SYSFS_POWER_PATH = '/sys/class/power_supply/AC*/online'
@@ -79,215 +88,7 @@ OC_MAILBOX_STATUS_SHIFT = 32
 OC_MAILBOX_STATUS_MASK = 0xFF
 OC_MAILBOX_TIMEOUT_S = 0.05
 OC_MAILBOX_POLL_S = 0.00001
-MCHBAR_ENABLE_BIT = 1
-MCHBAR_PACKAGE_POWER_LIMIT_OFFSET = 0x59A0
-MCHBAR_PACKAGE_POWER_LIMIT_SIZE = 8
-PCI_HOST_BRIDGE_SYSFS_PATH = '/sys/bus/pci/devices/0000:00:00.0'
-PCI_VENDOR_ID_INTEL = 0x8086
-# The masked address bits also encode the per-generation window alignment, so
-# rejecting any bit outside the mask fully validates the BAR before /dev/mem
-# is ever opened.
-MCHBAR_ADDRESS_MASK_39_15 = ((1 << 39) - 1) & ~((1 << 15) - 1)
-MCHBAR_ADDRESS_MASK_39_17 = ((1 << 39) - 1) & ~((1 << 17) - 1)
-MCHBAR_ADDRESS_MASK_42_17 = ((1 << 42) - 1) & ~((1 << 17) - 1)
 
-
-platform_info_bits = {
-    'maximum_non_turbo_ratio': [8, 15],
-    'maximum_efficiency_ratio': [40, 47],
-    'minimum_operating_ratio': [48, 55],
-    'feature_ppin_cap': [23, 23],
-    'feature_programmable_turbo_ratio': [28, 28],
-    'feature_programmable_tdp_limit': [29, 29],
-    'number_of_additional_tdp_profiles': [33, 34],
-    'feature_programmable_temperature_target': [30, 30],
-    'feature_low_power_mode': [32, 32],
-}
-
-thermal_status_bits = {
-    'thermal_limit_status': [0, 0],
-    'thermal_limit_log': [1, 1],
-    'prochot_or_forcepr_status': [2, 2],
-    'prochot_or_forcepr_log': [3, 3],
-    'crit_temp_status': [4, 4],
-    'crit_temp_log': [5, 5],
-    'thermal_threshold1_status': [6, 6],
-    'thermal_threshold1_log': [7, 7],
-    'thermal_threshold2_status': [8, 8],
-    'thermal_threshold2_log': [9, 9],
-    'power_limit_status': [10, 10],
-    'power_limit_log': [11, 11],
-    'current_limit_status': [12, 12],
-    'current_limit_log': [13, 13],
-    'cross_domain_limit_status': [14, 14],
-    'cross_domain_limit_log': [15, 15],
-    'cpu_temp': [16, 22],
-    'temp_resolution': [27, 30],
-    'reading_valid': [31, 31],
-}
-
-supported_cpus = {
-    (6, 26, 1): 'Nehalem',
-    (6, 26, 2): 'Nehalem-EP',
-    (6, 26, 4): 'Bloomfield',
-    (6, 28, 2): 'Silverthorne',
-    (6, 28, 10): 'PineView',
-    (6, 29, 0): 'Dunnington-6C',
-    (6, 29, 1): 'Dunnington',
-    (6, 30, 0): 'Lynnfield',
-    (6, 30, 5): 'Lynnfield_CPUID',
-    (6, 31, 1): 'Auburndale',
-    (6, 37, 2): 'Clarkdale',
-    (6, 37, 5): 'Arrandale',
-    (6, 38, 1): 'TunnelCreek',
-    (6, 39, 2): 'Medfield',
-    (6, 42, 2): 'SandyBridge',
-    (6, 42, 6): 'SandyBridge',
-    (6, 42, 7): 'Sandy Bridge-DT',
-    (6, 44, 1): 'Westmere-EP',
-    (6, 44, 2): 'Gulftown',
-    (6, 45, 5): 'Sandy Bridge-EP',
-    (6, 45, 6): 'Sandy Bridge-E',
-    (6, 46, 4): 'Beckton',
-    (6, 46, 5): 'Beckton',
-    (6, 46, 6): 'Beckton',
-    (6, 47, 2): 'Eagleton',
-    (6, 53, 1): 'Cloverview',
-    (6, 54, 1): 'Cedarview-D',
-    (6, 54, 9): 'Centerton',
-    (6, 55, 3): 'Bay Trail-D',
-    (6, 55, 8): 'Silvermont',
-    (6, 58, 9): 'Ivy Bridge-DT',
-    (6, 60, 3): 'Haswell-DT',
-    (6, 61, 4): 'Broadwell-U',
-    (6, 62, 3): 'IvyBridgeEP',
-    (6, 62, 4): 'Ivy Bridge-E',
-    (6, 63, 2): 'Haswell-EP',
-    (6, 69, 1): 'HaswellULT',
-    (6, 70, 1): 'Crystal Well-DT',
-    (6, 71, 1): 'Broadwell-H',
-    (6, 76, 3): 'Braswell',
-    (6, 77, 8): 'Avoton',
-    (6, 78, 3): 'Skylake',
-    (6, 79, 1): 'BroadwellE',
-    (6, 85, 4): 'SkylakeXeon',
-    (6, 85, 6): 'CascadeLakeSP',
-    (6, 85, 7): 'CascadeLakeXeon2',
-    (6, 86, 2): 'BroadwellDE',
-    (6, 86, 4): 'BroadwellDE',
-    (6, 87, 0): 'KnightsLanding',
-    (6, 87, 1): 'KnightsLanding',
-    (6, 90, 0): 'Moorefield',
-    (6, 92, 9): 'Apollo Lake',
-    (6, 93, 1): 'SoFIA',
-    (6, 94, 0): 'Skylake',
-    (6, 94, 3): 'Skylake-S',
-    (6, 95, 1): 'Denverton',
-    (6, 102, 3): 'Cannon Lake-U',
-    (6, 117, 10): 'Spreadtrum',
-    (6, 122, 1): 'Gemini Lake-D',
-    (6, 122, 8): 'GoldmontPlus',
-    (6, 126, 5): 'IceLakeY',
-    (6, 138, 1): 'Lakefield',
-    (6, 140, 1): 'TigerLake-U',
-    (6, 140, 2): 'TigerLake-U',
-    (6, 141, 1): 'TigerLake-H',
-    (6, 142, 9): 'KabyLake',
-    (6, 142, 10): 'KabyLake',
-    (6, 142, 11): 'WhiskeyLake',
-    (6, 142, 12): 'WhiskeyLake',
-    (6, 151, 2): 'AlderLake-S/HX',
-    (6, 151, 5): 'AlderLake-S',
-    (6, 154, 3): 'AlderLake-P/H',
-    (6, 154, 4): 'AlderLake-U',
-    (6, 156, 0): 'JasperLake',
-    (6, 158, 9): 'KabyLakeG',
-    (6, 158, 10): 'CoffeeLake',
-    (6, 158, 11): 'CoffeeLake',
-    (6, 158, 12): 'CoffeeLake',
-    (6, 158, 13): 'CoffeeLake',
-    (6, 165, 2): 'CometLake',
-    (6, 165, 3): 'CometLake-S',
-    (6, 165, 4): 'CometLake',
-    (6, 165, 5): 'CometLake-S',
-    (6, 166, 0): 'CometLake',
-    (6, 166, 1): 'CometLake-U',
-    (6, 167, 1): 'RocketLake',
-    (6, 170, 4): 'MeteorLake',
-    (6, 181, 0): 'ArrowLake-U',
-    (6, 183, 1): 'RaptorLake-HX',
-    (6, 186, 2): 'RaptorLake',
-    (6, 186, 3): 'RaptorLake-U',
-    (6, 189, 1): 'LunarLake',
-    (6, 190, 0): 'AlderLake-N',
-    (6, 191, 2): 'RaptorLake-HX/S',
-    (6, 191, 5): 'RaptorLake-S',
-    (6, 197, 2): 'ArrowLake-H',
-    (6, 198, 2): 'ArrowLake-HX',
-    (6, 204, 2): 'PantherLake',
-    (6, 204, 3): 'PantherLake',
-}
-
-FIXED_DRAM_ENERGY_UNIT_MODELS = {63, 79, 85, 86, 87}
-
-# MCHBAR belongs to the PCI host bridge, not to a CPUID signature. This is a
-# deliberately narrow allowlist: an unlisted device remains MSR-only.
-#
-# TGL/ADL/RPL/Core Ultra datasheets document PACKAGE_RAPL_LIMIT_0_0_0_MCHBAR_PCU
-# at MCHBAR + 0x59a0 (Intel docs 631122, 767625/767626, 764981/767624, 795258,
-# 819323, 844345). For older 32 KiB layouts, coreboot independently defines
-# MCH_PKG_POWER_LIMIT_LO at +0x59a0. Its inteltool also identifies Whiskey
-# Lake-U 0x3e34/0x3e35 and masks their MCHBAR to address bits 38:15. Groups for
-# newer platforms follow Linux igen6/ie31200 EDAC where applicable.
-MCHBAR_ADDRESS_MASKS_BY_PCI_DEVICE = {
-    # Kaby Lake-U/R and Coffee/Whiskey Lake target systems.
-    # coreboot inteltool groups 8th-gen U/Whiskey Lake with a 32 KiB MCHBAR
-    # at address bits 38:15; coreboot Cannon Lake/Whiskey Lake systemagent
-    # defines MCH_PKG_POWER_LIMIT at MCHBAR + 0x59a0.
-    0x5914: MCHBAR_ADDRESS_MASK_39_15,
-    0x3E34: MCHBAR_ADDRESS_MASK_39_15,  # Whiskey Lake-U 4-core
-    0x3E35: MCHBAR_ADDRESS_MASK_39_15,  # Whiskey Lake-U 2-core
-    0x3EC4: MCHBAR_ADDRESS_MASK_39_15,
-    # Comet Lake-H (Intel doc 615212; coreboot PCI_DID_INTEL_CML_H).
-    0x9B54: MCHBAR_ADDRESS_MASK_39_15,
-    # Comet Lake-U (Intel doc 615229; coreboot PCI_DID_INTEL_CML_U).
-    0x9B61: MCHBAR_ADDRESS_MASK_39_15,
-    # Tiger Lake (Linux igen6 tgl_cfg).
-    0x9A14: MCHBAR_ADDRESS_MASK_39_17,
-    # Alder Lake (Linux igen6 adl_cfg).
-    0x4601: MCHBAR_ADDRESS_MASK_42_17,
-    0x4602: MCHBAR_ADDRESS_MASK_42_17,
-    0x4621: MCHBAR_ADDRESS_MASK_42_17,
-    0x4641: MCHBAR_ADDRESS_MASK_42_17,
-    # Alder/Raptor Lake S/HX (Linux ie31200 rpl_s_cfg).
-    0x4660: MCHBAR_ADDRESS_MASK_42_17,
-    0x4668: MCHBAR_ADDRESS_MASK_42_17,
-    0x4648: MCHBAR_ADDRESS_MASK_42_17,
-    0xA703: MCHBAR_ADDRESS_MASK_42_17,
-    0x4640: MCHBAR_ADDRESS_MASK_42_17,
-    0x4630: MCHBAR_ADDRESS_MASK_42_17,
-    0xA700: MCHBAR_ADDRESS_MASK_42_17,
-    0xA740: MCHBAR_ADDRESS_MASK_42_17,
-    0xA704: MCHBAR_ADDRESS_MASK_42_17,
-    0xA702: MCHBAR_ADDRESS_MASK_42_17,
-    # Raptor Lake-P (Linux igen6 rpl_p_cfg).
-    0xA706: MCHBAR_ADDRESS_MASK_42_17,
-    0xA707: MCHBAR_ADDRESS_MASK_42_17,
-    0xA708: MCHBAR_ADDRESS_MASK_42_17,
-    0xA716: MCHBAR_ADDRESS_MASK_42_17,
-    0xA718: MCHBAR_ADDRESS_MASK_42_17,
-    # Meteor Lake and Arrow Lake-U/H (Linux igen6 mtl_ps/mtl_p_cfg).
-    0x7D21: MCHBAR_ADDRESS_MASK_42_17,
-    0x7D22: MCHBAR_ADDRESS_MASK_42_17,
-    0x7D23: MCHBAR_ADDRESS_MASK_42_17,
-    0x7D24: MCHBAR_ADDRESS_MASK_42_17,
-    0x7D01: MCHBAR_ADDRESS_MASK_42_17,
-    0x7D02: MCHBAR_ADDRESS_MASK_42_17,
-    0x7D14: MCHBAR_ADDRESS_MASK_42_17,
-    0x7D06: MCHBAR_ADDRESS_MASK_42_17,
-    0x7D20: MCHBAR_ADDRESS_MASK_42_17,
-    0x7D30: MCHBAR_ADDRESS_MASK_42_17,
-}
 
 TESTMSR = False
 UNSUPPORTED_FEATURES = []
