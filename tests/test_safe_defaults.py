@@ -13,26 +13,11 @@ class SafeDefaultConfigTests(unittest.TestCase):
 
         self.assertFalse(config.getboolean("GENERAL", "Enabled"))
 
-        write_options = {
-            "PL1_Tdp_W",
-            "PL1_Duration_s",
-            "PL1_Enable",
-            "PL1_Clamp",
-            "PL2_Tdp_W",
-            "PL2_Duration_s",
-            "PL2_Enable",
-            "PL2_Clamp",
-            "Trip_Temp_C",
-            "cTDP",
-            "HWP_EPP",
-            "HWP_Mode",
-            "Disable_Turbo",
-            "BDPROCHOT_Enabled",
-            "Disable_BDPROCHOT",
-        }
         for profile in ("AC", "BATTERY"):
             self.assertIn(profile, config)
-            self.assertTrue(write_options.isdisjoint(config[profile]))
+            # The shipped profile is intentionally inert: only polling cadence
+            # may be active before the operator explicitly opts into controls.
+            self.assertEqual(set(config[profile]), {"update_rate_s"})
 
         self.assertNotIn("UNDERVOLT.AC", config)
         self.assertNotIn("UNDERVOLT.BATTERY", config)
