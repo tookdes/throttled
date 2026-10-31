@@ -16,6 +16,7 @@ the daemon's existing validated PCI allow-list.
 """
 
 import argparse
+import json
 import math
 import os
 import subprocess
@@ -64,6 +65,8 @@ OC_MAILBOX_STATUS_SHIFT = 32
 OC_MAILBOX_STATUS_MASK = 0xFF
 OC_MAILBOX_TIMEOUT_S = 0.01
 OC_MAILBOX_POLL_S = 0.00001
+OC_BACKUP_DIR = Path("/var/lib/throttled/oc-backups")
+OC_BACKUP_SCHEMA_VERSION = 1
 
 PKG_PL1_POWER_MASK = 0x7FFF
 PKG_PL1_ENABLE_BIT = 15
@@ -419,6 +422,67 @@ def validate_target(force=False):
     return cpu, dmi
 
 
+def _current_machine_identity():
+    cpu = read_cpuinfo()
+    dmi = read_dmi()
+    return {
+        "target": TARGET_DMI_PRODUCT,
+        "dmi_product": dmi.get("product"),
+        "cpu": {
+            "vendor_id": cpu["vendor_id"],
+            "family": cpu["family"],
+            "model": cpu["model"],
+            "stepping": cpu["stepping"],
+        },
+    }
+
+
+def write_oc_recovery(kind, values):
+    """Persist pre-write OC mailbox state before any voltage/current change."""
+    identity = _current_machine_identity()
+    record = {
+        "schema_version": OC_BACKUP_SCHEMA_VERSION,
+        **identity,
+        "kind": kind,
+        "values": {name: int(value) for name, value in values.items()},
+    }
+    try:
+        OC_BACKUP_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(OC_BACKUP_DIR, 0o700)
+        path = OC_BACKUP_DIR / f"{kind}-{time.time_ns()}.json"
+        with path.open("x", encoding="utf-8") as handle:
+            json.dump(record, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        os.chmod(path, 0o600)
+    except OSError as exc:
+        raise ControlError(
+            f"refusing {kind} write because recovery backup could not be created: {exc}"
+        ) from exc
+    return path
+
+
+def load_oc_recovery(path, kind):
+    try:
+        record = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ControlError(f"unable to read OC recovery file {path!r}: {exc}") from exc
+    if not isinstance(record, dict) or record.get("schema_version") != OC_BACKUP_SCHEMA_VERSION:
+        raise ControlError("unsupported or malformed OC recovery file")
+    if record.get("kind") != kind:
+        raise ControlError(f"OC recovery kind {record.get('kind')!r} does not match {kind!r}")
+
+    current = _current_machine_identity()
+    if record.get("target") != TARGET_DMI_PRODUCT or record.get("dmi_product") != current["dmi_product"]:
+        raise ControlError("OC recovery file DMI target does not match this machine")
+    if record.get("cpu") != current["cpu"]:
+        raise ControlError("OC recovery file CPU identity does not match this machine")
+
+    values = record.get("values")
+    if not isinstance(values, dict):
+        raise ControlError("OC recovery file values are missing")
+    return values
+
+
 def daemon_is_active():
     try:
         result = subprocess.run(
@@ -762,6 +826,8 @@ def command_fivr_set(args, msr):
         raise ControlError("fivr set requires at least one voltage plane")
 
     original = {plane: read_mailbox_fivr_ticks(msr, plane) for plane in FIVR_PLANES}
+    backup_path = write_oc_recovery("fivr", original)
+    print(f"OC recovery backup written before voltage changes: {backup_path}")
     desired = dict(original)
     desired.update({plane: fivr_mv_to_ticks(mv) for plane, mv in requested.items()})
     if not args.allow_core_cache_mismatch and desired["core"] != desired["cache"]:
@@ -814,6 +880,8 @@ def command_iccmax_set(args, msr):
         raise ControlError("iccmax set requires at least one current plane")
 
     original = {plane: read_mailbox_iccmax_field(msr, plane) for plane in ICCMAX_PLANES}
+    backup_path = write_oc_recovery("iccmax", original)
+    print(f"OC recovery backup written before current-limit changes: {backup_path}")
     desired = {plane: iccmax_to_field(value) for plane, value in requested.items()}
     changed = []
     try:
@@ -840,6 +908,82 @@ def command_iccmax_set(args, msr):
 
     for plane, field in desired.items():
         print(f"{plane:8s} {field / ICCMAX_STEPS_PER_A:9.2f} A")
+    return 0
+
+
+def command_fivr_restore(args, msr):
+    validate_write_environment(args)
+    values = load_oc_recovery(args.path, "fivr")
+    if set(values) != set(FIVR_PLANES):
+        raise ControlError("FIVR recovery file does not contain exactly all voltage planes")
+    desired = {}
+    for plane in FIVR_PLANES:
+        value = values[plane]
+        if not isinstance(value, int) or not FIVR_MIN_TICKS <= value <= FIVR_MAX_TICKS:
+            raise ControlError(f"invalid recovery FIVR ticks for {plane}: {value!r}")
+        desired[plane] = value
+
+    current = {plane: read_mailbox_fivr_ticks(msr, plane) for plane in FIVR_PLANES}
+    changed = []
+    try:
+        for plane, ticks in desired.items():
+            if current[plane] == ticks:
+                continue
+            write_mailbox(msr, encode_fivr_write_ticks(plane, ticks))
+            changed.append(plane)
+            if read_mailbox_fivr_ticks(msr, plane) != ticks:
+                raise ControlError(f"FIVR recovery verify failed for {plane}")
+    except (ProbeError, ControlError) as exc:
+        rollback_errors = []
+        for plane in reversed(changed):
+            try:
+                write_mailbox(msr, encode_fivr_write_ticks(plane, current[plane]))
+                if read_mailbox_fivr_ticks(msr, plane) != current[plane]:
+                    rollback_errors.append(f"{plane}: verify mismatch")
+            except (ProbeError, ControlError) as rollback_exc:
+                rollback_errors.append(f"{plane}: {rollback_exc}")
+        suffix = f"; rollback issues: {'; '.join(rollback_errors)}" if rollback_errors else "; rollback attempted"
+        raise ControlError(f"FIVR recovery failed: {exc}{suffix}") from exc
+
+    print(f"FIVR recovery applied and verified from {args.path}.")
+    return 0
+
+
+def command_iccmax_restore(args, msr):
+    validate_write_environment(args)
+    values = load_oc_recovery(args.path, "iccmax")
+    if set(values) != set(ICCMAX_PLANES):
+        raise ControlError("IccMax recovery file does not contain exactly all current planes")
+    desired = {}
+    for plane in ICCMAX_PLANES:
+        value = values[plane]
+        if not isinstance(value, int) or not 0 <= value <= ICCMAX_MAX_FIELD:
+            raise ControlError(f"invalid recovery IccMax field for {plane}: {value!r}")
+        desired[plane] = value
+
+    current = {plane: read_mailbox_iccmax_field(msr, plane) for plane in ICCMAX_PLANES}
+    changed = []
+    try:
+        for plane, field in desired.items():
+            if current[plane] == field:
+                continue
+            write_mailbox(msr, encode_iccmax_write_field(plane, field))
+            changed.append(plane)
+            if read_mailbox_iccmax_field(msr, plane) != field:
+                raise ControlError(f"IccMax recovery verify failed for {plane}")
+    except (ProbeError, ControlError) as exc:
+        rollback_errors = []
+        for plane in reversed(changed):
+            try:
+                write_mailbox(msr, encode_iccmax_write_field(plane, current[plane]))
+                if read_mailbox_iccmax_field(msr, plane) != current[plane]:
+                    rollback_errors.append(f"{plane}: verify mismatch")
+            except (ProbeError, ControlError) as rollback_exc:
+                rollback_errors.append(f"{plane}: {rollback_exc}")
+        suffix = f"; rollback issues: {'; '.join(rollback_errors)}" if rollback_errors else "; rollback attempted"
+        raise ControlError(f"IccMax recovery failed: {exc}{suffix}") from exc
+
+    print(f"IccMax recovery applied and verified from {args.path}.")
     return 0
 
 
@@ -1008,6 +1152,9 @@ def build_parser():
     fivr_sub = fivr.add_subparsers(dest="fivr_command", required=True)
     fivr_read = fivr_sub.add_parser("read", help="query voltage offsets; this issues an OC-mailbox WRMSR")
     fivr_read.set_defaults(handler=command_fivr_read)
+    fivr_restore = fivr_sub.add_parser("restore", help="restore all voltage planes from an automatic recovery JSON")
+    fivr_restore.add_argument("path", metavar="PATH")
+    fivr_restore.set_defaults(handler=command_fivr_restore)
     fivr_set = fivr_sub.add_parser("set", help="set and verify voltage offsets")
     for plane in FIVR_PLANES:
         fivr_set.add_argument(f"--{plane}", type=parse_undervolt_mv, metavar="MV")
@@ -1022,6 +1169,9 @@ def build_parser():
     icc_sub = iccmax.add_subparsers(dest="icc_command", required=True)
     icc_read = icc_sub.add_parser("read", help="query IccMax; this issues an OC-mailbox WRMSR")
     icc_read.set_defaults(handler=command_iccmax_read)
+    icc_restore = icc_sub.add_parser("restore", help="restore all IccMax planes from an automatic recovery JSON")
+    icc_restore.add_argument("path", metavar="PATH")
+    icc_restore.set_defaults(handler=command_iccmax_restore)
     icc_set = icc_sub.add_parser("set", help="set and verify IccMax")
     for plane in ICCMAX_PLANES:
         icc_set.add_argument(f"--{plane}", type=parse_iccmax, metavar="AMPS")
