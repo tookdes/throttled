@@ -77,16 +77,18 @@ class ControlEncodingTests(unittest.TestCase):
                 pl1=15,
             )
 
-    def test_time_window_selects_nearest_encoding(self):
+    def test_time_window_never_shortens_requested_tau(self):
         field, represented = ctl.encode_time_window(28.0, 1 / 1024)
         self.assertGreaterEqual(field, 0)
         self.assertLessEqual(field, 0x7F)
-        candidates = [
+        candidates = sorted(
             (2**y) * (1.0 + z / 4.0) / 1024
             for y in range(32)
             for z in range(4)
-        ]
-        self.assertAlmostEqual(abs(represented - 28.0), min(abs(value - 28.0) for value in candidates))
+            if (2**y) * (1.0 + z / 4.0) / 1024 >= 28.0
+        )
+        self.assertGreaterEqual(represented, 28.0)
+        self.assertAlmostEqual(represented, candidates[0])
 
 
     def test_speedstep_and_clock_modulation_preserve_unrelated_bits(self):
@@ -231,7 +233,36 @@ class TransactionTests(unittest.TestCase):
         self.assertEqual(msr.values[(0, "A")], 1)
 
 
+class LegacyControlGuardTests(unittest.TestCase):
+    def _args(self):
+        return type("Args", (), {"force_target": False, "allow_daemon_race": False, "state": True, "ratio": 38, "force_ratio": False})()
+
+    def test_speedstep_rejects_hwp_enabled(self):
+        msr = FakeMsr({
+            (0, "IA32_PM_ENABLE"): 1,
+            (0, "IA32_MISC_ENABLE"): 0,
+        })
+        with mock.patch.object(ctl, "validate_write_environment"):
+            with self.assertRaises(ctl.ControlError):
+                ctl.command_speedstep(self._args(), msr)
+
+    def test_multiplier_rejects_hwp_enabled(self):
+        msr = FakeMsr({
+            (0, "IA32_PM_ENABLE"): 1,
+            (0, "MSR_PLATFORM_INFO"): 0,
+            (0, "MSR_TURBO_RATIO_LIMIT"): 0,
+            (0, "IA32_PERF_CTL"): 0,
+        })
+        with mock.patch.object(ctl, "validate_write_environment"):
+            with self.assertRaises(ctl.ControlError):
+                ctl.command_multiplier(self._args(), msr)
+
+
 class ParserTests(unittest.TestCase):
+    def test_help_formats_literal_c0_percent(self):
+        help_text = ctl.build_parser().format_help()
+        self.assertIn("C0%/temperature", help_text)
+
     def test_epp_range(self):
         parser = ctl.build_parser()
         self.assertEqual(parser.parse_args(["epp", "0"]).value, 0)
