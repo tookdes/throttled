@@ -1612,7 +1612,7 @@ def check_kernel():
         log('[W] Unable to obtain and validate kernel config.')
         return
     elif not re.search('CONFIG_DEVMEM=y', kernel_config):
-        warning('Bad kernel config: you need CONFIG_DEVMEM=y.')
+        warning('CONFIG_DEVMEM is unavailable; direct /dev/mem MCHBAR fallback will be disabled.')
     if not re.search('CONFIG_X86_MSR=(y|m)', kernel_config):
         fatal('Bad kernel config: you need CONFIG_X86_MSR builtin or as module.')
 
