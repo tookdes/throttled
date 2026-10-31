@@ -1438,7 +1438,6 @@ def set_bdprochot(enabled):
     for addr in _ensure_msr_module():
         cpu = int(os.path.basename(os.path.dirname(addr)))
         cur_val = readmsr('MSR_POWER_CTL', cpu=cpu)
-        current_enabled = bool(cur_val & mask)
         readback = write_msr_field_verified(
             'MSR_POWER_CTL',
             cpu,
@@ -1622,7 +1621,6 @@ def apply_package_power_limit(write_value, mmio_powercap=None, mchbar_mmio=None)
                 mchbar_mmio = None
                 direct_before = None
 
-    control_change = bool((write_value ^ msr_before) & PKG_POWER_LIMIT_CONTROL_MASK)
     if mchbar_mmio is None:
         warning(
             'No MMIO==MSR-validated direct MCHBAR mirror is available; skipping the entire '
