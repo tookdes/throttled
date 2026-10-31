@@ -57,6 +57,11 @@ FIVR_MAX_TICKS = 0
 ICCMAX_PLANES = {"core": 0, "gpu": 1, "cache": 2}
 ICCMAX_STEPS_PER_A = 4
 ICCMAX_MAX_FIELD = 0x3FF
+OC_MAILBOX_BUSY_BIT = 63
+OC_MAILBOX_STATUS_SHIFT = 32
+OC_MAILBOX_STATUS_MASK = 0xFF
+OC_MAILBOX_TIMEOUT_S = 0.01
+OC_MAILBOX_POLL_S = 0.00001
 
 PKG_PL1_POWER_MASK = 0x7FFF
 PKG_PL1_ENABLE_BIT = 15
@@ -317,19 +322,39 @@ def encode_iccmax_write_field(plane, field):
     return 0x8000001700000000 | (ICCMAX_PLANES[plane] << 40) | field
 
 
+def wait_oc_mailbox_ready(msr, cpu=0):
+    deadline = time.monotonic() + OC_MAILBOX_TIMEOUT_S
+    while True:
+        raw = msr.read(cpu, "MSR_OC_MAILBOX")
+        if not bit(raw, OC_MAILBOX_BUSY_BIT):
+            return raw
+        if time.monotonic() >= deadline:
+            raise ControlError("OC mailbox timed out waiting for completion")
+        time.sleep(OC_MAILBOX_POLL_S)
+
+
+def execute_oc_mailbox(msr, command, cpu=0):
+    wait_oc_mailbox_ready(msr, cpu)
+    msr.write(cpu, "MSR_OC_MAILBOX", command)
+    result = wait_oc_mailbox_ready(msr, cpu)
+    status = (result >> OC_MAILBOX_STATUS_SHIFT) & OC_MAILBOX_STATUS_MASK
+    if status:
+        raise ControlError(f"OC mailbox command failed with status 0x{status:02x}")
+    return result
+
+
 def read_mailbox_fivr_ticks(msr, plane):
-    msr.write(0, "MSR_OC_MAILBOX", encode_fivr_read(plane))
-    return fivr_ticks_from_response(msr.read(0, "MSR_OC_MAILBOX"))
+    return fivr_ticks_from_response(execute_oc_mailbox(msr, encode_fivr_read(plane)))
 
 
 def read_mailbox_iccmax_field(msr, plane):
-    msr.write(0, "MSR_OC_MAILBOX", encode_iccmax_read(plane))
-    return msr.read(0, "MSR_OC_MAILBOX") & ICCMAX_MAX_FIELD
+    return execute_oc_mailbox(msr, encode_iccmax_read(plane)) & ICCMAX_MAX_FIELD
 
 
-def write_mailbox_all_cpus(msr, value):
-    for cpu in msr.cpus():
-        msr.write(cpu, "MSR_OC_MAILBOX", value)
+def write_mailbox(msr, value):
+    # EliteBook 830 G6 is a single-package target; one package mailbox command
+    # through CPU0 is sufficient and avoids redundant commands on sibling CPUs.
+    execute_oc_mailbox(msr, value, cpu=0)
 
 
 def update_pkg_power_limit(raw, units, *, pl1=None, pl2=None, tau1=None, tau2=None,
@@ -711,7 +736,7 @@ def command_fivr_set(args, msr):
         for plane in requested:
             ticks = desired[plane]
             changed.append(plane)
-            write_mailbox_all_cpus(msr, encode_fivr_write_ticks(plane, ticks))
+            write_mailbox(msr, encode_fivr_write_ticks(plane, ticks))
             readback = read_mailbox_fivr_ticks(msr, plane)
             if readback != ticks:
                 raise ControlError(
@@ -722,7 +747,7 @@ def command_fivr_set(args, msr):
         rollback_errors = []
         for plane in reversed(changed):
             try:
-                write_mailbox_all_cpus(msr, encode_fivr_write_ticks(plane, original[plane]))
+                write_mailbox(msr, encode_fivr_write_ticks(plane, original[plane]))
                 if read_mailbox_fivr_ticks(msr, plane) != original[plane]:
                     rollback_errors.append(f"{plane}: verify mismatch")
             except ProbeError as rollback_exc:
@@ -756,7 +781,7 @@ def command_iccmax_set(args, msr):
     try:
         for plane, field in desired.items():
             changed.append(plane)
-            write_mailbox_all_cpus(msr, encode_iccmax_write_field(plane, field))
+            write_mailbox(msr, encode_iccmax_write_field(plane, field))
             readback = read_mailbox_iccmax_field(msr, plane)
             if readback != field:
                 raise ControlError(
@@ -767,7 +792,7 @@ def command_iccmax_set(args, msr):
         rollback_errors = []
         for plane in reversed(changed):
             try:
-                write_mailbox_all_cpus(msr, encode_iccmax_write_field(plane, original[plane]))
+                write_mailbox(msr, encode_iccmax_write_field(plane, original[plane]))
                 if read_mailbox_iccmax_field(msr, plane) != original[plane]:
                     rollback_errors.append(f"{plane}: verify mismatch")
             except ProbeError as rollback_exc:
