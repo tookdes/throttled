@@ -42,6 +42,16 @@ BD_PROCHOT_ENABLE_BIT = 0
 HWP_EPP_SHIFT = 24
 HWP_EPP_MASK = 0xFF << HWP_EPP_SHIFT
 HWP_PACKAGE_CONTROL_BIT = 42
+SPEEDSTEP_ENABLE_BIT = 16
+CLOCK_MODULATION_ENABLE_BIT = 4
+
+FIVR_PLANES = {"core": 0, "gpu": 1, "cache": 2, "uncore": 3, "analogio": 4}
+FIVR_TICKS_PER_MV = 1.024
+FIVR_MIN_TICKS = -(1 << 10)
+FIVR_MAX_TICKS = 0
+ICCMAX_PLANES = {"core": 0, "gpu": 1, "cache": 2}
+ICCMAX_STEPS_PER_A = 4
+ICCMAX_MAX_FIELD = 0x3FF
 
 PKG_PL1_POWER_MASK = 0x7FFF
 PKG_PL1_ENABLE_BIT = 15
@@ -90,6 +100,38 @@ def positive_finite(value):
     return parsed
 
 
+def parse_undervolt_mv(value):
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("voltage offset must be a number") from exc
+    minimum = FIVR_MIN_TICKS / FIVR_TICKS_PER_MV
+    if not math.isfinite(parsed) or not minimum <= parsed <= 0:
+        raise argparse.ArgumentTypeError(f"voltage offset must be between {minimum:g} and 0 mV")
+    return parsed
+
+
+def parse_iccmax(value):
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("IccMax must be a number") from exc
+    maximum = ICCMAX_MAX_FIELD / ICCMAX_STEPS_PER_A
+    if not math.isfinite(parsed) or not 0 < parsed <= maximum:
+        raise argparse.ArgumentTypeError(f"IccMax must be greater than 0 and at most {maximum:g} A")
+    return parsed
+
+
+def parse_ratio(value):
+    try:
+        parsed = int(value, 0)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("turbo ratio must be an integer") from exc
+    if not 1 <= parsed <= 0xFF:
+        raise argparse.ArgumentTypeError("turbo ratio must be in the range 1..255")
+    return parsed
+
+
 def set_bit(value, number, enabled):
     if enabled:
         return value | (1 << number)
@@ -134,6 +176,85 @@ def update_turbo(raw, enabled):
 
 def update_bd_prochot(raw, enabled):
     return set_bit(raw, BD_PROCHOT_ENABLE_BIT, enabled)
+
+
+def update_speedstep(raw, enabled):
+    return set_bit(raw, SPEEDSTEP_ENABLE_BIT, enabled)
+
+
+def force_clock_modulation_full(raw):
+    # Clearing the on-demand clock-modulation enable bit gives 100% duty cycle
+    # while preserving reserved/duty-cycle fields.
+    return set_bit(raw, CLOCK_MODULATION_ENABLE_BIT, False)
+
+
+def update_turbo_ratios(raw, ratios):
+    updated = raw
+    for core_count, ratio in ratios.items():
+        if not 1 <= core_count <= 8:
+            raise ControlError(f"unsupported active-core count: {core_count}")
+        if not 1 <= ratio <= 0xFF:
+            raise ControlError(f"invalid turbo ratio for {core_count}C: {ratio}")
+        shift = (core_count - 1) * 8
+        updated = replace_field(updated, 0xFF << shift, shift, ratio)
+    return updated
+
+
+def fivr_mv_to_ticks(mv):
+    minimum = FIVR_MIN_TICKS / FIVR_TICKS_PER_MV
+    if not math.isfinite(mv) or not minimum <= mv <= 0:
+        raise ControlError(f"FIVR offset must be between {minimum:g} and 0 mV")
+    ticks = int(round(mv * FIVR_TICKS_PER_MV))
+    if not FIVR_MIN_TICKS <= ticks <= FIVR_MAX_TICKS:
+        raise ControlError("FIVR offset does not fit the signed 11-bit field")
+    return ticks
+
+
+def fivr_ticks_from_response(raw):
+    field = (raw >> 21) & 0x7FF
+    return field if field < 0x400 else field - 0x800
+
+
+def fivr_ticks_to_mv(ticks):
+    return ticks / FIVR_TICKS_PER_MV
+
+
+def encode_fivr_read(plane):
+    return 0x8000001000000000 | (FIVR_PLANES[plane] << 40)
+
+
+def encode_fivr_write_ticks(plane, ticks):
+    return 0x8000001100000000 | (FIVR_PLANES[plane] << 40) | ((ticks & 0x7FF) << 21)
+
+
+def encode_iccmax_read(plane):
+    return 0x8000001600000000 | (ICCMAX_PLANES[plane] << 40)
+
+
+def iccmax_to_field(amps):
+    field = int(amps * ICCMAX_STEPS_PER_A)
+    if not 1 <= field <= ICCMAX_MAX_FIELD:
+        raise ControlError("IccMax does not fit the 10-bit quarter-ampere field")
+    return field
+
+
+def encode_iccmax_write_field(plane, field):
+    return 0x8000001700000000 | (ICCMAX_PLANES[plane] << 40) | field
+
+
+def read_mailbox_fivr_ticks(msr, plane):
+    msr.write(0, "MSR_OC_MAILBOX", encode_fivr_read(plane))
+    return fivr_ticks_from_response(msr.read(0, "MSR_OC_MAILBOX"))
+
+
+def read_mailbox_iccmax_field(msr, plane):
+    msr.write(0, "MSR_OC_MAILBOX", encode_iccmax_read(plane))
+    return msr.read(0, "MSR_OC_MAILBOX") & ICCMAX_MAX_FIELD
+
+
+def write_mailbox_all_cpus(msr, value):
+    for cpu in msr.cpus():
+        msr.write(cpu, "MSR_OC_MAILBOX", value)
 
 
 def update_pkg_power_limit(raw, units, *, pl1=None, pl2=None, tau1=None, tau2=None,
@@ -317,6 +438,159 @@ def command_bd_prochot(args, msr):
     return 0
 
 
+def command_speedstep(args, msr):
+    validate_write_environment(args)
+    writes = []
+    for cpu in msr.cpus():
+        raw = msr.read(cpu, "IA32_MISC_ENABLE")
+        writes.append((cpu, "IA32_MISC_ENABLE", update_speedstep(raw, args.state)))
+    apply_transaction(msr, writes)
+    print(f"SpeedStep/EIST {'enabled' if args.state else 'disabled'} and verified.")
+    return 0
+
+
+def command_clock_mod(args, msr):
+    validate_write_environment(args)
+    writes = []
+    for cpu in msr.cpus():
+        raw = msr.read(cpu, "IA32_CLOCK_MODULATION")
+        writes.append((cpu, "IA32_CLOCK_MODULATION", force_clock_modulation_full(raw)))
+    apply_transaction(msr, writes)
+    print("On-demand clock modulation disabled (100% duty cycle) and verified.")
+    return 0
+
+
+def command_turbo_ratio(args, msr):
+    validate_write_environment(args)
+    platform = msr.read(0, "MSR_PLATFORM_INFO")
+    if not bit(platform, 28):
+        raise ControlError("MSR_PLATFORM_INFO reports programmable turbo ratios are not supported")
+
+    ratios = {
+        core_count: value
+        for core_count, value in enumerate(
+            (args.ratio1, args.ratio2, args.ratio3, args.ratio4, args.ratio5, args.ratio6, args.ratio7, args.ratio8),
+            start=1,
+        )
+        if value is not None
+    }
+    if not ratios:
+        raise ControlError("turbo-ratio requires at least one --1c .. --8c value")
+
+    current = msr.read(0, "MSR_TURBO_RATIO_LIMIT")
+    updated = update_turbo_ratios(current, ratios)
+    apply_transaction(msr, [(0, "MSR_TURBO_RATIO_LIMIT", updated)])
+    rendered = ", ".join(f"{cores}C={ratio}x" for cores, ratio in sorted(ratios.items()))
+    print(f"Turbo ratio limits updated and verified: {rendered}")
+    return 0
+
+
+def command_fivr_read(args, msr):
+    validate_write_environment(args)
+    values = {}
+    for plane in FIVR_PLANES:
+        ticks = read_mailbox_fivr_ticks(msr, plane)
+        values[plane] = fivr_ticks_to_mv(ticks)
+    for plane, mv in values.items():
+        print(f"{plane:8s} {mv:9.3f} mV")
+    return 0
+
+
+def command_fivr_set(args, msr):
+    validate_write_environment(args)
+    requested = {
+        "core": args.core,
+        "gpu": args.gpu,
+        "cache": args.cache,
+        "uncore": args.uncore,
+        "analogio": args.analogio,
+    }
+    requested = {plane: value for plane, value in requested.items() if value is not None}
+    if not requested:
+        raise ControlError("fivr set requires at least one voltage plane")
+
+    original = {plane: read_mailbox_fivr_ticks(msr, plane) for plane in FIVR_PLANES}
+    desired = dict(original)
+    desired.update({plane: fivr_mv_to_ticks(mv) for plane, mv in requested.items()})
+    if not args.allow_core_cache_mismatch and desired["core"] != desired["cache"]:
+        raise ControlError(
+            "Core and Cache offsets would differ; set both to the same value or use --allow-core-cache-mismatch"
+        )
+
+    changed = []
+    try:
+        for plane in requested:
+            ticks = desired[plane]
+            write_mailbox_all_cpus(msr, encode_fivr_write_ticks(plane, ticks))
+            readback = read_mailbox_fivr_ticks(msr, plane)
+            if readback != ticks:
+                raise ControlError(
+                    f"FIVR verify failed for {plane}: requested {fivr_ticks_to_mv(ticks):.3f} mV, "
+                    f"read {fivr_ticks_to_mv(readback):.3f} mV"
+                )
+            changed.append(plane)
+    except (ProbeError, ControlError) as exc:
+        rollback_errors = []
+        for plane in reversed(changed):
+            try:
+                write_mailbox_all_cpus(msr, encode_fivr_write_ticks(plane, original[plane]))
+                if read_mailbox_fivr_ticks(msr, plane) != original[plane]:
+                    rollback_errors.append(f"{plane}: verify mismatch")
+            except ProbeError as rollback_exc:
+                rollback_errors.append(f"{plane}: {rollback_exc}")
+        suffix = f"; rollback issues: {'; '.join(rollback_errors)}" if rollback_errors else "; rollback attempted"
+        raise ControlError(str(exc) + suffix) from exc
+
+    for plane in requested:
+        print(f"{plane:8s} {fivr_ticks_to_mv(desired[plane]):9.3f} mV")
+    return 0
+
+
+def command_iccmax_read(args, msr):
+    validate_write_environment(args)
+    for plane in ICCMAX_PLANES:
+        field = read_mailbox_iccmax_field(msr, plane)
+        print(f"{plane:8s} {field / ICCMAX_STEPS_PER_A:9.2f} A")
+    return 0
+
+
+def command_iccmax_set(args, msr):
+    validate_write_environment(args)
+    requested = {"core": args.core, "gpu": args.gpu, "cache": args.cache}
+    requested = {plane: value for plane, value in requested.items() if value is not None}
+    if not requested:
+        raise ControlError("iccmax set requires at least one current plane")
+
+    original = {plane: read_mailbox_iccmax_field(msr, plane) for plane in ICCMAX_PLANES}
+    desired = {plane: iccmax_to_field(value) for plane, value in requested.items()}
+    changed = []
+    try:
+        for plane, field in desired.items():
+            write_mailbox_all_cpus(msr, encode_iccmax_write_field(plane, field))
+            readback = read_mailbox_iccmax_field(msr, plane)
+            if readback != field:
+                raise ControlError(
+                    f"IccMax verify failed for {plane}: requested {field / ICCMAX_STEPS_PER_A:.2f} A, "
+                    f"read {readback / ICCMAX_STEPS_PER_A:.2f} A"
+                )
+            changed.append(plane)
+    except (ProbeError, ControlError) as exc:
+        rollback_errors = []
+        for plane in reversed(changed):
+            try:
+                write_mailbox_all_cpus(msr, encode_iccmax_write_field(plane, original[plane]))
+                if read_mailbox_iccmax_field(msr, plane) != original[plane]:
+                    rollback_errors.append(f"{plane}: verify mismatch")
+            except ProbeError as rollback_exc:
+                rollback_errors.append(f"{plane}: {rollback_exc}")
+        suffix = f"; rollback issues: {'; '.join(rollback_errors)}" if rollback_errors else "; rollback attempted"
+        raise ControlError(str(exc) + suffix) from exc
+
+    for plane, field in desired.items():
+        print(f"{plane:8s} {field / ICCMAX_STEPS_PER_A:9.2f} A")
+    return 0
+
+
 def command_power(args, msr):
     validate_write_environment(args)
 
@@ -397,6 +671,41 @@ def build_parser():
     bd = sub.add_parser("bd-prochot", help="enable or disable bidirectional PROCHOT")
     bd.add_argument("state", type=parse_on_off, metavar="on|off")
     bd.set_defaults(handler=command_bd_prochot)
+
+    speedstep = sub.add_parser("speedstep", help="enable or disable legacy SpeedStep/EIST")
+    speedstep.add_argument("state", type=parse_on_off, metavar="on|off")
+    speedstep.set_defaults(handler=command_speedstep)
+
+    clock_mod = sub.add_parser("clock-mod", help="force clock modulation to 100% duty cycle")
+    clock_mod.set_defaults(handler=command_clock_mod)
+
+    ratio = sub.add_parser("turbo-ratio", help="set per-active-core Turbo Ratio Limit bytes")
+    for cores in range(1, 9):
+        ratio.add_argument(f"--{cores}c", dest=f"ratio{cores}", type=parse_ratio, metavar="RATIO")
+    ratio.set_defaults(handler=command_turbo_ratio)
+
+    fivr = sub.add_parser("fivr", help="query or set FIVR voltage offsets (OC mailbox)")
+    fivr_sub = fivr.add_subparsers(dest="fivr_command", required=True)
+    fivr_read = fivr_sub.add_parser("read", help="query voltage offsets; this issues an OC-mailbox WRMSR")
+    fivr_read.set_defaults(handler=command_fivr_read)
+    fivr_set = fivr_sub.add_parser("set", help="set and verify voltage offsets")
+    for plane in FIVR_PLANES:
+        fivr_set.add_argument(f"--{plane}", type=parse_undervolt_mv, metavar="MV")
+    fivr_set.add_argument(
+        "--allow-core-cache-mismatch",
+        action="store_true",
+        help="allow Core and Cache voltage offsets to differ",
+    )
+    fivr_set.set_defaults(handler=command_fivr_set)
+
+    iccmax = sub.add_parser("iccmax", help="query or set FIVR current ceilings")
+    icc_sub = iccmax.add_subparsers(dest="icc_command", required=True)
+    icc_read = icc_sub.add_parser("read", help="query IccMax; this issues an OC-mailbox WRMSR")
+    icc_read.set_defaults(handler=command_iccmax_read)
+    icc_set = icc_sub.add_parser("set", help="set and verify IccMax")
+    for plane in ICCMAX_PLANES:
+        icc_set.add_argument(f"--{plane}", type=parse_iccmax, metavar="AMPS")
+    icc_set.set_defaults(handler=command_iccmax_set)
 
     power = sub.add_parser("power", help="modify MSR PL1/PL2 and RAPL time windows")
     power.add_argument("--pl1", type=positive_finite, metavar="W")
