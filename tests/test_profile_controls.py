@@ -100,6 +100,21 @@ class ProfileControlTests(unittest.TestCase):
         ))
         self.assertEqual(len(write.call_args_list), 3)
 
+    def test_bdprochot_profile_setting_preserves_legacy_semantics(self):
+        throttled = load_throttled()
+
+        explicit = make_config({"AC": {"BDPROCHOT_Enabled": False, "Disable_BDPROCHOT": False}})
+        self.assertIs(throttled._bdprochot_setting(explicit, "AC"), False)
+
+        legacy_disable = make_config({"AC": {"Disable_BDPROCHOT": True}})
+        self.assertIs(throttled._bdprochot_setting(legacy_disable, "AC"), False)
+
+        legacy_false = make_config({"AC": {"Disable_BDPROCHOT": False}})
+        self.assertIsNone(throttled._bdprochot_setting(legacy_false, "AC"))
+
+        untouched = make_config({"AC": {}})
+        self.assertIsNone(throttled._bdprochot_setting(untouched, "AC"))
+
     def test_turbo_and_bd_prochot_are_reversible(self):
         throttled = load_throttled()
         cpu_values = {0: 0, 1: 0}
@@ -137,6 +152,7 @@ class ProfileControlTests(unittest.TestCase):
             "HWP_EPP: 256",
             "HWP_EPP: fast",
             "Disable_Turbo: perhaps",
+            "BDPROCHOT_Enabled: perhaps",
             "PL1_Enable: perhaps",
             "PL1_Clamp: perhaps",
             "PL2_Enable: perhaps",
