@@ -302,21 +302,23 @@ class PR394FixTests(unittest.TestCase):
         mapping = mock.Mock()
         mapping.read64.return_value = 0
 
-        with mock.patch.object(throttled, '_read_host_bridge_identity', return_value=(0x8086, 0x5914)):
-            with mock.patch.object(throttled, '_read_mchbar_dword', side_effect=(0xFED10001, 0)):
-                with mock.patch.object(throttled, 'MMIO', return_value=mapping) as mmio:
-                    with mock.patch.object(throttled, 'writemsr'):
-                        throttled._power_thread(state, StopAfterWait())
+        with mock.patch.object(throttled, 'find_mmio_package_zone', return_value=None):
+            with mock.patch.object(throttled, '_read_host_bridge_identity', return_value=(0x8086, 0x5914)):
+                with mock.patch.object(throttled, '_read_mchbar_dword', side_effect=(0xFED10001, 0)):
+                    with mock.patch.object(throttled, 'MMIO', return_value=mapping) as mmio:
+                        with mock.patch.object(throttled, 'writemsr'):
+                            throttled._power_thread(state, StopAfterWait())
 
         mmio.assert_called_once_with(0xFED159A0, 8)
         mapping.write64.assert_called_once_with(0, 0x1234)
 
-        with mock.patch.object(throttled, '_read_host_bridge_identity', return_value=(0x8086, 0xFFFF)):
-            with mock.patch.object(throttled, '_read_mchbar_dword') as read:
-                with mock.patch.object(throttled, 'MMIO') as mmio:
-                    with mock.patch.object(throttled, 'writemsr') as writemsr:
-                        with mock.patch.object(throttled, 'warning'):
-                            throttled._power_thread(state, StopAfterWait())
+        with mock.patch.object(throttled, 'find_mmio_package_zone', return_value=None):
+            with mock.patch.object(throttled, '_read_host_bridge_identity', return_value=(0x8086, 0xFFFF)):
+                with mock.patch.object(throttled, '_read_mchbar_dword') as read:
+                    with mock.patch.object(throttled, 'MMIO') as mmio:
+                        with mock.patch.object(throttled, 'writemsr') as writemsr:
+                            with mock.patch.object(throttled, 'warning'):
+                                throttled._power_thread(state, StopAfterWait())
 
         read.assert_not_called()
         mmio.assert_not_called()
@@ -368,12 +370,13 @@ class PR394FixTests(unittest.TestCase):
         state = {'config': config, 'regs': {'AC': {'MSR_PKG_POWER_LIMIT': 0x1234}, 'BATTERY': {}}}
         values = {'48.l': b'fed1f001\n', '4c.l': b'00000000\n'}
 
-        with mock.patch.object(throttled, '_read_host_bridge_identity', return_value=(0x8086, 0xA706)):
-            with mock.patch.object(throttled, 'check_output', side_effect=lambda cmd, stderr: values[cmd[-1]]) as check:
-                with mock.patch.object(throttled, 'MMIO') as mmio:
-                    with mock.patch.object(throttled, 'writemsr') as writemsr:
-                        with mock.patch.object(throttled, 'warning'):
-                            throttled._power_thread(state, StopAfterWait())
+        with mock.patch.object(throttled, 'find_mmio_package_zone', return_value=None):
+            with mock.patch.object(throttled, '_read_host_bridge_identity', return_value=(0x8086, 0xA706)):
+                with mock.patch.object(throttled, 'check_output', side_effect=lambda cmd, stderr: values[cmd[-1]]) as check:
+                    with mock.patch.object(throttled, 'MMIO') as mmio:
+                        with mock.patch.object(throttled, 'writemsr') as writemsr:
+                            with mock.patch.object(throttled, 'warning'):
+                                throttled._power_thread(state, StopAfterWait())
 
         self.assertEqual(check.call_count, 4)
         mmio.assert_not_called()
@@ -386,10 +389,11 @@ class PR394FixTests(unittest.TestCase):
         mapping = mock.Mock()
         mapping.read64.return_value = 0
 
-        with mock.patch.object(throttled, 'read_mchbar_base', return_value=0xFED10000):
-            with mock.patch.object(throttled, 'MMIO', return_value=mapping) as mmio:
-                with mock.patch.object(throttled, 'writemsr'):
-                    throttled._power_thread(state, StopAfterWait())
+        with mock.patch.object(throttled, 'find_mmio_package_zone', return_value=None):
+            with mock.patch.object(throttled, 'read_mchbar_base', return_value=0xFED10000):
+                with mock.patch.object(throttled, 'MMIO', return_value=mapping) as mmio:
+                    with mock.patch.object(throttled, 'writemsr'):
+                        throttled._power_thread(state, StopAfterWait())
 
         mmio.assert_called_once_with(0xFED159A0, 8)
         mapping.write64.assert_called_once_with(0, 0x1234)
@@ -402,11 +406,12 @@ class PR394FixTests(unittest.TestCase):
         mapping.read64.return_value = 0
         mapping.write64.side_effect = throttled.MMIOError('blocked')
 
-        with mock.patch.object(throttled, 'read_mchbar_base', return_value=0xFED10000):
-            with mock.patch.object(throttled, 'MMIO', return_value=mapping):
-                with mock.patch.object(throttled, 'writemsr') as writemsr:
-                    with mock.patch.object(throttled, 'warning') as warning:
-                        throttled._power_thread(state, StopAfterWait())
+        with mock.patch.object(throttled, 'find_mmio_package_zone', return_value=None):
+            with mock.patch.object(throttled, 'read_mchbar_base', return_value=0xFED10000):
+                with mock.patch.object(throttled, 'MMIO', return_value=mapping):
+                    with mock.patch.object(throttled, 'writemsr') as writemsr:
+                        with mock.patch.object(throttled, 'warning') as warning:
+                            throttled._power_thread(state, StopAfterWait())
 
         writemsr.assert_called_once_with('MSR_PKG_POWER_LIMIT', 0x1234)
         mapping.write64.assert_called_once_with(0, 0x1234)
@@ -419,11 +424,12 @@ class PR394FixTests(unittest.TestCase):
         state = {'config': old_config, 'regs': {'AC': {}, 'BATTERY': {}}}
         new_regs = {'AC': {}, 'BATTERY': {}}
 
-        with mock.patch.object(throttled, 'read_mchbar_base', return_value=0):
-            with mock.patch.object(throttled, 'MMIO'):
-                with mock.patch.object(throttled, 'get_config_write_time', side_effect=[1, 2]):
-                    with mock.patch.object(throttled, 'reload_config', return_value=(new_config, new_regs)):
-                        throttled.power_thread(state, StopAfterWait())
+        with mock.patch.object(throttled, 'find_mmio_package_zone', return_value=None):
+            with mock.patch.object(throttled, 'read_mchbar_base', return_value=0):
+                with mock.patch.object(throttled, 'MMIO'):
+                    with mock.patch.object(throttled, 'get_config_write_time', side_effect=[1, 2]):
+                        with mock.patch.object(throttled, 'reload_config', return_value=(new_config, new_regs)):
+                            throttled.power_thread(state, StopAfterWait())
 
         self.assertIs(state['config'], new_config)
         self.assertIs(state['regs'], new_regs)
