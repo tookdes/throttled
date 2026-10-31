@@ -12,12 +12,12 @@ vendor_id : GenuineIntel
 cpu family : 6
 model : 142
 model name : Intel(R) Core(TM) i5-8365U CPU @ 1.60GHz
-stepping : 11
+stepping : 12
 microcode : 0xf4
 flags : fpu hwp hwp_epp hwp_act_window hwp_pkg_req
 """
         )
-        self.assertEqual((cpu["family"], cpu["model"], cpu["stepping"]), (6, 142, 11))
+        self.assertEqual((cpu["family"], cpu["model"], cpu["stepping"]), (6, 142, 12))
         self.assertIn("hwp_epp", cpu["flags"])
 
     def test_decode_rapl_power_limits(self):
@@ -52,12 +52,14 @@ flags : fpu hwp hwp_epp hwp_act_window hwp_pkg_req
         self.assertEqual(decoded["active"], ["Current/EDP", "Package-PL1"])
         self.assertEqual(decoded["logged"], ["VR-Thermal"])
 
-    def test_target_detection(self):
-        cpu = {"family": 6, "model": 142, "stepping": 11}
+    def test_target_detection_accepts_both_whiskey_lake_cpuid_revisions(self):
         dmi = {"product": "HP EliteBook 830 G6"}
-        result = probe.cpu_target_status(cpu, dmi)
-        self.assertTrue(result["cpuid_match"])
-        self.assertTrue(result["dmi_match"])
+        for stepping in (11, 12):
+            with self.subTest(stepping=stepping):
+                cpu = {"family": 6, "model": 142, "stepping": stepping}
+                result = probe.cpu_target_status(cpu, dmi)
+                self.assertTrue(result["cpuid_match"])
+                self.assertTrue(result["dmi_match"])
 
     def test_restore_plan_only_uses_saved_values(self):
         snapshot = {
