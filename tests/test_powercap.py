@@ -62,6 +62,20 @@ class PowercapTests(unittest.TestCase):
             self.assertEqual(restored["pl1"]["time_window_us"], 28_000_000)
             self.assertEqual(restored["pl2"]["time_window_us"], 2_440)
 
+    def test_write_rejects_nonfinite_and_nonpositive_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            zone = powercap.PowercapZone(make_zone(tmp))
+            for kwargs in (
+                {"pl1_w": 0},
+                {"pl1_w": -1},
+                {"pl1_w": float("nan")},
+                {"tau1_s": 0},
+                {"tau1_s": float("inf")},
+            ):
+                with self.subTest(kwargs=kwargs):
+                    with self.assertRaises(powercap.PowercapError):
+                        zone.write(**kwargs)
+
     def test_write_rejects_kernel_power_bounds(self):
         with tempfile.TemporaryDirectory() as tmp:
             zone = powercap.PowercapZone(make_zone(tmp))
