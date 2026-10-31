@@ -348,6 +348,7 @@ def apply_transaction(msr, writes):
             if new_value == original:
                 completed.append((cpu, register, original))
                 continue
+            completed.append((cpu, register, original))
             msr.write(cpu, register, new_value)
             readback = msr.read(cpu, register)
             if readback != new_value:
@@ -355,7 +356,6 @@ def apply_transaction(msr, writes):
                     f"verify failed for cpu{cpu} {register}: wrote 0x{new_value:016x}, "
                     f"read 0x{readback:016x}"
                 )
-            completed.append((cpu, register, original))
     except (ProbeError, ControlError) as exc:
         rollback_errors = []
         for cpu, register, original in reversed(completed):
@@ -521,6 +521,7 @@ def command_fivr_set(args, msr):
     try:
         for plane in requested:
             ticks = desired[plane]
+            changed.append(plane)
             write_mailbox_all_cpus(msr, encode_fivr_write_ticks(plane, ticks))
             readback = read_mailbox_fivr_ticks(msr, plane)
             if readback != ticks:
@@ -528,7 +529,6 @@ def command_fivr_set(args, msr):
                     f"FIVR verify failed for {plane}: requested {fivr_ticks_to_mv(ticks):.3f} mV, "
                     f"read {fivr_ticks_to_mv(readback):.3f} mV"
                 )
-            changed.append(plane)
     except (ProbeError, ControlError) as exc:
         rollback_errors = []
         for plane in reversed(changed):
@@ -566,6 +566,7 @@ def command_iccmax_set(args, msr):
     changed = []
     try:
         for plane, field in desired.items():
+            changed.append(plane)
             write_mailbox_all_cpus(msr, encode_iccmax_write_field(plane, field))
             readback = read_mailbox_iccmax_field(msr, plane)
             if readback != field:
@@ -573,7 +574,6 @@ def command_iccmax_set(args, msr):
                     f"IccMax verify failed for {plane}: requested {field / ICCMAX_STEPS_PER_A:.2f} A, "
                     f"read {readback / ICCMAX_STEPS_PER_A:.2f} A"
                 )
-            changed.append(plane)
     except (ProbeError, ControlError) as exc:
         rollback_errors = []
         for plane in reversed(changed):
