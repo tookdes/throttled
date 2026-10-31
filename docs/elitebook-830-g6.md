@@ -103,11 +103,14 @@ PL2_Clamp: False
 
 HWP_EPP: 32
 Disable_Turbo: False
-Disable_BDPROCHOT: False
+BDPROCHOT_Enabled: True
 ```
 
 `HWP_EPP` is preferred over the historical boolean `HWP_Mode`; the old
-option remains for compatibility.
+option remains for compatibility. `BDPROCHOT_Enabled` is the reversible
+profile control. The historical `Disable_BDPROCHOT` keeps its original
+one-way semantics: `True` disables BD PROCHOT, while `False` leaves the
+current hardware state untouched.
 
 Profile controls are reapplied on AC/battery transitions, periodically where
 firmware or another power manager may overwrite them, and immediately after
