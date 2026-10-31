@@ -80,7 +80,6 @@ HWP_DEFAULT_VALUE = 0x80
 HWP_INTERVAL = 60
 TURBO_DISABLE_BIT = 38
 BD_PROCHOT_ENABLE_BIT = 0
-BD_PROCHOT_LOCK_BIT = 23
 UNDERVOLT_TICKS_PER_MV = 1.024
 UNDERVOLT_MIN_TICKS = -(1 << 10)
 UNDERVOLT_MAX_TICKS = 0
@@ -1294,9 +1293,6 @@ def set_bdprochot(enabled):
         cpu = int(os.path.basename(os.path.dirname(addr)))
         cur_val = readmsr('MSR_POWER_CTL', cpu=cpu)
         current_enabled = bool(cur_val & mask)
-        if ((cur_val >> BD_PROCHOT_LOCK_BIT) & 1) and current_enabled != enabled:
-            warning(f'BD PROCHOT is locked on CPU {cpu:d}; requested state change skipped.')
-            continue
         readback = write_msr_field_verified(
             'MSR_POWER_CTL',
             cpu,
