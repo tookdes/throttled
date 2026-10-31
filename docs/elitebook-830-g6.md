@@ -72,10 +72,10 @@ MSR_PKG_POWER_LIMIT bit 63 is a hard lock. Neither daemon nor CLI sets it.
 
 The package-power control plane is intentionally fail-closed:
 
-1. `intel-rapl-mmio` is used for watts/Tau and its kernel min/max bounds are
-   enforced and read back;
-2. direct MCHBAR is required for Enable/Clamp changes or when no kernel MMIO
-   zone exists;
+1. every synchronized TPL change requires the direct MCHBAR mirror to pass
+   the live equality gate;
+2. when present, `intel-rapl-mmio` is additionally used for watts/Tau and its
+   kernel min/max bounds are enforced and read back;
 3. direct MCHBAR uses the shared allow-list (including Whiskey Lake-U
    `0x3E34/0x3E35`), bits 38:15 MCHBAR decoding and `+0x59A0` package-power
    mirror;
@@ -175,8 +175,13 @@ the fields this fork can change:
 
 It additionally captures `intel-rapl-mmio` constraints when present and the
 direct MCHBAR package-power raw value only when the read-only mirror equals MSR
-0x610. Restore preflights all captured backends before the first write and
-rolls back already restored state if a backend fails.
+0x610 at snapshot time. Restore is intentionally different from live writes:
+it may open the validated MCHBAR address even when the **current** MMIO and MSR
+values have diverged, because repairing that divergence is the recovery goal.
+Managed MSR state is restored first; kernel MMIO and direct MCHBAR are then
+attempted independently. Missing/failing backends produce an explicit partial
+recovery result instead of undoing successful recovery on the remaining
+backends.
 
 FIVR/IccMax stay outside this strict snapshot because querying them requires an
 OC-mailbox WRMSR. Every explicit FIVR/IccMax set creates a root-only recovery
