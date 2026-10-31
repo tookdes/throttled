@@ -927,6 +927,8 @@ def command_fivr_restore(args, msr):
         desired[plane] = value
 
     current = {plane: read_mailbox_fivr_ticks(msr, plane) for plane in FIVR_PLANES}
+    rollback_path = write_oc_recovery("fivr", current)
+    print(f"Pre-restore FIVR recovery backup written: {rollback_path}")
     changed = []
     try:
         for plane, ticks in desired.items():
@@ -965,6 +967,8 @@ def command_iccmax_restore(args, msr):
         desired[plane] = value
 
     current = {plane: read_mailbox_iccmax_field(msr, plane) for plane in ICCMAX_PLANES}
+    rollback_path = write_oc_recovery("iccmax", current)
+    print(f"Pre-restore IccMax recovery backup written: {rollback_path}")
     changed = []
     try:
         for plane, field in desired.items():
