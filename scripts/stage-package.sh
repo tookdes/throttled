@@ -46,6 +46,7 @@ mkdir -p \
 
 install -m 0755 "$ROOT_DIR/throttled.py" "$STAGE_ROOT/usr/lib/throttled/throttled.py"
 install -m 0644 "$ROOT_DIR/throttled_ctl.py" "$STAGE_ROOT/usr/lib/throttled/throttled_ctl.py"
+install -m 0644 "$ROOT_DIR/throttled_powercap.py" "$STAGE_ROOT/usr/lib/throttled/throttled_powercap.py"
 install -m 0644 "$ROOT_DIR/throttled_probe.py" "$STAGE_ROOT/usr/lib/throttled/throttled_probe.py"
 install -m 0644 "$ROOT_DIR/mmio.py" "$STAGE_ROOT/usr/lib/throttled/mmio.py"
 install -m 0644 "$ROOT_DIR/throttled_version.py" "$STAGE_ROOT/usr/lib/throttled/throttled_version.py"
