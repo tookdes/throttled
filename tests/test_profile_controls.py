@@ -114,15 +114,21 @@ class ProfileControlTests(unittest.TestCase):
 
         self.assertTrue(all(call.args[1] & (1 << throttled.TURBO_DISABLE_BIT) for call in write.call_args_list))
 
-        with mock.patch.object(throttled, "readmsr", return_value=0):
-            with mock.patch.object(throttled, "writemsr") as write:
-                throttled.set_bdprochot(True)
-        self.assertTrue(write.call_args.args[1] & 1)
+        with mock.patch.object(throttled, "_ensure_msr_module", return_value=["/dev/cpu/0/msr", "/dev/cpu/1/msr"]):
+            with mock.patch.object(throttled, "readmsr", return_value=0):
+                with mock.patch.object(throttled, "writemsr") as write:
+                    throttled.set_bdprochot(True)
+        self.assertEqual(len(write.call_args_list), 2)
+        self.assertTrue(all(call.args[1] & 1 for call in write.call_args_list))
 
-        with mock.patch.object(throttled, "readmsr", return_value=1):
-            with mock.patch.object(throttled, "writemsr") as write:
-                throttled.set_bdprochot(False)
-        self.assertFalse(write.call_args.args[1] & 1)
+        with mock.patch.object(throttled, "_ensure_msr_module", return_value=["/dev/cpu/0/msr", "/dev/cpu/1/msr"]):
+            with mock.patch.object(throttled, "readmsr", return_value=1):
+                with mock.patch.object(throttled, "writemsr") as write:
+                    throttled.set_bdprochot(False)
+        # Already disabled? No writes should be needed when bit 0 is clear only;
+        # here the input is 1 so each CPU must be cleared.
+        self.assertEqual(len(write.call_args_list), 2)
+        self.assertTrue(all(not (call.args[1] & 1) for call in write.call_args_list))
 
     def test_load_config_validates_hwp_epp_and_new_booleans(self):
         throttled = load_throttled()
