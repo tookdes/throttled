@@ -34,6 +34,8 @@ class SupportedCPUTests(unittest.TestCase):
         throttled = load_throttled()
         # F-M-S signatures from Intel's microcode-20260925 release notes.
         documented_cpu_ids = {
+            (6, 142, 11): 'WhiskeyLake',
+            (6, 142, 12): 'WhiskeyLake',
             (6, 165, 3): 'CometLake-S',
             (6, 166, 1): 'CometLake-U',
             (6, 191, 2): 'RaptorLake-HX/S',
