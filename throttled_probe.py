@@ -854,6 +854,35 @@ def _restore_direct_mchbar(mapping, saved_raw):
         raise ProbeError(f"direct MCHBAR restore failed: {exc}{suffix}") from exc
 
 
+def verify_package_register_views(msr, plan):
+    """Verify package-scoped managed fields are visible identically from all online CPUs."""
+    cpu_list = msr.cpus() if hasattr(msr, "cpus") else [0]
+    if not cpu_list:
+        return ["no online CPUs available for package-view verification"]
+
+    errors = []
+    package_names = [
+        name
+        for cpu, name, _ in plan
+        if cpu == 0 and name in SNAPSHOT_PACKAGE_REGS
+    ]
+    for name in package_names:
+        mask = SNAPSHOT_RESTORE_MASKS[name]
+        reference = msr.read(0, name) & mask
+        for cpu in cpu_list:
+            try:
+                value = msr.read(cpu, name) & mask
+            except ProbeError as exc:
+                errors.append(f"cpu{cpu} {name}: {exc}")
+                continue
+            if value != reference:
+                errors.append(
+                    f"cpu{cpu} {name}: managed view 0x{value:x} "
+                    f"!= cpu0 0x{reference:x}"
+                )
+    return errors
+
+
 def apply_full_restore(msr, plan, snapshot):
     """Restore every recoverable backend independently and report partial recovery."""
     backends = snapshot.get("power_backends") or {}
@@ -874,7 +903,15 @@ def apply_full_restore(msr, plan, snapshot):
 
     # Minimum recovery path: managed MSR fields remain transactional.
     apply_restore_plan(msr, plan)
-    status["msr"] = {"status": "restored"}
+    package_view_errors = verify_package_register_views(msr, plan)
+    status["msr"] = (
+        {"status": "restored"}
+        if not package_view_errors
+        else {
+            "status": "failed",
+            "reason": "package MSR view mismatch: " + "; ".join(package_view_errors),
+        }
+    )
 
     if saved_powercap is not None:
         powercap_zone = find_mmio_package_zone()
@@ -905,7 +942,7 @@ def apply_full_restore(msr, plan, snapshot):
 
     direct_mapping = None
     try:
-        direct_mapping, direct_before, direct_error = _open_snapshot_mchbar(snapshot)
+        direct_mapping, _direct_before, direct_error = _open_snapshot_mchbar(snapshot)
         if status["direct_mchbar"]["status"] == "pending":
             if direct_mapping is None:
                 status["direct_mchbar"] = {
