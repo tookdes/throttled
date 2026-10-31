@@ -1,4 +1,8 @@
 import json
+import os
+import struct
+import tempfile
+from pathlib import Path
 import unittest
 
 import throttled_probe as probe
@@ -82,34 +86,30 @@ flags : fpu hwp hwp_epp hwp_act_window hwp_pkg_req
                 self.assertTrue(result["cpuid_match"])
                 self.assertTrue(result["dmi_match"])
 
-    def test_restore_plan_only_uses_saved_values(self):
+    def test_restore_plan_rejects_any_missing_or_unreadable_register(self):
         snapshot = {
             "package_msrs": {
-                "MSR_PKG_POWER_LIMIT": {"value": "0x1234"},
-                "MSR_TEMPERATURE_TARGET": {"error": "not readable"},
+                name: {"value": "0x1"} for name in probe.SNAPSHOT_PACKAGE_REGS
             },
             "per_cpu_msrs": {
-                "0": {"IA32_HWP_REQUEST": {"value": "0x42"}},
-                "1": {"IA32_HWP_REQUEST": {"value": "0x43"}},
+                "0": {name: {"value": "0x2"} for name in probe.SNAPSHOT_PER_CPU_REGS},
+                "1": {name: {"value": "0x3"} for name in probe.SNAPSHOT_PER_CPU_REGS},
             },
         }
-        plan = probe.build_restore_plan(snapshot, [0, 1])
-        self.assertIn((0, "MSR_PKG_POWER_LIMIT", 0x1234), plan)
-        self.assertFalse((1, "MSR_PKG_POWER_LIMIT", 0x1234) in plan)
-        self.assertIn((0, "IA32_HWP_REQUEST", 0x42), plan)
-        self.assertIn((1, "IA32_HWP_REQUEST", 0x43), plan)
-        self.assertFalse(any(name == "MSR_TEMPERATURE_TARGET" for _, name, _ in plan))
+        snapshot["package_msrs"]["MSR_TEMPERATURE_TARGET"] = {"error": "not readable"}
+        with self.assertRaises(probe.ProbeError):
+            probe.build_restore_plan(snapshot, [0, 1])
 
     def test_snapshot_schema_rejects_unknown_version_target_and_cpu_topology(self):
         base = {
-            "schema_version": 1,
+            "schema_version": probe.SNAPSHOT_SCHEMA_VERSION,
             "target": probe.TARGET_DMI_PRODUCT,
             "per_cpu_msrs": {"0": {}, "1": {}},
         }
         probe.validate_snapshot_schema(base, [0, 1])
 
         for broken in (
-            {**base, "schema_version": 2},
+            {**base, "schema_version": probe.SNAPSHOT_SCHEMA_VERSION + 1},
             {**base, "target": "Other Laptop"},
             {**base, "per_cpu_msrs": {"0": {}}},
             {**base, "per_cpu_msrs": {"cpu0": {}}},
@@ -146,6 +146,42 @@ flags : fpu hwp hwp_epp hwp_act_window hwp_pkg_req
         cpu = {"vendor_id": "GenuineIntel", "family": 6, "model": 142, "stepping": 12}
         with self.assertRaises(probe.ProbeError):
             probe.validate_snapshot_identity(snapshot, cpu, {"product": "Other Laptop"})
+
+    def test_msr_access_uses_shared_table_for_mailbox_and_thermal_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            msr_path = root / "0" / "msr"
+            msr_path.parent.mkdir(parents=True)
+            with msr_path.open("wb") as handle:
+                handle.seek(probe.MSR["IA32_THERM_STATUS"])
+                handle.write(struct.pack("<Q", 0x12345678))
+                handle.seek(probe.MSR["MSR_OC_MAILBOX"])
+                handle.write(struct.pack("<Q", 0xABCDEF))
+            access = probe.MsrAccess(root)
+            self.assertEqual(access.read(0, "MSR_OC_MAILBOX"), 0xABCDEF)
+            self.assertEqual(access.read(0, "IA32_THERM_STATUS"), 0x12345678)
+
+    def test_whiskey_lake_host_bridges_are_probe_allowlisted(self):
+        self.assertEqual(
+            probe.MCHBAR_ADDRESS_MASKS_BY_PCI_DEVICE[0x3E34],
+            probe.MCHBAR_ADDRESS_MASK_39_15,
+        )
+        self.assertEqual(
+            probe.MCHBAR_ADDRESS_MASKS_BY_PCI_DEVICE[0x3E35],
+            probe.MCHBAR_ADDRESS_MASK_39_15,
+        )
+
+    def test_snapshot_completeness_requires_every_expected_value(self):
+        snapshot = {
+            "package_msrs": {name: {"value": "0x1"} for name in probe.SNAPSHOT_PACKAGE_REGS},
+            "per_cpu_msrs": {
+                "0": {name: {"value": "0x2"} for name in probe.SNAPSHOT_PER_CPU_REGS},
+            },
+        }
+        self.assertEqual(probe.snapshot_completeness_errors(snapshot, [0]), [])
+        del snapshot["per_cpu_msrs"]["0"]["IA32_HWP_REQUEST"]
+        errors = probe.snapshot_completeness_errors(snapshot, [0])
+        self.assertTrue(any("IA32_HWP_REQUEST" in error for error in errors))
 
     def test_restore_rolls_back_after_write_failure(self):
         msr = FakeMsr(
