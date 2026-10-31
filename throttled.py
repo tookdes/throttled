@@ -2013,12 +2013,15 @@ def main():
         log('[I] Throttled is disabled in config file... Quitting. :(')
         return
 
-    acquire_daemon_lock()
+    if os.geteuid() != 0:
+        fatal('No root no party. Try again with sudo.')
 
     cpuid = None
     if not args.force:
         check_kernel()
         cpuid = check_cpu()
+
+    acquire_daemon_lock()
 
     set_msr_allow_writes()
 
