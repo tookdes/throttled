@@ -1897,13 +1897,14 @@ def main():
         from throttled_probe import main as probe_main
 
         probe_args = []
-        if args.json:
+        if getattr(args, 'json', False):
             probe_args.append('--json')
-        if args.snapshot:
-            probe_args.extend(('--snapshot', args.snapshot))
+        snapshot_path = getattr(args, 'snapshot', None)
+        if snapshot_path:
+            probe_args.extend(('--snapshot', snapshot_path))
         return probe_main(probe_args)
 
-    if args.json or args.snapshot:
+    if getattr(args, 'json', False) or getattr(args, 'snapshot', None):
         parser.error('--json/--snapshot are valid only together with --probe')
 
     if args.log:
