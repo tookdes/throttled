@@ -95,7 +95,7 @@ flags : fpu hwp hwp_epp hwp_act_window hwp_pkg_req
         }
         plan = probe.build_restore_plan(snapshot, [0, 1])
         self.assertIn((0, "MSR_PKG_POWER_LIMIT", 0x1234), plan)
-        self.assertIn((1, "MSR_PKG_POWER_LIMIT", 0x1234), plan)
+        self.assertFalse((1, "MSR_PKG_POWER_LIMIT", 0x1234) in plan)
         self.assertIn((0, "IA32_HWP_REQUEST", 0x42), plan)
         self.assertIn((1, "IA32_HWP_REQUEST", 0x43), plan)
         self.assertFalse(any(name == "MSR_TEMPERATURE_TARGET" for _, name, _ in plan))
