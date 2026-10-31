@@ -181,10 +181,16 @@ direct MCHBAR package-power raw value only when the read-only mirror equals MSR
 0x610 at snapshot time. Restore is intentionally different from live writes:
 it may open the validated MCHBAR address even when the **current** MMIO and MSR
 values have diverged, because repairing that divergence is the recovery goal.
-Managed MSR state is restored first; kernel MMIO and direct MCHBAR are then
-attempted independently. Missing/failing backends produce an explicit partial
-recovery result instead of undoing successful recovery on the remaining
-backends.
+Managed MSR state is restored first and package-scoped managed fields are
+read back through every online CPU. A package-view mismatch rolls that MSR
+restore back to the pre-restore state and skips all later backends. Otherwise,
+kernel MMIO and direct MCHBAR are attempted independently. Missing/failing
+backends produce an explicit partial recovery result instead of undoing
+successful recovery on the remaining backends.
+
+Actual `--apply-restore` writes are refused while the shared daemon flock or
+`throttled.service` is active. `--allow-daemon-race` is an explicit unsafe
+override; dry-run restore remains available while the daemon is running.
 
 FIVR/IccMax stay outside this strict snapshot because querying them requires an
 OC-mailbox WRMSR. Every explicit FIVR/IccMax set creates a root-only recovery
