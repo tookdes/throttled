@@ -45,10 +45,12 @@ mkdir -p \
     "$STAGE_ROOT/usr/share/doc/throttled"
 
 install -m 0755 "$ROOT_DIR/throttled.py" "$STAGE_ROOT/usr/lib/throttled/throttled.py"
+install -m 0644 "$ROOT_DIR/throttled_ctl.py" "$STAGE_ROOT/usr/lib/throttled/throttled_ctl.py"
 install -m 0644 "$ROOT_DIR/throttled_probe.py" "$STAGE_ROOT/usr/lib/throttled/throttled_probe.py"
 install -m 0644 "$ROOT_DIR/mmio.py" "$STAGE_ROOT/usr/lib/throttled/mmio.py"
 install -m 0644 "$ROOT_DIR/throttled_version.py" "$STAGE_ROOT/usr/lib/throttled/throttled_version.py"
 install -m 0755 "$ROOT_DIR/packaging/throttled" "$STAGE_ROOT/usr/bin/throttled"
+install -m 0755 "$ROOT_DIR/packaging/throttlectl" "$STAGE_ROOT/usr/bin/throttlectl"
 install -m 0644 "$ROOT_DIR/etc/throttled.conf" "$STAGE_ROOT/etc/throttled.conf"
 install -m 0644 "$ROOT_DIR/LICENSE" "$STAGE_ROOT/usr/share/doc/throttled/copyright"
 
