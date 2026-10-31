@@ -873,16 +873,16 @@ def apply_full_restore(msr, plan, snapshot):
                 raise ProbeError("restored direct MCHBAR managed fields do not match restored MSR")
     except (ProbeError, PowercapError, OSError) as exc:
         rollback_errors = []
-        if direct_mapping is not None and direct_before is not None:
-            try:
-                _restore_direct_mchbar(direct_mapping, direct_before)
-            except (ProbeError, OSError) as rollback_exc:
-                rollback_errors.append(f"MCHBAR: {rollback_exc}")
         if powercap_zone is not None and powercap_before is not None:
             try:
                 powercap_zone.restore(powercap_before)
             except PowercapError as rollback_exc:
                 rollback_errors.append(f"powercap: {rollback_exc}")
+        if direct_mapping is not None and direct_before is not None:
+            try:
+                _restore_direct_mchbar(direct_mapping, direct_before)
+            except (ProbeError, OSError) as rollback_exc:
+                rollback_errors.append(f"MCHBAR: {rollback_exc}")
         try:
             apply_restore_plan(msr, rollback_plan)
         except ProbeError as rollback_exc:
