@@ -930,15 +930,15 @@ def build_parser():
 
 
 def main(argv=None):
-    args = build_parser().parse_args(argv)
-    msr = MsrAccess()
-    msr.ensure()
-    return args.handler(args, msr)
+    try:
+        args = build_parser().parse_args(argv)
+        msr = MsrAccess()
+        msr.ensure()
+        return args.handler(args, msr)
+    except (ProbeError, ControlError, PowercapError) as exc:
+        print(f"control error: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except (ProbeError, ControlError) as exc:
-        print(f"control error: {exc}", file=sys.stderr)
-        raise SystemExit(1)
+    raise SystemExit(main())
