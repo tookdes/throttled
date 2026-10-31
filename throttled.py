@@ -1463,18 +1463,16 @@ def get_config_write_time():
 
 
 def reload_config():
-    """Re-read the config and re-apply undervolt, IccMax and HWP settings."""
+    """Re-read config and compute a new register plan without touching hardware.
+
+    The power thread publishes the new config/plan under config_lock and then
+    applies the whole profile under hardware_lock, avoiding resume/reload races.
+    """
     config = load_config()
     if not config_is_enabled(config):
         log('[I] Reloading changes.')
         return config, defaultdict(dict)
     regs = calc_reg_values(get_cpu_platform_info(), config)
-    undervolt(config)
-    set_icc_max(config)
-    source = power['source']
-    set_hwp_epp(_hwp_epp(config, source))
-    set_turbo(_turbo_setting(config, source))
-    set_bdprochot(_bdprochot_setting(config, source))
     log('[I] Reloading changes.')
     return config, regs
 
@@ -1774,9 +1772,9 @@ def power_thread(state, exit_event):
 def _power_thread(state, exit_event):
     """Daemon main loop: periodically (re-)apply throttling MSRs."""
     config, regs = state['config'], state['regs']
-    mmio_powercap = find_mmio_package_zone()
     mchbar_mmio = None
     has_tpl = any('MSR_PKG_POWER_LIMIT' in regs.get(profile, {}) for profile in POWER_PROFILES)
+    mmio_powercap = find_mmio_package_zone() if has_tpl else None
     if has_tpl:
         pkg_baseline = readmsr('MSR_PKG_POWER_LIMIT', cpu=0)
         mchbar_mmio = open_mchbar_power_limit_mmio(expected_msr=pkg_baseline)
@@ -1791,18 +1789,23 @@ def _power_thread(state, exit_event):
         get_config_write_time() if config.getboolean('GENERAL', 'Autoreload', fallback=False) else None
     )
     while not exit_event.is_set():
+        config_reloaded = False
         # Reload config on changes (unless it's deleted)
         if config.getboolean('GENERAL', 'Autoreload', fallback=False):
             config_write_time = get_config_write_time()
             if config_write_time and last_config_write_time != config_write_time:
                 last_config_write_time = config_write_time
+                new_config, new_regs = reload_config()
                 with config_lock:
-                    state['config'], state['regs'] = reload_config()
-                config, regs = state['config'], state['regs']
+                    state['config'], state['regs'] = new_config, new_regs
+                    config, regs = new_config, new_regs
+                config_reloaded = True
 
-        # switch back to sysfs polling
+        # Switch back to sysfs polling and publish the source atomically.
         if power['method'] == 'polling':
-            power['source'] = 'BATTERY' if is_on_battery(config) else 'AC'
+            polled_source = 'BATTERY' if is_on_battery(config) else 'AC'
+            with config_lock:
+                power['source'] = polled_source
 
         # Snapshot the source under the same publication lock used by D-Bus.
         with config_lock:
@@ -1826,8 +1829,16 @@ def _power_thread(state, exit_event):
         if source_changed:
             log(f'[I] Power source changed: {applied_source:s} -> {power_source:s}')
 
+        if config_reloaded:
+            has_tpl = any('MSR_PKG_POWER_LIMIT' in regs.get(profile, {}) for profile in POWER_PROFILES)
+            if has_tpl and mmio_powercap is None:
+                mmio_powercap = find_mmio_package_zone()
+            if has_tpl and mchbar_mmio is None:
+                pkg_baseline = readmsr('MSR_PKG_POWER_LIMIT', cpu=0)
+                mchbar_mmio = open_mchbar_power_limit_mmio(expected_msr=pkg_baseline)
+
         hwp_epp = _hwp_epp(config, power_source)
-        hwp_due = hwp_epp is not None and (source_changed or next_hwp_write <= time())
+        hwp_due = hwp_epp is not None and (source_changed or config_reloaded or next_hwp_write <= time())
         with hardware_lock:
             mmio_powercap, mchbar_mmio = apply_runtime_profile(
                 config,
@@ -1835,7 +1846,7 @@ def _power_thread(state, exit_event):
                 power_source,
                 mmio_powercap=mmio_powercap,
                 mchbar_mmio=mchbar_mmio,
-                apply_mailbox=source_changed,
+                apply_mailbox=source_changed or config_reloaded,
                 apply_hwp=hwp_due,
             )
         applied_source = power_source
