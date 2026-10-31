@@ -39,12 +39,14 @@ TARGET_CPUIDS = {
 
 MSR = {
     "MSR_PLATFORM_INFO": 0xCE,
+    "MSR_OC_MAILBOX": 0x150,
     "IA32_APERF": 0xE8,
     "IA32_MPERF": 0xE7,
     "IA32_MISC_ENABLE": 0x1A0,
     "IA32_PERF_CTL": 0x199,
     "IA32_PERF_STATUS": 0x198,
     "IA32_CLOCK_MODULATION": 0x19A,
+    "IA32_THERM_STATUS": 0x19C,
     "MSR_TEMPERATURE_TARGET": 0x1A2,
     "MSR_TURBO_RATIO_LIMIT": 0x1AD,
     "MSR_POWER_CTL": 0x1FC,
@@ -89,6 +91,8 @@ MCHBAR_ADDRESS_MASK_42_17 = ((1 << 42) - 1) & ~((1 << 17) - 1)
 # Kept in sync with the current MIT-licensed throttled MCHBAR allow-list.
 MCHBAR_ADDRESS_MASKS_BY_PCI_DEVICE = {
     0x5914: MCHBAR_ADDRESS_MASK_39_15,
+    0x3E34: MCHBAR_ADDRESS_MASK_39_15,  # Whiskey Lake-U 4-core
+    0x3E35: MCHBAR_ADDRESS_MASK_39_15,  # Whiskey Lake-U 2-core
     0x3EC4: MCHBAR_ADDRESS_MASK_39_15,
     0x9B54: MCHBAR_ADDRESS_MASK_39_15,
     0x9B61: MCHBAR_ADDRESS_MASK_39_15,
@@ -374,10 +378,14 @@ def read_host_bridge_identity():
         return None
 
 
-def read_mchbar_dword(register):
+def read_mchbar_dword(register, method=None):
+    """Read one MCHBAR PCI config DWORD, trying an explicit access method when requested."""
+    cmd = ["setpci", "-s", "0000:00:00.0", register]
+    if method:
+        cmd[1:1] = ["-A", method]
     try:
         result = subprocess.run(
-            ["setpci", "-s", "0000:00:00.0", register],
+            cmd,
             check=True,
             capture_output=True,
             text=True,
@@ -394,18 +402,22 @@ def read_mchbar_base(device_id):
     address_mask = MCHBAR_ADDRESS_MASKS_BY_PCI_DEVICE.get(device_id)
     if address_mask is None:
         return None
-    low = read_mchbar_dword("48.l")
-    high = read_mchbar_dword("4c.l")
-    if low is None or high is None:
-        return None
-    value = low | (high << 32)
-    if not value & MCHBAR_ENABLE_BIT:
-        return None
+
     allowed = address_mask | MCHBAR_ENABLE_BIT
-    if value & ~allowed:
-        return None
-    base = value & address_mask
-    return base or None
+    for method in ("ecam", None):
+        low = read_mchbar_dword("48.l", method=method)
+        high = read_mchbar_dword("4c.l", method=method)
+        if low is None or high is None:
+            continue
+        value = low | (high << 32)
+        if not value & MCHBAR_ENABLE_BIT:
+            continue
+        if value & ~allowed:
+            continue
+        base = value & address_mask
+        if base:
+            return base
+    return None
 
 
 def probe_mmio(msr_pkg_raw):
@@ -490,13 +502,57 @@ def collect_snapshot(msr, cpu, dmi):
         value, error = try_read(msr, 0, name)
         snapshot["package_msrs"][name] = {"value": f"0x{value:016x}"} if error is None else {"error": error}
 
-    for logical_cpu in msr.cpus():
+    current_cpus = msr.cpus()
+    for logical_cpu in current_cpus:
         registers = {}
         for name in SNAPSHOT_PER_CPU_REGS:
             value, error = try_read(msr, logical_cpu, name)
             registers[name] = {"value": f"0x{value:016x}"} if error is None else {"error": error}
         snapshot["per_cpu_msrs"][str(logical_cpu)] = registers
+
+    errors = snapshot_completeness_errors(snapshot, current_cpus)
+    snapshot["complete"] = not errors
+    snapshot["errors"] = errors
     return snapshot
+
+
+def snapshot_completeness_errors(snapshot, current_cpus):
+    """Return every missing/unreadable control register in a stock snapshot."""
+    errors = []
+    package_msrs = snapshot.get("package_msrs")
+    if not isinstance(package_msrs, dict):
+        errors.append("package_msrs is missing or is not an object")
+    else:
+        for name in SNAPSHOT_PACKAGE_REGS:
+            item = package_msrs.get(name)
+            if not isinstance(item, dict):
+                errors.append(f"package {name}: missing entry")
+            elif "value" not in item:
+                errors.append(f"package {name}: {item.get('error', 'missing value')}")
+
+    per_cpu = snapshot.get("per_cpu_msrs")
+    if not isinstance(per_cpu, dict):
+        errors.append("per_cpu_msrs is missing or is not an object")
+        return errors
+
+    for cpu in current_cpus:
+        registers = per_cpu.get(str(cpu))
+        if not isinstance(registers, dict):
+            errors.append(f"cpu{cpu}: missing register object")
+            continue
+        for name in SNAPSHOT_PER_CPU_REGS:
+            item = registers.get(name)
+            if not isinstance(item, dict):
+                errors.append(f"cpu{cpu} {name}: missing entry")
+            elif "value" not in item:
+                errors.append(f"cpu{cpu} {name}: {item.get('error', 'missing value')}")
+    return errors
+
+
+def validate_snapshot_completeness(snapshot, current_cpus):
+    errors = snapshot_completeness_errors(snapshot, current_cpus)
+    if errors:
+        raise ProbeError("snapshot is incomplete: " + "; ".join(errors))
 
 
 def validate_snapshot_schema(snapshot, current_cpus):
@@ -541,7 +597,9 @@ def validate_snapshot_identity(snapshot, cpu, dmi=None):
     if dmi is not None:
         saved_product = (snapshot.get("dmi") or {}).get("product")
         current_product = dmi.get("product")
-        if saved_product and current_product and saved_product != current_product:
+        if not saved_product or not current_product:
+            raise ProbeError("snapshot/current DMI product is missing; refusing restore")
+        if saved_product != current_product:
             raise ProbeError(
                 f"snapshot DMI product {saved_product!r} does not match current product {current_product!r}"
             )
@@ -558,22 +616,21 @@ def _snapshot_hex_value(item, register):
 
 
 def build_restore_plan(snapshot, current_cpus):
+    validate_snapshot_completeness(snapshot, current_cpus)
     plan = []
     for name in SNAPSHOT_PACKAGE_REGS:
-        item = snapshot.get("package_msrs", {}).get(name, {})
-        if "value" in item:
-            value = _snapshot_hex_value(item, name)
-            # 830 G6 is a single-package target. Package-scoped state is
-            # snapshotted from CPU0 and restored through CPU0 only.
-            plan.append((0, name, value))
+        item = snapshot["package_msrs"][name]
+        value = _snapshot_hex_value(item, name)
+        # 830 G6 is a single-package target. Package-scoped state is
+        # snapshotted from CPU0 and restored through CPU0 only.
+        plan.append((0, name, value))
 
-    saved_per_cpu = snapshot.get("per_cpu_msrs", {})
+    saved_per_cpu = snapshot["per_cpu_msrs"]
     for cpu in current_cpus:
-        registers = saved_per_cpu.get(str(cpu), {})
+        registers = saved_per_cpu[str(cpu)]
         for name in SNAPSHOT_PER_CPU_REGS:
-            item = registers.get(name, {})
-            if "value" in item:
-                plan.append((cpu, name, _snapshot_hex_value(item, name)))
+            item = registers[name]
+            plan.append((cpu, name, _snapshot_hex_value(item, name)))
     return plan
 
 
@@ -696,6 +753,18 @@ def probe_machine(msr):
         hwp["per_cpu"][str(logical_cpu)] = (
             {"error": error} if error else {"raw": request_raw, **decode_hwp_request(request_raw)}
         )
+
+    package_control = any(
+        data.get("package_control", False)
+        for data in hwp["per_cpu"].values()
+        if isinstance(data, dict)
+    )
+    hwp["package_control_active"] = package_control
+    if package_control:
+        pkg_request_raw, pkg_request_error = try_read(msr, 0, "IA32_HWP_REQUEST_PKG")
+        hwp["package_request_error"] = pkg_request_error
+        if pkg_request_error is None:
+            hwp["package_request"] = {"raw": pkg_request_raw, **decode_hwp_request(pkg_request_raw)}
     report["hwp"] = hwp
 
     temp_raw, temp_error = try_read(msr, 0, "MSR_TEMPERATURE_TARGET")
@@ -810,7 +879,21 @@ def format_report(report):
         for cpu_id, data in hwp["per_cpu"].items()
         if "epp" in data
     ]
-    lines.append("  EPP: " + (", ".join(epps) if epps else "unavailable"))
+    lines.append("  Per-CPU EPP: " + (", ".join(epps) if epps else "unavailable"))
+    if hwp.get("package_control_active"):
+        package_request = hwp.get("package_request")
+        if package_request is not None:
+            lines.append(
+                f"  Package control: active; effective package EPP={package_request['epp']} "
+                "(per-CPU EPP may be overridden)"
+            )
+        else:
+            lines.append(
+                "  Package control: active; package request unavailable "
+                f"({hwp.get('package_request_error') or 'unknown error'})"
+            )
+    else:
+        lines.append("  Package control: inactive")
 
     power = report["power"]
     lines.append("")
@@ -934,6 +1017,7 @@ def _main(argv=None):
         current_cpus = msr.cpus()
         validate_snapshot_schema(snapshot, current_cpus)
         validate_snapshot_identity(snapshot, cpu, dmi)
+        validate_snapshot_completeness(snapshot, current_cpus)
         plan = build_restore_plan(snapshot, current_cpus)
         print(f"Restore plan: {len(plan)} WRMSR operations")
         for logical_cpu, name, value in plan:
@@ -956,7 +1040,13 @@ def _main(argv=None):
             path.write_text(json.dumps(snapshot, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         except OSError as exc:
             raise ProbeError(f"unable to write snapshot {str(path)!r}: {exc}") from exc
-        print(f"Snapshot written to {path}")
+        if snapshot["complete"]:
+            print(f"Snapshot written to {path} (complete)")
+        else:
+            print(f"Snapshot written to {path} but is NOT restorable:", file=sys.stderr)
+            for error in snapshot["errors"]:
+                print(f"  - {error}", file=sys.stderr)
+            return 2
     return 0
 
 
