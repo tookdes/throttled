@@ -998,6 +998,7 @@ def open_validated_ctl_mchbar(expected_msr):
     base = result.get("base")
     if not isinstance(base, int):
         return None
+    mapping = None
     try:
         mapping = MMIO(
             base + MCHBAR_PACKAGE_POWER_LIMIT_OFFSET,
@@ -1005,6 +1006,8 @@ def open_validated_ctl_mchbar(expected_msr):
         )
         current = mapping.read64(0)
     except (MMIOError, OSError) as exc:
+        if mapping is not None:
+            mapping.close()
         raise ControlError(f"unable to open validated direct MCHBAR: {exc}") from exc
     if current != expected_msr:
         mapping.close()
@@ -1098,9 +1101,10 @@ def command_power(args, msr):
                 )
     except (ControlError, ProbeError, PowercapError, MMIOError, OSError) as exc:
         rollback_errors = []
-        if direct_changed and direct_mapping is not None and direct_before is not None:
+        if direct_mapping is not None and direct_before is not None:
             try:
-                direct_mapping.write64(0, direct_before)
+                if direct_mapping.read64(0) != direct_before:
+                    direct_mapping.write64(0, direct_before)
                 if direct_mapping.read64(0) != direct_before:
                     rollback_errors.append("direct MCHBAR verify mismatch")
             except (MMIOError, OSError) as rollback_exc:
