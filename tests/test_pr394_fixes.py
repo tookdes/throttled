@@ -203,6 +203,16 @@ class PR394FixTests(unittest.TestCase):
             with mock.patch.object(throttled, 'check_output', side_effect=lambda cmd, stderr: values[cmd[-1]]):
                 self.assertEqual(throttled.read_mchbar_base(), 0xFED10000)
 
+    def test_mchbar_reader_accepts_whiskey_lake_32k_host_bridges(self):
+        throttled = load_throttled()
+        for device_id in (0x3E34, 0x3E35):
+            with self.subTest(device_id=device_id):
+                with mock.patch.object(
+                    throttled, '_read_host_bridge_identity', return_value=(0x8086, device_id)
+                ):
+                    with mock.patch.object(throttled, '_read_mchbar_dword', side_effect=(0xFED10001, 0)):
+                        self.assertEqual(throttled.read_mchbar_base(), 0xFED10000)
+
     def test_mchbar_reader_accepts_a_low_nonzero_32k_bar(self):
         throttled = load_throttled()
 
