@@ -1536,13 +1536,19 @@ def _power_thread(state, exit_event):
         if 'MSR_TEMPERATURE_TARGET' in regs[power_source]:
             write_value = regs[power_source]['MSR_TEMPERATURE_TARGET']
             current = readmsr('MSR_TEMPERATURE_TARGET', cpu=0)
-            offset_mask = 0x3F << 24
-            new_value = (current & ~offset_mask) | (write_value & offset_mask)
-            writemsr('MSR_TEMPERATURE_TARGET', new_value)
-            if args.debug:
-                read_value = readmsr('MSR_TEMPERATURE_TARGET', 24, 29, flatten=True)
-                match = OK if (write_value >> 24) == read_value else ERR
-                log(f'[D] TEMPERATURE_TARGET - write {write_value >> 24:#x} - read {read_value:#x} - match {match}')
+            if (current >> 31) & 1:
+                warning('MSR_TEMPERATURE_TARGET TCC offset is locked; temperature-target write skipped.')
+            else:
+                offset_mask = 0x3F << 24
+                new_value = (current & ~offset_mask) | (write_value & offset_mask)
+                writemsr('MSR_TEMPERATURE_TARGET', new_value)
+                if args.debug:
+                    read_value = readmsr('MSR_TEMPERATURE_TARGET', 24, 29, flatten=True)
+                    match = OK if (write_value >> 24) == read_value else ERR
+                    log(
+                        f'[D] TEMPERATURE_TARGET - write {write_value >> 24:#x} '
+                        f'- read {read_value:#x} - match {match}'
+                    )
 
         # set cTDP target bits without touching the lock/reserved fields
         if 'MSR_CONFIG_TDP_CONTROL' in regs[power_source]:
