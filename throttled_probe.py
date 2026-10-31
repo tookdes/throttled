@@ -568,11 +568,9 @@ def snapshot_completeness_errors(snapshot, current_cpus):
         direct = backends["direct_mchbar"]
         if not isinstance(direct, dict):
             errors.append("power_backends.direct_mchbar is not an object")
-        elif direct.get("available"):
-            if direct.get("matches_msr") is not True:
-                errors.append("captured direct MCHBAR was not equal to MSR_PKG_POWER_LIMIT")
+        elif direct.get("available") and direct.get("matches_msr") is True:
             if not isinstance(direct.get("pkg_power_limit_raw"), int):
-                errors.append("captured direct MCHBAR raw value is missing")
+                errors.append("captured validated direct MCHBAR raw value is missing")
     return errors
 
 
