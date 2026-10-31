@@ -133,6 +133,7 @@ class PowercapZone:
             "pl2": {"power": pl2_w, "time": tau2_s},
         }
         touched = []
+        targets = []
         try:
             for role, values in requested.items():
                 paths = self._constraint_paths(role)
@@ -153,6 +154,7 @@ class PowercapZone:
                         raise PowercapError(f"{role.upper()} {target} uW is below kernel minimum {minimum} uW")
                     if maximum is not None and target > maximum:
                         raise PowercapError(f"{role.upper()} {target} uW is above kernel maximum {maximum} uW")
+                    targets.append((paths["power"], target))
                     if target != before:
                         touched.append((paths["power"], before))
                         self._write_int(paths["power"], target)
@@ -169,9 +171,17 @@ class PowercapZone:
                         raise PowercapError(f"{role.upper()} {target} us is below kernel minimum {minimum} us")
                     if maximum is not None and target > maximum:
                         raise PowercapError(f"{role.upper()} {target} us is above kernel maximum {maximum} us")
+                    targets.append((paths["time"], target))
                     if target != before:
                         touched.append((paths["time"], before))
                         self._write_int(paths["time"], target)
+
+            for path, target in targets:
+                readback = _read_int(path)
+                if readback != target:
+                    raise PowercapError(
+                        f"powercap verify failed for {path}: wrote {target}, read {readback}"
+                    )
         except PowercapError as exc:
             rollback_errors = []
             for path, original in reversed(touched):
