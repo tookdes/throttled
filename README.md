@@ -230,8 +230,16 @@ sudo python3 throttled_probe.py --restore-snapshot /root/830g6-stock.json
 sudo python3 throttled_probe.py --restore-snapshot /root/830g6-stock.json --apply-restore
 ```
 
+The apply step refuses to write while a throttled daemon is active (shared
+flock plus systemd check). `--allow-daemon-race` exists only as an explicit
+unsafe override for controlled experiments.
+
 The apply step always attempts the transactional managed-MSR recovery first,
-then restores captured kernel MMIO and direct MCHBAR backends independently.
+then verifies package-scoped managed MSR views from all online CPUs. A
+cross-CPU package-view mismatch rolls the entire MSR restore back to its
+pre-restore state and skips powercap/direct-MCHBAR recovery. Only after that
+check passes are captured kernel MMIO and direct MCHBAR backends restored
+independently.
 Unlike live TPL writes, recovery deliberately does **not** require the current
 MCHBAR value to equal the current MSR value: repairing that split-brain state
 is the purpose of restore. If a captured backend is unavailable, the command
