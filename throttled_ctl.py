@@ -220,6 +220,8 @@ def update_perf_target_ratio(raw, ratio):
 
 
 def update_temperature_target(raw, target_c):
+    if bit(raw, 31):
+        raise ControlError("MSR_TEMPERATURE_TARGET TCC offset is locked (bit 31)")
     tjmax = (raw >> 16) & 0xFF
     if not tjmax:
         raise ControlError("MSR_TEMPERATURE_TARGET does not expose a valid TjMax")
