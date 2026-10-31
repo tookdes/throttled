@@ -374,6 +374,7 @@ class PR394FixTests(unittest.TestCase):
         config = make_config()
         state = {'config': config, 'regs': {'AC': {'MSR_PKG_POWER_LIMIT': 0x1234}, 'BATTERY': {}}}
         mapping = mock.Mock()
+        mapping.read64.return_value = 0
 
         with mock.patch.object(throttled, 'read_mchbar_base', return_value=0xFED10000):
             with mock.patch.object(throttled, 'MMIO', return_value=mapping) as mmio:
@@ -388,6 +389,7 @@ class PR394FixTests(unittest.TestCase):
         config = make_config()
         state = {'config': config, 'regs': {'AC': {'MSR_PKG_POWER_LIMIT': 0x1234}, 'BATTERY': {}}}
         mapping = mock.Mock()
+        mapping.read64.return_value = 0
         mapping.write64.side_effect = throttled.MMIOError('blocked')
 
         with mock.patch.object(throttled, 'read_mchbar_base', return_value=0xFED10000):
