@@ -1454,6 +1454,25 @@ def read_mchbar_base():
     return None
 
 
+def open_mchbar_power_limit_mmio():
+    """Open the validated direct MCHBAR package-power mirror, or return None."""
+    mchbar_base = read_mchbar_base()
+    if mchbar_base is None:
+        return None
+    try:
+        return MMIO(
+            mchbar_base + MCHBAR_PACKAGE_POWER_LIMIT_OFFSET,
+            MCHBAR_PACKAGE_POWER_LIMIT_SIZE,
+        )
+    except MMIOError:
+        warning('Unable to open /dev/mem. MMIO package power-limit writes are disabled.')
+        warning(
+            'Check CONFIG_DEVMEM=y and that kernel lockdown is disabled '
+            '(CONFIG_IO_STRICT_DEVMEM can also block this region).'
+        )
+        return None
+
+
 def power_thread(state, exit_event):
     """Crash-loud wrapper for _power_thread: an uncaught exception (or a
     sys.exit() from a helper) would only kill this thread, leaving a zombie
@@ -1476,19 +1495,7 @@ def _power_thread(state, exit_event):
     if mmio_powercap is not None:
         log(f'[I] Using kernel intel-rapl-mmio zone: {mmio_powercap.path}')
     else:
-        mchbar_base = read_mchbar_base()
-        if mchbar_base is not None:
-            try:
-                mchbar_mmio = MMIO(
-                    mchbar_base + MCHBAR_PACKAGE_POWER_LIMIT_OFFSET,
-                    MCHBAR_PACKAGE_POWER_LIMIT_SIZE,
-                )
-            except MMIOError:
-                warning('Unable to open /dev/mem. MMIO package power-limit writes are disabled.')
-                warning(
-                    'Check CONFIG_DEVMEM=y and that kernel lockdown is disabled '
-                    '(CONFIG_IO_STRICT_DEVMEM can also block this region).'
-                )
+        mchbar_mmio = open_mchbar_power_limit_mmio()
 
     next_hwp_write = 0
     applied_source = power['source']
@@ -1592,10 +1599,16 @@ def _power_thread(state, exit_event):
                         tau2_s=decode_time_window_field(tw2),
                     )
                 except PowercapError as e:
-                    warning(f'Unable to write intel-rapl-mmio power limits ({e}); disabling kernel MMIO writes.')
+                    warning(
+                        f'Unable to write intel-rapl-mmio power limits ({e}); '
+                        'falling back to validated direct MCHBAR if available.'
+                    )
                     mmio_powercap = None
-            elif mchbar_mmio is not None:
-                # Fallback for kernels that do not expose intel-rapl-mmio.
+                    if mchbar_mmio is None:
+                        mchbar_mmio = open_mchbar_power_limit_mmio()
+
+            if mmio_powercap is None and mchbar_mmio is not None:
+                # Fallback for kernels that do not expose a usable intel-rapl-mmio zone.
                 try:
                     mmio_current = mchbar_mmio.read64(0)
                     if (mmio_current >> PKG_POWER_LIMIT_LOCK_BIT) & 1:
