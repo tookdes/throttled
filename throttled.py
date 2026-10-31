@@ -186,7 +186,7 @@ supported_cpus = {
     (6, 142, 9): 'KabyLake',
     (6, 142, 10): 'KabyLake',
     (6, 142, 11): 'WhiskeyLake',
-    (6, 142, 12): 'CometLake-U',
+    (6, 142, 12): 'WhiskeyLake',
     (6, 151, 2): 'AlderLake-S/HX',
     (6, 151, 5): 'AlderLake-S',
     (6, 154, 3): 'AlderLake-P/H',
