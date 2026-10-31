@@ -1,9 +1,12 @@
 import configparser
+import tempfile
 import importlib.util
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
+
+import throttled_ctl as ctl
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -60,6 +63,42 @@ class OcMailboxTests(unittest.TestCase):
 
         get_uv.assert_not_called()
         get_icc.assert_not_called()
+
+    def test_daemon_recovery_file_is_consumable_by_throttlectl(self):
+        throttled = load_throttled()
+        cpu = {
+            "vendor_id": "GenuineIntel",
+            "family": 6,
+            "model": 142,
+            "stepping": 12,
+        }
+        dmi = {"product": throttled.TARGET_DMI_PRODUCT}
+        values = {
+            "CORE": -50,
+            "GPU": 0,
+            "CACHE": -40,
+            "UNCORE": 0,
+            "ANALOGIO": 0,
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(throttled, "OC_BACKUP_DIR", tmp):
+                with mock.patch.object(throttled, "probe_read_cpuinfo", return_value=cpu):
+                    with mock.patch.object(throttled, "probe_read_dmi", return_value=dmi):
+                        path = throttled.write_daemon_oc_recovery("fivr", values)
+
+            identity = {
+                "target": throttled.TARGET_DMI_PRODUCT,
+                "dmi_product": throttled.TARGET_DMI_PRODUCT,
+                "cpu": cpu,
+            }
+            with mock.patch.object(ctl, "_current_machine_identity", return_value=identity):
+                loaded = ctl.load_oc_recovery(path, "fivr")
+
+        self.assertEqual(
+            loaded,
+            {name.lower(): value for name, value in values.items()},
+        )
 
     def test_execute_waits_for_ready_and_checks_completion_status(self):
         throttled = load_throttled()
