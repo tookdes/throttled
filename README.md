@@ -184,9 +184,11 @@ sudo throttlectl fivr set --core -80 --cache -80
 sudo throttlectl iccmax read
 ```
 
-FIVR/IccMax `set` automatically writes a root-only recovery JSON under
-`/var/lib/throttled/oc-backups/` before the first mailbox change. Recovery is
-explicit:
+FIVR/IccMax changes made by either `throttlectl` or an explicitly configured
+daemon profile write a root-only recovery JSON under
+`/var/lib/throttled/oc-backups/` before the first mailbox change. A
+multi-plane daemon failure rolls already changed planes back in reverse order;
+the persistent file remains available for manual recovery:
 
 ```sh
 sudo throttlectl fivr restore /var/lib/throttled/oc-backups/fivr-....json
