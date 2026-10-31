@@ -290,6 +290,7 @@ class PR394FixTests(unittest.TestCase):
         config = make_config()
         state = {'config': config, 'regs': {'AC': {'MSR_PKG_POWER_LIMIT': 0x1234}, 'BATTERY': {}}}
         mapping = mock.Mock()
+        mapping.read64.return_value = 0
 
         with mock.patch.object(throttled, '_read_host_bridge_identity', return_value=(0x8086, 0x5914)):
             with mock.patch.object(throttled, '_read_mchbar_dword', side_effect=(0xFED10001, 0)):
