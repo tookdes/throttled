@@ -102,6 +102,71 @@ class OcMailboxTests(unittest.TestCase):
                 throttled.undervolt(config, source="AC")
         execute.assert_not_called()
 
+    def test_daemon_undervolt_rolls_back_all_changed_planes_after_partial_failure(self):
+        throttled = load_throttled()
+        config = configparser.ConfigParser()
+        config.read_dict({"UNDERVOLT.AC": {"CORE": "-50", "CACHE": "-40"}})
+        state = {plane: 0 for plane in throttled.VOLTAGE_PLANES}
+        id_to_plane = {value: key for key, value in throttled.VOLTAGE_PLANES.items()}
+        cache_target = throttled.calc_undervolt_msr("CACHE", -40) & 0xFFE00000
+
+        def get_uv(plane=None, convert=False):
+            return {plane: state[plane]}
+
+        def execute(command):
+            plane = id_to_plane[(command >> 40) & 0xFF]
+            field = command & 0xFFE00000
+            # Simulate a command that reports success but fails to take effect.
+            if plane == "CACHE" and field == cache_target:
+                return command
+            state[plane] = field
+            return command
+
+        with mock.patch.object(throttled, "get_undervolt", side_effect=get_uv):
+            with mock.patch.object(throttled, "execute_oc_mailbox", side_effect=execute):
+                with mock.patch.object(
+                    throttled,
+                    "write_daemon_oc_recovery",
+                    return_value="/var/lib/throttled/oc-backups/fivr-test.json",
+                ) as backup:
+                    with self.assertRaises(throttled.OCMailboxError):
+                        throttled.undervolt(config, source="AC")
+
+        backup.assert_called_once()
+        self.assertTrue(all(value == 0 for value in state.values()))
+
+    def test_daemon_iccmax_rolls_back_all_changed_planes_after_partial_failure(self):
+        throttled = load_throttled()
+        config = configparser.ConfigParser()
+        config.read_dict({"ICCMAX.AC": {"CORE": "100", "CACHE": "90"}})
+        state = {plane: 40 for plane in throttled.CURRENT_PLANES}
+        id_to_plane = {value: key for key, value in throttled.CURRENT_PLANES.items()}
+        cache_target = throttled.calc_icc_max_msr("CACHE", 90) & throttled.ICCMAX_MAX_FIELD
+
+        def get_icc(plane=None, convert=False):
+            return {plane: state[plane]}
+
+        def execute(command):
+            plane = id_to_plane[(command >> 40) & 0xFF]
+            field = command & throttled.ICCMAX_MAX_FIELD
+            if plane == "CACHE" and field == cache_target:
+                return command
+            state[plane] = field
+            return command
+
+        with mock.patch.object(throttled, "get_icc_max", side_effect=get_icc):
+            with mock.patch.object(throttled, "execute_oc_mailbox", side_effect=execute):
+                with mock.patch.object(
+                    throttled,
+                    "write_daemon_oc_recovery",
+                    return_value="/var/lib/throttled/oc-backups/iccmax-test.json",
+                ) as backup:
+                    with self.assertRaises(throttled.OCMailboxError):
+                        throttled.set_icc_max(config, source="AC")
+
+        backup.assert_called_once()
+        self.assertEqual(state, {plane: 40 for plane in throttled.CURRENT_PLANES})
+
     def test_undervolt_verifies_readback_even_without_debug(self):
         throttled = load_throttled()
         config = configparser.ConfigParser()
