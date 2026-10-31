@@ -146,6 +146,16 @@ def nonnegative_int(value):
     return parsed
 
 
+def parse_temperature(value):
+    try:
+        parsed = int(value, 0)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("temperature must be an integer in Celsius") from exc
+    if not 1 <= parsed <= 125:
+        raise argparse.ArgumentTypeError("temperature must be in the range 1..125 C")
+    return parsed
+
+
 def set_bit(value, number, enabled):
     if enabled:
         return value | (1 << number)
@@ -206,6 +216,18 @@ def update_perf_target_ratio(raw, ratio):
     if not 1 <= ratio <= 0xFF:
         raise ControlError(f"multiplier ratio must be in the range 1..255, got {ratio}")
     return replace_field(raw, PERF_TARGET_RATIO_MASK, PERF_TARGET_RATIO_SHIFT, ratio)
+
+
+def update_temperature_target(raw, target_c):
+    tjmax = (raw >> 16) & 0xFF
+    if not tjmax:
+        raise ControlError("MSR_TEMPERATURE_TARGET does not expose a valid TjMax")
+    offset = tjmax - target_c
+    if not 0 <= offset <= 0x3F:
+        raise ControlError(
+            f"target {target_c} C cannot be represented: TjMax={tjmax} C requires offset {offset}"
+        )
+    return replace_field(raw, 0x3F << 24, 24, offset)
 
 
 def counter_delta(before, after, width=64):
@@ -507,6 +529,21 @@ def command_clock_mod(args, msr):
         writes.append((cpu, "IA32_CLOCK_MODULATION", force_clock_modulation_full(raw)))
     apply_transaction(msr, writes)
     print("On-demand clock modulation disabled (100% duty cycle) and verified.")
+    return 0
+
+
+def command_temp_target(args, msr):
+    validate_write_environment(args)
+    platform = msr.read(0, "MSR_PLATFORM_INFO")
+    if not bit(platform, 30):
+        raise ControlError("MSR_PLATFORM_INFO reports programmable temperature target is unavailable")
+
+    writes = []
+    for cpu in msr.cpus():
+        raw = msr.read(cpu, "MSR_TEMPERATURE_TARGET")
+        writes.append((cpu, "MSR_TEMPERATURE_TARGET", update_temperature_target(raw, args.celsius)))
+    apply_transaction(msr, writes)
+    print(f"Temperature target set to {args.celsius} C and verified.")
     return 0
 
 
@@ -855,6 +892,10 @@ def build_parser():
     bd = sub.add_parser("bd-prochot", help="enable or disable bidirectional PROCHOT")
     bd.add_argument("state", type=parse_on_off, metavar="on|off")
     bd.set_defaults(handler=command_bd_prochot)
+
+    temp_target = sub.add_parser("temp-target", help="set programmable TCC/PROCHOT temperature target")
+    temp_target.add_argument("celsius", type=parse_temperature, metavar="C")
+    temp_target.set_defaults(handler=command_temp_target)
 
     multiplier = sub.add_parser("multiplier", help="set IA32_PERF_CTL target multiplier")
     multiplier.add_argument("ratio", type=parse_ratio, metavar="RATIO")
