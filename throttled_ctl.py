@@ -16,6 +16,7 @@ the daemon's existing validated PCI allow-list.
 """
 
 import argparse
+import fcntl
 import json
 import math
 import os
@@ -70,6 +71,7 @@ OC_MAILBOX_TIMEOUT_S = 0.01
 OC_MAILBOX_POLL_S = 0.00001
 OC_BACKUP_DIR = Path("/var/lib/throttled/oc-backups")
 OC_BACKUP_SCHEMA_VERSION = 1
+DAEMON_LOCK_PATH = Path("/run/throttled/daemon.lock")
 
 PKG_PL1_POWER_MASK = 0x7FFF
 PKG_PL1_ENABLE_BIT = 15
@@ -486,7 +488,26 @@ def load_oc_recovery(path, kind):
     return values
 
 
+def daemon_lock_active():
+    """Detect any daemon instance holding the shared flock, including manual runs."""
+    try:
+        handle = DAEMON_LOCK_PATH.open("a+", encoding="ascii")
+    except OSError:
+        return False
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return False
+    finally:
+        handle.close()
+
+
 def daemon_is_active():
+    if daemon_lock_active():
+        return True
     try:
         result = subprocess.run(
             ["systemctl", "is-active", "--quiet", "throttled.service"],
