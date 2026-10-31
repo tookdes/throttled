@@ -42,6 +42,18 @@ class CLITests(unittest.TestCase):
         self.assertEqual(exit_context.exception.code, 0)
         self.assertTrue(output.getvalue().strip().endswith(f' {throttled.__version__}'))
 
+    def test_probe_is_a_top_level_mode(self):
+        throttled = load_throttled()
+        parser = throttled.build_arg_parser()
+
+        parsed = parser.parse_args(['--probe'])
+        self.assertTrue(parsed.probe)
+
+        with redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as exit_context:
+                parser.parse_args(['--probe', '--monitor'])
+        self.assertEqual(exit_context.exception.code, 2)
+
     def test_monitor_interval_must_be_finite_and_positive(self):
         throttled = load_throttled()
         parser = throttled.build_arg_parser()
