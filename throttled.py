@@ -68,6 +68,7 @@ HWP_DEFAULT_VALUE = 0x80
 HWP_INTERVAL = 60
 TURBO_DISABLE_BIT = 38
 BD_PROCHOT_ENABLE_BIT = 0
+BD_PROCHOT_LOCK_BIT = 23
 UNDERVOLT_TICKS_PER_MV = 1.024
 UNDERVOLT_MIN_TICKS = -(1 << 10)
 UNDERVOLT_MAX_TICKS = 0
@@ -1432,6 +1433,10 @@ def set_bdprochot(enabled):
     for addr in _ensure_msr_module():
         cpu = int(os.path.basename(os.path.dirname(addr)))
         cur_val = readmsr('MSR_POWER_CTL', cpu=cpu)
+        current_enabled = bool((cur_val >> BD_PROCHOT_ENABLE_BIT) & 1)
+        if ((cur_val >> BD_PROCHOT_LOCK_BIT) & 1) and current_enabled != enabled:
+            warning(f'BD PROCHOT is locked on CPU {cpu:d}; requested state change skipped.')
+            continue
         if enabled:
             new_val = cur_val | (1 << BD_PROCHOT_ENABLE_BIT)
         else:
@@ -1554,24 +1559,34 @@ def read_mchbar_base():
 
 
 def open_mchbar_power_limit_mmio(expected_msr=None):
-    """Open the allow-listed MCHBAR package-power mirror after a read-only equality gate."""
+    """Open direct MCHBAR for writes only after a true read-only MMIO==MSR preflight."""
+    if expected_msr is None:
+        warning('Direct MCHBAR requires an MSR equality preflight; write mapping not opened.')
+        return None
     mchbar_base = read_mchbar_base()
     if mchbar_base is None:
         return None
+    address = mchbar_base + MCHBAR_PACKAGE_POWER_LIMIT_OFFSET
     try:
-        mapping = MMIO(
-            mchbar_base + MCHBAR_PACKAGE_POWER_LIMIT_OFFSET,
-            MCHBAR_PACKAGE_POWER_LIMIT_SIZE,
-        )
-        if expected_msr is not None:
-            mmio_raw = mapping.read64(0)
-            if mmio_raw != expected_msr:
-                warning(
-                    f'Direct MCHBAR preflight mismatch: MMIO={mmio_raw:#x}, MSR={expected_msr:#x}; '
-                    'direct MCHBAR writes are disabled for this run.'
-                )
-                mapping.close()
-                return None
+        with MMIO(address, MCHBAR_PACKAGE_POWER_LIMIT_SIZE, readonly=True) as probe_mapping:
+            mmio_raw = probe_mapping.read64(0)
+        if mmio_raw != expected_msr:
+            warning(
+                f'Direct MCHBAR preflight mismatch: MMIO={mmio_raw:#x}, MSR={expected_msr:#x}; '
+                'direct MCHBAR writes are disabled for this run.'
+            )
+            return None
+
+        mapping = MMIO(address, MCHBAR_PACKAGE_POWER_LIMIT_SIZE)
+        # Re-check after reopening RW to close the TOCTOU window before callers write.
+        rw_raw = mapping.read64(0)
+        if rw_raw != expected_msr:
+            warning(
+                f'Direct MCHBAR changed after read-only preflight: MMIO={rw_raw:#x}, '
+                f'MSR={expected_msr:#x}; direct writes are disabled.'
+            )
+            mapping.close()
+            return None
         return mapping
     except (MMIOError, OSError) as e:
         warning(f'Unable to open/read /dev/mem MCHBAR ({e}); direct MMIO writes are disabled.')
