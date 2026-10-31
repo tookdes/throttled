@@ -5,6 +5,7 @@ import configparser
 import fcntl
 import glob
 import gzip
+import json
 import math
 import os
 import re
@@ -22,6 +23,7 @@ from time import monotonic, sleep, time
 
 from mmio import MMIO, MMIOError
 from throttled_powercap import PowercapError, find_mmio_package_zone
+from throttled_probe import TARGET_DMI_PRODUCT, read_cpuinfo as probe_read_cpuinfo, read_dmi as probe_read_dmi
 from throttled_mchbar import (
     MCHBAR_ADDRESS_MASKS_BY_PCI_DEVICE,
     MCHBAR_ENABLE_BIT,
@@ -90,6 +92,8 @@ OC_MAILBOX_STATUS_SHIFT = 32
 OC_MAILBOX_STATUS_MASK = 0xFF
 OC_MAILBOX_TIMEOUT_S = 0.05
 OC_MAILBOX_POLL_S = 0.00001
+OC_BACKUP_DIR = '/var/lib/throttled/oc-backups'
+OC_BACKUP_SCHEMA_VERSION = 1
 PCI_HOST_BRIDGE_SYSFS_PATH = '/sys/bus/pci/devices/0000:00:00.0'
 PCI_VENDOR_ID_INTEL = 0x8086
 
@@ -648,12 +652,15 @@ def calc_undervolt_msr(plane, offset):
     return 0x8000001100000000 | (VOLTAGE_PLANES[plane] << 40) | encoded_offset
 
 
+def calc_undervolt_ticks(msr_value):
+    """Return the signed 11-bit OC-mailbox voltage-offset field."""
+    offset = (msr_value & 0xFFE00000) >> 21
+    return offset if offset < 0x400 else offset - 0x800
+
+
 def calc_undervolt_mv(msr_value):
     """Return the offset voltage (in mV) from the given raw MSR 150h value."""
-    offset = (msr_value & 0xFFE00000) >> 21
-    # 11-bit two's complement: values >= 0x400 are negative
-    offset = offset if offset < 0x400 else -(0x800 - offset)
-    return int(round(offset / UNDERVOLT_TICKS_PER_MV))
+    return int(round(calc_undervolt_ticks(msr_value) / UNDERVOLT_TICKS_PER_MV))
 
 
 class OCMailboxError(OSError):
@@ -682,6 +689,82 @@ def execute_oc_mailbox(command):
     return result
 
 
+def write_daemon_oc_recovery(kind, values):
+    """Persist pre-write OC state in the same schema consumed by throttlectl restore."""
+    try:
+        cpu = probe_read_cpuinfo()
+        dmi = probe_read_dmi()
+        payload = {
+            'schema_version': OC_BACKUP_SCHEMA_VERSION,
+            'target': TARGET_DMI_PRODUCT,
+            'dmi_product': dmi.get('product'),
+            'cpu': {
+                'vendor_id': cpu['vendor_id'],
+                'family': cpu['family'],
+                'model': cpu['model'],
+                'stepping': cpu['stepping'],
+            },
+            'kind': kind,
+            'values': {str(name).lower(): int(value) for name, value in values.items()},
+            'source': 'daemon',
+        }
+        os.makedirs(OC_BACKUP_DIR, mode=0o700, exist_ok=True)
+        os.chmod(OC_BACKUP_DIR, 0o700)
+        stamp = datetime.utcnow().strftime('%Y%m%dT%H%M%S%fZ')
+        path = os.path.join(OC_BACKUP_DIR, f'{kind}-{stamp}-{os.getpid():d}.json')
+        with open(path, 'x', encoding='utf-8') as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write('\n')
+        os.chmod(path, 0o600)
+        return path
+    except (OSError, KeyError, TypeError, ValueError) as exc:
+        raise OCMailboxError(
+            f'refusing {kind} update because the recovery backup could not be created: {exc}'
+        ) from exc
+
+
+def _rollback_undervolt_planes(planes, original):
+    errors = []
+    for plane in reversed(planes):
+        try:
+            current = get_undervolt(plane)[plane]
+            original_field = original[plane] & 0xFFE00000
+            if (current & 0xFFE00000) != original_field:
+                restore = (
+                    0x8000001100000000
+                    | (VOLTAGE_PLANES[plane] << 40)
+                    | original_field
+                )
+                execute_oc_mailbox(restore)
+            verify = get_undervolt(plane)[plane]
+            if (verify & 0xFFE00000) != original_field:
+                errors.append(f'{plane}: verify mismatch')
+        except (OSError, OCMailboxError) as exc:
+            errors.append(f'{plane}: {exc}')
+    return errors
+
+
+def _rollback_iccmax_planes(planes, original):
+    errors = []
+    for plane in reversed(planes):
+        try:
+            current = get_icc_max(plane)[plane]
+            original_field = original[plane] & ICCMAX_MAX_FIELD
+            if current != original_field:
+                restore = (
+                    0x8000001700000000
+                    | (CURRENT_PLANES[plane] << 40)
+                    | original_field
+                )
+                execute_oc_mailbox(restore)
+            verify = get_icc_max(plane)[plane]
+            if verify != original_field:
+                errors.append(f'{plane}: verify mismatch')
+        except (OSError, OCMailboxError) as exc:
+            errors.append(f'{plane}: {exc}')
+    return errors
+
+
 def get_undervolt(plane=None, convert=False):
     """Read current voltage offsets using the package OC mailbox protocol."""
     if 'UNDERVOLT' in UNSUPPORTED_FEATURES:
@@ -697,33 +780,64 @@ def get_undervolt(plane=None, convert=False):
 
 
 def undervolt(config, source=None):
-    """Apply undervolt offsets through one verified package-mailbox transaction per plane."""
+    """Apply all configured voltage planes transactionally with persistent recovery."""
     source = source or power['source']
     section = f'UNDERVOLT.{source}'
     if (section not in config and 'UNDERVOLT' not in config) or 'UNDERVOLT' in UNSUPPORTED_FEATURES:
         return
-    for plane in VOLTAGE_PLANES:
-        write_offset_mv = config.getfloat(section, plane, fallback=config.getfloat('UNDERVOLT', plane, fallback=0.0))
-        write_value = calc_undervolt_msr(plane, write_offset_mv)
-        desired_field = write_value & 0xFFE00000
-        current_value = get_undervolt(plane)[plane]
-        if (current_value & 0xFFE00000) == desired_field:
-            if args.debug:
-                log(f'[D] Undervolt plane {plane:s} already at {write_offset_mv:.0f} mV; skipping write.')
-            continue
 
-        execute_oc_mailbox(write_value)
-        read_value = get_undervolt(plane)[plane]
-        if (read_value & 0xFFE00000) != desired_field:
-            raise OCMailboxError(
-                f'Undervolt verify failed for {plane:s}: requested {write_offset_mv:.0f} mV, '
-                f'read {calc_undervolt_mv(read_value):.0f} mV.'
-            )
+    original = {}
+    desired = {}
+    changed_planes = []
+    for plane in VOLTAGE_PLANES:
+        write_offset_mv = config.getfloat(
+            section,
+            plane,
+            fallback=config.getfloat('UNDERVOLT', plane, fallback=0.0),
+        )
+        write_value = calc_undervolt_msr(plane, write_offset_mv)
+        current_value = get_undervolt(plane)[plane]
+        original[plane] = current_value
+        desired[plane] = (write_value, write_value & 0xFFE00000, write_offset_mv)
+        if (current_value & 0xFFE00000) != desired[plane][1]:
+            changed_planes.append(plane)
+
+    if not changed_planes:
         if args.debug:
-            log(
-                f'[D] Undervolt plane {plane:s} - write {write_offset_mv:.0f} mV '
-                f'- read {calc_undervolt_mv(read_value):.0f} mV - match {OK}'
-            )
+            log('[D] All configured undervolt planes already match; skipping writes.')
+        return
+
+    backup = write_daemon_oc_recovery(
+        'fivr',
+        {plane: calc_undervolt_ticks(value) for plane, value in original.items()},
+    )
+    log(f'[I] OC recovery backup written before daemon undervolt changes: {backup}')
+
+    try:
+        for plane in changed_planes:
+            write_value, desired_field, write_offset_mv = desired[plane]
+            execute_oc_mailbox(write_value)
+            read_value = get_undervolt(plane)[plane]
+            if (read_value & 0xFFE00000) != desired_field:
+                raise OCMailboxError(
+                    f'Undervolt verify failed for {plane:s}: requested {write_offset_mv:.0f} mV, '
+                    f'read {calc_undervolt_mv(read_value):.0f} mV.'
+                )
+            if args.debug:
+                log(
+                    f'[D] Undervolt plane {plane:s} - write {write_offset_mv:.0f} mV '
+                    f'- read {calc_undervolt_mv(read_value):.0f} mV - match {OK}'
+                )
+    except (OSError, OCMailboxError) as exc:
+        rollback_errors = _rollback_undervolt_planes(changed_planes, original)
+        suffix = (
+            f'; rollback issues: {"; ".join(rollback_errors)}'
+            if rollback_errors
+            else '; rollback verified'
+        )
+        raise OCMailboxError(
+            f'Daemon undervolt transaction failed: {exc}; recovery backup: {backup}{suffix}'
+        ) from exc
 
 
 def _icc_max_to_field(current):
@@ -790,43 +904,75 @@ def get_icc_max(plane=None, convert=False):
 
 
 def set_icc_max(config, source=None):
-    """Apply the IccMax limits from the config to all current planes."""
+    """Apply configured IccMax planes transactionally with persistent recovery."""
     if 'ICCMAX' in UNSUPPORTED_FEATURES:
         return
     source = source or power['source']
     section = f'ICCMAX.{source}'
+
+    requested = {}
     for plane in CURRENT_PLANES:
         try:
             write_current_amp = config.getfloat(
-                section, plane, fallback=config.getfloat('ICCMAX', plane, fallback=-1.0)
+                section,
+                plane,
+                fallback=config.getfloat('ICCMAX', plane, fallback=-1.0),
             )
-            if write_current_amp <= 0 and any(
-                config.getfloat(key, plane, fallback=-1.0) > 0 for key in ICCMAX_KEYS
-            ):
-                warning(f'IccMax {plane:s} is not configured for the {source:s} profile: leaving it untouched.')
-            if write_current_amp > 0:
-                write_value = calc_icc_max_msr(plane, write_current_amp)
-                desired_field = write_value & ICCMAX_MAX_FIELD
-                current_field = get_icc_max(plane)[plane]
-                if current_field == desired_field:
-                    if args.debug:
-                        log(f'[D] IccMax plane {plane:s} already at {calc_icc_max_amp(desired_field):.2f} A; skipping write.')
-                    continue
-
-                execute_oc_mailbox(write_value)
-                read_value = get_icc_max(plane)[plane]
-                if read_value != desired_field:
-                    raise OCMailboxError(
-                        f'IccMax verify failed for {plane:s}: requested '
-                        f'{calc_icc_max_amp(desired_field):.2f} A, read {calc_icc_max_amp(read_value):.2f} A.'
-                    )
-                if args.debug:
-                    log(
-                        f'[D] IccMax plane {plane:s} - write {calc_icc_max_amp(desired_field):.2f} A '
-                        f'- read {calc_icc_max_amp(read_value):.2f} A - match {OK}'
-                    )
         except (configparser.NoSectionError, configparser.NoOptionError):
-            pass
+            continue
+        if write_current_amp <= 0:
+            if any(config.getfloat(key, plane, fallback=-1.0) > 0 for key in ICCMAX_KEYS):
+                warning(
+                    f'IccMax {plane:s} is not configured for the {source:s} profile: '
+                    'leaving it untouched.'
+                )
+            continue
+        write_value = calc_icc_max_msr(plane, write_current_amp)
+        requested[plane] = (write_value, write_value & ICCMAX_MAX_FIELD)
+
+    if not requested:
+        return
+
+    # Read every plane so the backup remains directly consumable by throttlectl restore.
+    original = {plane: get_icc_max(plane)[plane] for plane in CURRENT_PLANES}
+    changed_planes = [
+        plane for plane, (_, desired_field) in requested.items()
+        if original[plane] != desired_field
+    ]
+    if not changed_planes:
+        if args.debug:
+            log('[D] All configured IccMax planes already match; skipping writes.')
+        return
+
+    backup = write_daemon_oc_recovery('iccmax', original)
+    log(f'[I] OC recovery backup written before daemon IccMax changes: {backup}')
+
+    try:
+        for plane in changed_planes:
+            write_value, desired_field = requested[plane]
+            execute_oc_mailbox(write_value)
+            read_value = get_icc_max(plane)[plane]
+            if read_value != desired_field:
+                raise OCMailboxError(
+                    f'IccMax verify failed for {plane:s}: requested '
+                    f'{calc_icc_max_amp(desired_field):.2f} A, '
+                    f'read {calc_icc_max_amp(read_value):.2f} A.'
+                )
+            if args.debug:
+                log(
+                    f'[D] IccMax plane {plane:s} - write {calc_icc_max_amp(desired_field):.2f} A '
+                    f'- read {calc_icc_max_amp(read_value):.2f} A - match {OK}'
+                )
+    except (OSError, OCMailboxError) as exc:
+        rollback_errors = _rollback_iccmax_planes(changed_planes, original)
+        suffix = (
+            f'; rollback issues: {"; ".join(rollback_errors)}'
+            if rollback_errors
+            else '; rollback verified'
+        )
+        raise OCMailboxError(
+            f'Daemon IccMax transaction failed: {exc}; recovery backup: {backup}{suffix}'
+        ) from exc
 
 
 def _remove_config_option(config, section, option):
