@@ -106,6 +106,16 @@ class ControlEncodingTests(unittest.TestCase):
             raw & ~(1 << ctl.CLOCK_MODULATION_ENABLE_BIT),
         )
 
+    def test_temperature_target_preserves_tjmax_and_other_bits(self):
+        raw = (100 << 16) | (5 << 24) | (1 << 40)
+        updated = ctl.update_temperature_target(raw, 90)
+        self.assertEqual((updated >> 16) & 0xFF, 100)
+        self.assertEqual((updated >> 24) & 0x3F, 10)
+        self.assertEqual(updated & (1 << 40), raw & (1 << 40))
+
+        with self.assertRaises(ctl.ControlError):
+            ctl.update_temperature_target(raw, 20)
+
     def test_turbo_ratio_update_preserves_unspecified_bytes(self):
         raw = 0x28292A2B2C2D2E2F
         updated = ctl.update_turbo_ratios(raw, {1: 0x31, 4: 0x30})
@@ -212,6 +222,9 @@ class ParserTests(unittest.TestCase):
         ratio = parser.parse_args(["turbo-ratio", "--1c", "41", "--4c", "38"])
         self.assertEqual(ratio.ratio1, 41)
         self.assertEqual(ratio.ratio4, 38)
+
+        temp = parser.parse_args(["temp-target", "90"])
+        self.assertEqual(temp.celsius, 90)
 
         monitor = parser.parse_args(["monitor", "--interval", "0.5", "--count", "3"])
         self.assertEqual(monitor.interval, 0.5)
