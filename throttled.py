@@ -553,8 +553,7 @@ def handle_sleep_prepare(sleeping, config_or_state):
                 set_icc_max(config)
                 source = power['source']
                 set_hwp_epp(_hwp_epp(config, source))
-                disable_turbo = config.getboolean(source, 'Disable_Turbo', fallback=None)
-                set_turbo(None if disable_turbo is None else not disable_turbo)
+                set_turbo(_turbo_setting(config, source))
                 set_bdprochot(_bdprochot_setting(config, source))
 
 
@@ -1225,7 +1224,10 @@ def set_hwp(performance_mode):
 
 
 def _hwp_epp(config, source=None):
-    source = source or power['source']
+    source = source or power.get('source')
+    if source not in POWER_PROFILES:
+        return None
+
     epp = config.getint(source, 'HWP_EPP', fallback=None)
     if epp is not None:
         return epp
@@ -1234,6 +1236,14 @@ def _hwp_epp(config, source=None):
     if legacy is None:
         return None
     return HWP_PERFORMANCE_VALUE if legacy and source == 'AC' else HWP_DEFAULT_VALUE
+
+
+def _turbo_setting(config, source=None):
+    source = source or power.get('source')
+    if source not in POWER_PROFILES:
+        return None
+    disable = config.getboolean(source, 'Disable_Turbo', fallback=None)
+    return None if disable is None else not disable
 
 
 def _hwp_mode(config):
@@ -1251,7 +1261,10 @@ def _bdprochot_setting(config, source=None):
     Disable_BDPROCHOT option remains one-way: True disables; False/absent means
     leave the current hardware state untouched.
     """
-    source = source or power['source']
+    source = source or power.get('source')
+    if source not in POWER_PROFILES:
+        return None
+
     explicit = config.getboolean(source, 'BDPROCHOT_Enabled', fallback=None)
     if explicit is not None:
         return explicit
@@ -1330,8 +1343,7 @@ def reload_config():
     set_icc_max(config)
     source = power['source']
     set_hwp_epp(_hwp_epp(config, source))
-    disable_turbo = config.getboolean(source, 'Disable_Turbo', fallback=None)
-    set_turbo(None if disable_turbo is None else not disable_turbo)
+    set_turbo(_turbo_setting(config, source))
     set_bdprochot(_bdprochot_setting(config, source))
     log('[I] Reloading changes.')
     return config, regs
@@ -1493,8 +1505,7 @@ def _power_thread(state, exit_event):
             set_icc_max(config, source=power_source)
             set_hwp_epp(_hwp_epp(config, power_source))
             next_hwp_write = time() + HWP_INTERVAL
-            disable_turbo = config.getboolean(power_source, 'Disable_Turbo', fallback=None)
-            set_turbo(None if disable_turbo is None else not disable_turbo)
+            set_turbo(_turbo_setting(config, power_source))
             set_bdprochot(_bdprochot_setting(config, power_source))
             applied_source = power_source
 
@@ -1570,8 +1581,7 @@ def _power_thread(state, exit_event):
         # Re-assert profile controls in case firmware or another power manager changed them.
         set_bdprochot(_bdprochot_setting(config, power_source))
 
-        disable_turbo = config.getboolean(power_source, 'Disable_Turbo', fallback=None)
-        set_turbo(None if disable_turbo is None else not disable_turbo)
+        set_turbo(_turbo_setting(config, power_source))
 
         wait_t = get_update_rate(config, power_source)
         hwp_epp = _hwp_epp(config, power_source)
@@ -1834,8 +1844,7 @@ def main():
     undervolt(config)
     set_icc_max(config)
     set_hwp_epp(_hwp_epp(config, power['source']))
-    disable_turbo = config.getboolean(power['source'], 'Disable_Turbo', fallback=None)
-    set_turbo(None if disable_turbo is None else not disable_turbo)
+    set_turbo(_turbo_setting(config, power['source']))
     set_bdprochot(_bdprochot_setting(config, power['source']))
 
     state = {'config': config, 'regs': regs}
