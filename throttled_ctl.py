@@ -20,6 +20,7 @@ import os
 import subprocess
 import sys
 
+from throttled_powercap import PowercapError, find_mmio_package_zone
 from throttled_probe import (
     MSR,
     MsrAccess,
@@ -625,9 +626,35 @@ def command_power(args, msr):
     )
 
     # Package scoped on the target, but the existing daemon intentionally writes
-    # all online logical CPUs.  Match that behavior and verify each view.
+    # all online logical CPUs. Match that behavior and verify each view.
     writes = [(cpu, "MSR_PKG_POWER_LIMIT", updated) for cpu in msr.cpus()]
-    apply_transaction(msr, writes)
+    msr_results = apply_transaction(msr, writes)
+
+    mmio_zone = None if args.no_mmio_sync else find_mmio_package_zone()
+    mmio_requested = any(value is not None for value in (args.pl1, args.pl2, args.tau1, args.tau2))
+    mmio_state = None
+    if mmio_zone is not None and mmio_requested:
+        try:
+            mmio_state = mmio_zone.write(
+                pl1_w=args.pl1,
+                pl2_w=args.pl2,
+                tau1_s=args.tau1,
+                tau2_s=args.tau2,
+            )
+        except PowercapError as exc:
+            rollback = [
+                (result["cpu"], result["register"], result["before"])
+                for result in msr_results
+                if result["changed"]
+            ]
+            if rollback:
+                try:
+                    apply_transaction(msr, rollback)
+                except ControlError as rollback_exc:
+                    raise ControlError(
+                        f"MMIO powercap update failed: {exc}; MSR rollback also failed: {rollback_exc}"
+                    ) from exc
+            raise ControlError(f"MMIO powercap update failed: {exc}; MSR changes rolled back") from exc
 
     decoded = decode_pkg_power_limit(msr.read(0, "MSR_PKG_POWER_LIMIT"), units)
     print(
@@ -639,7 +666,16 @@ def command_power(args, msr):
             "Represented values: "
             + ", ".join(f"{key}={value:.6g}" for key, value in sorted(represented.items()))
         )
-    print("MSR power limits verified. MMIO was not modified.")
+    if mmio_state is not None:
+        mmio_pl1 = (mmio_state.get("pl1") or {}).get("power_limit_uw")
+        mmio_pl2 = (mmio_state.get("pl2") or {}).get("power_limit_uw")
+        rendered1 = "?" if mmio_pl1 is None else f"{mmio_pl1 / 1_000_000:.3f} W"
+        rendered2 = "?" if mmio_pl2 is None else f"{mmio_pl2 / 1_000_000:.3f} W"
+        print(f"Kernel intel-rapl-mmio synchronized: PL1 {rendered1}; PL2 {rendered2}.")
+    elif args.no_mmio_sync:
+        print("MMIO synchronization explicitly disabled.")
+    else:
+        print("Kernel intel-rapl-mmio zone not available; direct MCHBAR was not modified.")
     return 0
 
 
@@ -716,6 +752,11 @@ def build_parser():
     power.add_argument("--pl2-enable", type=parse_on_off, metavar="on|off")
     power.add_argument("--pl1-clamp", type=parse_on_off, metavar="on|off")
     power.add_argument("--pl2-clamp", type=parse_on_off, metavar="on|off")
+    power.add_argument(
+        "--no-mmio-sync",
+        action="store_true",
+        help="do not synchronize PL1/PL2/Tau through the kernel intel-rapl-mmio zone",
+    )
     power.set_defaults(handler=command_power)
 
     return parser
