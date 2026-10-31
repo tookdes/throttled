@@ -266,6 +266,21 @@ class LegacyControlGuardTests(unittest.TestCase):
                 ctl.command_multiplier(self._args(), msr)
 
 
+class DaemonLockTests(unittest.TestCase):
+    def test_daemon_lock_detects_manual_instance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "daemon.lock"
+            path.touch()
+            with path.open("a+", encoding="ascii") as held:
+                ctl.fcntl.flock(held.fileno(), ctl.fcntl.LOCK_EX | ctl.fcntl.LOCK_NB)
+                with mock.patch.object(ctl, "DAEMON_LOCK_PATH", path):
+                    self.assertTrue(ctl.daemon_lock_active())
+                ctl.fcntl.flock(held.fileno(), ctl.fcntl.LOCK_UN)
+
+            with mock.patch.object(ctl, "DAEMON_LOCK_PATH", path):
+                self.assertFalse(ctl.daemon_lock_active())
+
+
 class PowerCommandTests(unittest.TestCase):
     def _msr(self, pkg_raw):
         # RAPL power unit = 1/8 W, time unit = 1 s.
