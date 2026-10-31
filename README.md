@@ -132,41 +132,77 @@ an existing `/etc/throttled.conf`, detects systemd, OpenRC, or runit, and
 enables the service. Use `--init systemd|openrc|runit` to override detection,
 or `--no-start` to install without enabling or starting it.
 
-## HP EliteBook 830 G6 bring-up probe
+## HP EliteBook 830 G6 / ThrottleStop replacement
 
-This fork is currently adding a narrowly scoped ThrottleStop replacement path
-for the HP EliteBook 830 G6 / Whiskey Lake-U generation. Before changing any
-settings, collect the machine's actual register capabilities:
+This fork contains an intentionally narrow bring-up path for the HP EliteBook
+830 G6 / Whiskey Lake-U generation. The goal is to reproduce the CPU controls
+that are useful in Windows ThrottleStop before adding a GUI.
+
+Start with the strict read-only probe:
 
 ```sh
 sudo throttled --probe
 ```
 
-The probe is intentionally read-only. It reports DMI/CPUID identity, HWP/Speed
-Shift and EPP state, PL1/PL2/Tau and lock bits, the validated MCHBAR power-limit
-mirror when readable, TjMax/TCC and BD PROCHOT state, turbo ratio limits, and
-core performance-limit reasons. It does **not** issue the OC-mailbox WRMSR
-transaction needed to query FIVR offsets, so a normal probe cannot change
-voltage state.
+It reports DMI/CPUID identity, HWP/Speed Shift and EPP state, PL1/PL2/Tau and
+lock bits, kernel `intel-rapl` / `intel-rapl-mmio` zones, the validated
+direct MCHBAR fallback when readable, TjMax/TCC and BD PROCHOT state, turbo
+ratio limits, and performance-limit reasons. A normal probe does **not** issue
+the OC-mailbox WRMSR transaction required to query FIVR offsets.
 
-For bring-up and recovery work, the standalone module can also save selected
-raw control registers:
+For one-shot ThrottleStop-style controls use `throttlectl`. Write commands
+are guarded to the 830 G6 target by default, preserve unrelated MSR bits,
+verify readback, and attempt rollback after partial failures. They also refuse
+to race the background daemon unless explicitly overridden.
+
+```sh
+sudo throttlectl status
+sudo throttlectl limits
+sudo throttlectl monitor --interval 1
+
+sudo throttlectl epp 32
+sudo throttlectl turbo on
+sudo throttlectl bd-prochot on
+sudo throttlectl speedstep on
+sudo throttlectl clock-mod
+sudo throttlectl multiplier 38
+
+sudo throttlectl power --pl1 25 --pl2 44 --tau1 28
+sudo throttlectl turbo-ratio --1c 42 --2c 41 --3c 39 --4c 39
+
+# These "read" operations are not electrically read-only: Intel's OC mailbox
+# protocol requires a WRMSR selector transaction before the mailbox result can
+# be read.
+sudo throttlectl fivr read
+sudo throttlectl fivr set --core -80 --cache -80
+sudo throttlectl iccmax read
+```
+
+When the kernel exposes `intel-rapl-mmio`, TPL changes synchronize that
+kernel-managed chipset/MMIO zone instead of guessing an 830 G6 MCHBAR mapping.
+The existing validated `/dev/mem` MCHBAR implementation remains a daemon
+fallback for already allow-listed host bridges.
+
+For bring-up and recovery work, save the stock raw registers before testing:
 
 ```sh
 sudo python3 throttled_probe.py --snapshot /root/830g6-stock.json
 ```
 
-Restoring is deliberately two-step. The first command only prints the WRMSR
-plan; the second actually writes and verifies it:
+Restore is deliberately two-step. The first invocation prints the WRMSR plan;
+the second actually writes and verifies it:
 
 ```sh
 sudo python3 throttled_probe.py --restore-snapshot /root/830g6-stock.json
 sudo python3 throttled_probe.py --restore-snapshot /root/830g6-stock.json --apply-restore
 ```
 
-Snapshots currently cover package power/temperature/BD-PROCHOT/cTDP controls
-and per-CPU HWP requests. FIVR/IccMax and the MMIO mirror are intentionally not
-part of this first restore milestone.
+The snapshot currently covers package power/temperature/BD-PROCHOT/cTDP,
+Turbo Ratio, HWP package request, and per-CPU HWP, Turbo/SpeedStep,
+clock-modulation, and PERF_CTL state. FIVR/IccMax are intentionally excluded
+from the strict stock snapshot because merely querying them requires an OC
+mailbox write. See `docs/elitebook-830-g6.md` for the implementation map and
+remaining hardware-validation gates.
 
 ## Configuration
 
