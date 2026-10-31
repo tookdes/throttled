@@ -1262,21 +1262,28 @@ def set_turbo(enabled):
 
 
 def set_bdprochot(enabled):
-    """Set or clear MSR_POWER_CTL[0] so profile changes can restore BD PROCHOT."""
+    """Set or clear MSR_POWER_CTL[0] per CPU without copying unrelated bits."""
     if enabled is None:
         return
-    cur_val = readmsr('MSR_POWER_CTL', flatten=True)
-    if enabled:
-        new_val = cur_val | (1 << BD_PROCHOT_ENABLE_BIT)
-    else:
-        new_val = cur_val & ~(1 << BD_PROCHOT_ENABLE_BIT)
-
-    writemsr('MSR_POWER_CTL', new_val)
-    if args.debug:
-        read_value = readmsr('MSR_POWER_CTL', from_bit=BD_PROCHOT_ENABLE_BIT, to_bit=BD_PROCHOT_ENABLE_BIT)[0]
-        expected = 1 if enabled else 0
-        match = OK if read_value == expected else ERR
-        log(f'[D] BDPROCHOT - write "{expected:#02x}" - read "{read_value:#02x}" - match {match}')
+    expected = 1 if enabled else 0
+    for addr in _ensure_msr_module():
+        cpu = int(os.path.basename(os.path.dirname(addr)))
+        cur_val = readmsr('MSR_POWER_CTL', cpu=cpu)
+        if enabled:
+            new_val = cur_val | (1 << BD_PROCHOT_ENABLE_BIT)
+        else:
+            new_val = cur_val & ~(1 << BD_PROCHOT_ENABLE_BIT)
+        if new_val != cur_val:
+            writemsr('MSR_POWER_CTL', new_val, cpu=cpu)
+        if args.debug:
+            read_value = readmsr(
+                'MSR_POWER_CTL',
+                from_bit=BD_PROCHOT_ENABLE_BIT,
+                to_bit=BD_PROCHOT_ENABLE_BIT,
+                cpu=cpu,
+            )
+            match = OK if read_value == expected else ERR
+            log(f'[D] BDPROCHOT CPU {cpu:d} - write "{expected:#02x}" - read "{read_value:#02x}" - match {match}')
 
 
 def set_disable_bdprochot():
@@ -1476,20 +1483,28 @@ def _power_thread(state, exit_event):
         # set temperature trip point
         if 'MSR_TEMPERATURE_TARGET' in regs[power_source]:
             write_value = regs[power_source]['MSR_TEMPERATURE_TARGET']
-            writemsr('MSR_TEMPERATURE_TARGET', write_value)
+            current = readmsr('MSR_TEMPERATURE_TARGET', cpu=0)
+            offset_mask = 0x3F << 24
+            new_value = (current & ~offset_mask) | (write_value & offset_mask)
+            writemsr('MSR_TEMPERATURE_TARGET', new_value)
             if args.debug:
                 read_value = readmsr('MSR_TEMPERATURE_TARGET', 24, 29, flatten=True)
-                match = OK if write_value >> 24 == read_value else ERR
+                match = OK if (write_value >> 24) == read_value else ERR
                 log(f'[D] TEMPERATURE_TARGET - write {write_value >> 24:#x} - read {read_value:#x} - match {match}')
 
-        # set cTDP
+        # set cTDP target bits without touching the lock/reserved fields
         if 'MSR_CONFIG_TDP_CONTROL' in regs[power_source]:
             write_value = regs[power_source]['MSR_CONFIG_TDP_CONTROL']
-            writemsr('MSR_CONFIG_TDP_CONTROL', write_value)
-            if args.debug:
-                read_value = readmsr('MSR_CONFIG_TDP_CONTROL', 0, 1, flatten=True)
-                match = OK if write_value == read_value else ERR
-                log(f'[D] CONFIG_TDP_CONTROL - write {write_value:#x} - read {read_value:#x} - match {match}')
+            current = readmsr('MSR_CONFIG_TDP_CONTROL', cpu=0)
+            if (current >> 31) & 1:
+                warning('MSR_CONFIG_TDP_CONTROL is locked; cTDP write skipped.')
+            else:
+                new_value = (current & ~0x3) | (write_value & 0x3)
+                writemsr('MSR_CONFIG_TDP_CONTROL', new_value)
+                if args.debug:
+                    read_value = readmsr('MSR_CONFIG_TDP_CONTROL', 0, 1, flatten=True)
+                    match = OK if write_value == read_value else ERR
+                    log(f'[D] CONFIG_TDP_CONTROL - write {write_value:#x} - read {read_value:#x} - match {match}')
 
         # set PL1/2 on MSR
         if 'MSR_PKG_POWER_LIMIT' in regs[power_source]:
