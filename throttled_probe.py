@@ -499,6 +499,33 @@ def collect_snapshot(msr, cpu, dmi):
     return snapshot
 
 
+def validate_snapshot_schema(snapshot, current_cpus):
+    if not isinstance(snapshot, dict):
+        raise ProbeError("snapshot root must be a JSON object")
+    if snapshot.get("schema_version") != 1:
+        raise ProbeError(
+            f"unsupported snapshot schema_version {snapshot.get('schema_version')!r}; expected 1"
+        )
+    if snapshot.get("target") != TARGET_DMI_PRODUCT:
+        raise ProbeError(
+            f"snapshot target {snapshot.get('target')!r} does not match {TARGET_DMI_PRODUCT!r}"
+        )
+
+    saved_per_cpu = snapshot.get("per_cpu_msrs")
+    if not isinstance(saved_per_cpu, dict):
+        raise ProbeError("snapshot per_cpu_msrs must be an object")
+    try:
+        saved_cpus = {int(cpu) for cpu in saved_per_cpu}
+    except (TypeError, ValueError) as exc:
+        raise ProbeError("snapshot contains an invalid logical CPU key") from exc
+
+    current_set = set(current_cpus)
+    if saved_cpus != current_set:
+        raise ProbeError(
+            f"snapshot logical CPUs {sorted(saved_cpus)} do not match current online CPUs {sorted(current_set)}"
+        )
+
+
 def validate_snapshot_identity(snapshot, cpu, dmi=None):
     saved = snapshot.get("cpu", {})
     current = (cpu["vendor_id"], cpu["family"], cpu["model"], cpu["stepping"])
@@ -903,8 +930,10 @@ def _main(argv=None):
             snapshot = json.loads(Path(args.restore_snapshot).read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise ProbeError(f"unable to read snapshot {args.restore_snapshot!r}: {exc}") from exc
+        current_cpus = msr.cpus()
+        validate_snapshot_schema(snapshot, current_cpus)
         validate_snapshot_identity(snapshot, cpu, dmi)
-        plan = build_restore_plan(snapshot, msr.cpus())
+        plan = build_restore_plan(snapshot, current_cpus)
         print(f"Restore plan: {len(plan)} WRMSR operations")
         for logical_cpu, name, value in plan:
             print(f"  cpu{logical_cpu}: {name} <- 0x{value:016x}")
