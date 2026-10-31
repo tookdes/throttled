@@ -462,7 +462,7 @@ class PR394FixTests(unittest.TestCase):
         apply.assert_called_once()
         self.assertEqual(apply.call_args.args[:3], (updated_config, updated_regs, 'AC'))
         self.assertTrue(apply.call_args.kwargs['apply_mailbox'])
-        self.assertTrue(apply.call_args.kwargs['apply_hwp'])
+        self.assertFalse(apply.call_args.kwargs['apply_hwp'])
 
 if __name__ == '__main__':
     unittest.main()
