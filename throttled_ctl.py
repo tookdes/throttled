@@ -1070,11 +1070,6 @@ def command_power(args, msr):
     target_decoded = decode_pkg_power_limit(updated, units)
 
     numeric_requested = any(value is not None for value in (args.pl1, args.pl2, args.tau1, args.tau2))
-    bit_control_requested = any(
-        value is not None
-        for value in (args.pl1_enable, args.pl2_enable, args.pl1_clamp, args.pl2_clamp)
-    )
-
     mmio_zone = None
     direct_mapping = None
     direct_before = None
