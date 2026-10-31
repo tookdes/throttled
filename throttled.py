@@ -17,7 +17,7 @@ from errno import EACCES, EIO, ENOENT, EPERM
 from platform import uname
 from subprocess import check_output, CalledProcessError, PIPE
 from threading import Event, Lock, Thread, current_thread, main_thread
-from time import time
+from time import monotonic, sleep, time
 
 from mmio import MMIO, MMIOError
 from throttled_powercap import PowercapError, find_mmio_package_zone
@@ -56,6 +56,7 @@ MSR_DICT = {
     'MSR_DRAM_ENERGY_STATUS': 0x619,
     'MSR_PP1_ENERGY_STATUS': 0x641,
     'MSR_CONFIG_TDP_CONTROL': 0x64B,
+    'IA32_PM_ENABLE': 0x770,
     'IA32_HWP_REQUEST_PKG': 0x772,
     'IA32_HWP_REQUEST': 0x774,
 }
@@ -70,6 +71,11 @@ UNDERVOLT_MIN_TICKS = -(1 << 10)
 UNDERVOLT_MAX_TICKS = 0
 ICCMAX_STEPS_PER_A = 4
 ICCMAX_MAX_FIELD = 0x3FF
+OC_MAILBOX_BUSY_BIT = 63
+OC_MAILBOX_STATUS_SHIFT = 32
+OC_MAILBOX_STATUS_MASK = 0xFF
+OC_MAILBOX_TIMEOUT_S = 0.05
+OC_MAILBOX_POLL_S = 0.00001
 MCHBAR_ENABLE_BIT = 1
 MCHBAR_PACKAGE_POWER_LIMIT_OFFSET = 0x59A0
 MCHBAR_PACKAGE_POWER_LIMIT_SIZE = 8
@@ -801,22 +807,48 @@ def calc_undervolt_mv(msr_value):
     return int(round(offset / UNDERVOLT_TICKS_PER_MV))
 
 
+class OCMailboxError(OSError):
+    """OC mailbox command was rejected, timed out, or failed verification."""
+
+
+def wait_oc_mailbox_ready():
+    deadline = monotonic() + OC_MAILBOX_TIMEOUT_S
+    while True:
+        raw = readmsr('MSR_OC_MAILBOX', cpu=0)
+        if not ((raw >> OC_MAILBOX_BUSY_BIT) & 1):
+            return raw
+        if monotonic() >= deadline:
+            raise OCMailboxError('OC mailbox timed out waiting for completion.')
+        sleep(OC_MAILBOX_POLL_S)
+
+
+def execute_oc_mailbox(command):
+    """Execute one package OC-mailbox transaction through CPU0 and check status."""
+    wait_oc_mailbox_ready()
+    writemsr('MSR_OC_MAILBOX', command, cpu=0)
+    result = wait_oc_mailbox_ready()
+    status = (result >> OC_MAILBOX_STATUS_SHIFT) & OC_MAILBOX_STATUS_MASK
+    if status:
+        raise OCMailboxError(f'OC mailbox command failed with status {status:#04x}.')
+    return result
+
+
 def get_undervolt(plane=None, convert=False):
-    """Read the current undervolt offset from one or all voltage planes."""
+    """Read current voltage offsets using the package OC mailbox protocol."""
     if 'UNDERVOLT' in UNSUPPORTED_FEATURES:
         return 0
     planes = [plane] if plane in VOLTAGE_PLANES else VOLTAGE_PLANES
     out = {}
     for plane in planes:
-        writemsr('MSR_OC_MAILBOX', 0x8000001000000000 | (VOLTAGE_PLANES[plane] << 40))
-        read_value = readmsr('MSR_OC_MAILBOX', flatten=True) & 0xFFFFFFFF
+        result = execute_oc_mailbox(0x8000001000000000 | (VOLTAGE_PLANES[plane] << 40))
+        read_value = result & 0xFFFFFFFF
         out[plane] = calc_undervolt_mv(read_value) if convert else read_value
 
     return out
 
 
 def undervolt(config, source=None):
-    """Apply the undervolt offsets from the config to all voltage planes."""
+    """Apply undervolt offsets through one verified package-mailbox transaction per plane."""
     source = source or power['source']
     section = f'UNDERVOLT.{source}'
     if (section not in config and 'UNDERVOLT' not in config) or 'UNDERVOLT' in UNSUPPORTED_FEATURES:
@@ -824,14 +856,24 @@ def undervolt(config, source=None):
     for plane in VOLTAGE_PLANES:
         write_offset_mv = config.getfloat(section, plane, fallback=config.getfloat('UNDERVOLT', plane, fallback=0.0))
         write_value = calc_undervolt_msr(plane, write_offset_mv)
-        writemsr('MSR_OC_MAILBOX', write_value)
+        desired_field = write_value & 0xFFE00000
+        current_value = get_undervolt(plane)[plane]
+        if (current_value & 0xFFE00000) == desired_field:
+            if args.debug:
+                log(f'[D] Undervolt plane {plane:s} already at {write_offset_mv:.0f} mV; skipping write.')
+            continue
+
+        execute_oc_mailbox(write_value)
+        read_value = get_undervolt(plane)[plane]
+        if (read_value & 0xFFE00000) != desired_field:
+            raise OCMailboxError(
+                f'Undervolt verify failed for {plane:s}: requested {write_offset_mv:.0f} mV, '
+                f'read {calc_undervolt_mv(read_value):.0f} mV.'
+            )
         if args.debug:
-            write_value &= 0xFFFFFFFF
-            read_value = get_undervolt(plane)[plane]
-            read_offset_mv = calc_undervolt_mv(read_value)
-            match = OK if write_value == read_value else ERR
             log(
-                f'[D] Undervolt plane {plane:s} - write {write_offset_mv:.0f} mV ({write_value:#x}) - read {read_offset_mv:.0f} mV ({read_value:#x}) - match {match}'
+                f'[D] Undervolt plane {plane:s} - write {write_offset_mv:.0f} mV '
+                f'- read {calc_undervolt_mv(read_value):.0f} mV - match {OK}'
             )
 
 
@@ -885,12 +927,14 @@ def get_update_rate(config, power_source):
 
 
 def get_icc_max(plane=None, convert=False):
-    """Read the IccMax setting from one or all current planes."""
+    """Read IccMax through the package OC mailbox protocol."""
+    if 'ICCMAX' in UNSUPPORTED_FEATURES:
+        return 0
     planes = [plane] if plane in CURRENT_PLANES else CURRENT_PLANES
     out = {}
     for plane in planes:
-        writemsr('MSR_OC_MAILBOX', 0x8000001600000000 | (CURRENT_PLANES[plane] << 40))
-        read_value = readmsr('MSR_OC_MAILBOX', flatten=True) & 0x3FF
+        result = execute_oc_mailbox(0x8000001600000000 | (CURRENT_PLANES[plane] << 40))
+        read_value = result & ICCMAX_MAX_FIELD
         out[plane] = calc_icc_max_amp(read_value) if convert else read_value
 
     return out
@@ -913,14 +957,24 @@ def set_icc_max(config, source=None):
                 warning(f'IccMax {plane:s} is not configured for the {source:s} profile: leaving it untouched.')
             if write_current_amp > 0:
                 write_value = calc_icc_max_msr(plane, write_current_amp)
-                writemsr('MSR_OC_MAILBOX', write_value)
+                desired_field = write_value & ICCMAX_MAX_FIELD
+                current_field = get_icc_max(plane)[plane]
+                if current_field == desired_field:
+                    if args.debug:
+                        log(f'[D] IccMax plane {plane:s} already at {calc_icc_max_amp(desired_field):.2f} A; skipping write.')
+                    continue
+
+                execute_oc_mailbox(write_value)
+                read_value = get_icc_max(plane)[plane]
+                if read_value != desired_field:
+                    raise OCMailboxError(
+                        f'IccMax verify failed for {plane:s}: requested '
+                        f'{calc_icc_max_amp(desired_field):.2f} A, read {calc_icc_max_amp(read_value):.2f} A.'
+                    )
                 if args.debug:
-                    write_value &= 0x3FF
-                    read_value = get_icc_max(plane)[plane]
-                    read_current_A = calc_icc_max_amp(read_value)
-                    match = OK if write_value == read_value else ERR
                     log(
-                        f'[D] IccMax plane {plane:s} - write {calc_icc_max_amp(write_value):.2f} A ({write_value:#x}) - read {read_current_A:.2f} A ({read_value:#x}) - match {match}'
+                        f'[D] IccMax plane {plane:s} - write {calc_icc_max_amp(desired_field):.2f} A '
+                        f'- read {calc_icc_max_amp(read_value):.2f} A - match {OK}'
                     )
         except (configparser.NoSectionError, configparser.NoOptionError):
             pass
@@ -1217,6 +1271,9 @@ def set_hwp_epp(epp):
         return
     if not isinstance(epp, int) or not 0 <= epp <= 255:
         raise ValueError(f'HWP EPP must be an integer from 0 to 255, got {epp!r}.')
+    if not (readmsr('IA32_PM_ENABLE', 0, 0, cpu=0) & 1):
+        warning('HWP/Speed Shift is disabled; skipping EPP write.')
+        return
 
     requests = []
     package_control = False
@@ -1315,7 +1372,8 @@ def set_turbo(enabled):
             new_val = cur_val & ~(1 << TURBO_DISABLE_BIT)
         else:
             new_val = cur_val | (1 << TURBO_DISABLE_BIT)
-        writemsr('IA32_MISC_ENABLE', new_val, cpu=cpu)
+        if new_val != cur_val:
+            writemsr('IA32_MISC_ENABLE', new_val, cpu=cpu)
         if args.debug:
             read_value = readmsr('IA32_MISC_ENABLE', from_bit=TURBO_DISABLE_BIT, to_bit=TURBO_DISABLE_BIT, cpu=cpu)
             expected = 0 if enabled else 1
@@ -1735,10 +1793,11 @@ def test_msr_rw_capabilities():
 
         try:
             log('[I] Testing if HWP is supported...')
-            cur_val = readmsr('IA32_HWP_REQUEST', cpu=0)
-            writemsr('IA32_HWP_REQUEST', cur_val, cpu=0)
+            if not (readmsr('IA32_PM_ENABLE', 0, 0, cpu=0) & 1):
+                raise OSError('HWP/Speed Shift is disabled')
+            readmsr('IA32_HWP_REQUEST', cpu=0)
         except (IOError, OSError):
-            warning('HWP seems not to be supported by your system, disabling.')
+            warning('HWP seems not to be supported/enabled by your system, disabling.')
             UNSUPPORTED_FEATURES.append('HWP')
 
         if args.monitor is not None:
