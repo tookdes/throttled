@@ -32,7 +32,7 @@ interfaces must fail closed instead of pretending a setting was accepted.
 | direct MCHBAR | validated PCI allow-list only | fallback only |
 | FIVR voltage offsets | OC mailbox MSR 0x150 | implemented in explicit control CLI |
 | FIVR IccMax | OC mailbox MSR 0x150 | implemented in explicit control CLI |
-| Temperature target | MSR_TEMPERATURE_TARGET | daemon profile support |
+| Temperature target | MSR_TEMPERATURE_TARGET | implemented in daemon and direct control |
 | Limits | Whiskey/SKL performance-limit reasons + thermal state | implemented |
 | Ratio / MHz | IA32_PERF_STATUS | implemented |
 | Effective MHz | APERF / MPERF deltas | implemented |
@@ -134,6 +134,7 @@ sudo throttlectl bd-prochot on
 sudo throttlectl speedstep on
 sudo throttlectl clock-mod
 sudo throttlectl multiplier 38
+sudo throttlectl temp-target 90
 sudo throttlectl turbo-ratio --1c 42 --2c 41 --3c 39 --4c 39
 
 sudo throttlectl fivr read
