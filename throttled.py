@@ -1546,6 +1546,7 @@ def build_arg_parser():
         parser = argparse.ArgumentParser()
     exclusive_group = parser.add_mutually_exclusive_group()
     exclusive_group.add_argument('--debug', action='store_true', help='add some debug info and additional checks')
+    exclusive_group.add_argument('--probe', action='store_true', help='read-only HP EliteBook 830 G6 bring-up probe')
     exclusive_group.add_argument(
         '--monitor',
         metavar='update_rate',
@@ -1573,6 +1574,11 @@ def main():
         except OSError as e:
             args.log = None
             fatal(f'Unable to write to the log file: {e}')
+
+    if args.probe:
+        from throttled_probe import main as probe_main
+
+        return probe_main([])
 
     log('[I] Loading config file.')
     config = load_config()
