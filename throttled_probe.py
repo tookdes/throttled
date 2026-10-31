@@ -656,8 +656,8 @@ def apply_restore_plan(msr, plan):
                 )
                 continue
 
-            completed.append((cpu, name, original))
             msr.write(cpu, name, value)
+            completed.append((cpu, name, original))
             readback = msr.read(cpu, name)
             if readback != value:
                 raise ProbeError(
