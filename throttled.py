@@ -1536,6 +1536,13 @@ def apply_package_power_limit(write_value, mmio_powercap=None, mchbar_mmio=None)
                 )
     except (OSError, PowercapError) as e:
         rollback_errors = []
+        # Restore the narrower kernel powercap view first, then the full direct
+        # mirror so powercap cannot overwrite a just-restored MCHBAR value.
+        if powercap_before is not None and mmio_powercap is not None:
+            try:
+                mmio_powercap.restore(powercap_before)
+            except PowercapError as rollback_error:
+                rollback_errors.append(f'powercap: {rollback_error}')
         if mchbar_mmio is not None and direct_before is not None:
             try:
                 if mchbar_mmio.read64(0) != direct_before:
@@ -1544,11 +1551,6 @@ def apply_package_power_limit(write_value, mmio_powercap=None, mchbar_mmio=None)
                     rollback_errors.append('MCHBAR verify mismatch')
             except (OSError, MMIOError) as rollback_error:
                 rollback_errors.append(f'MCHBAR: {rollback_error}')
-        if powercap_before is not None and mmio_powercap is not None:
-            try:
-                mmio_powercap.restore(powercap_before)
-            except PowercapError as rollback_error:
-                rollback_errors.append(f'powercap: {rollback_error}')
         if msr_changed:
             try:
                 writemsr('MSR_PKG_POWER_LIMIT', msr_before, cpu=0)
