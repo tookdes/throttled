@@ -1115,6 +1115,35 @@ def calc_reg_values(platform_info, config):
     return regs
 
 
+def write_msr_field_verified(msr_name, cpu, mask, desired_bits, label):
+    """RMW one managed field, verify it, and restore that field on mismatch."""
+    original = readmsr(msr_name, cpu=cpu)
+    target = (original & ~mask) | (desired_bits & mask)
+    if target == original:
+        return original
+
+    writemsr(msr_name, target, cpu=cpu)
+    readback = readmsr(msr_name, cpu=cpu)
+    if (readback & mask) == (target & mask):
+        return readback
+
+    rollback_error = None
+    try:
+        rollback_target = (readback & ~mask) | (original & mask)
+        writemsr(msr_name, rollback_target, cpu=cpu)
+        rollback_readback = readmsr(msr_name, cpu=cpu)
+        if (rollback_readback & mask) != (original & mask):
+            rollback_error = 'rollback verify mismatch'
+    except (OSError, IOError) as exc:
+        rollback_error = str(exc)
+
+    suffix = f'; rollback issue: {rollback_error}' if rollback_error else '; managed field rollback verified'
+    raise OSError(
+        f'{label} verify failed on CPU {cpu:d}: expected 0x{target & mask:x}, '
+        f'read 0x{readback & mask:x}{suffix}'
+    )
+
+
 def set_hwp_epp(epp):
     """Set HWP EPP, including the package request when package control is active."""
     if epp is None or 'HWP' in UNSUPPORTED_FEATURES:
@@ -1133,23 +1162,29 @@ def set_hwp_epp(epp):
         requests.append((cpu, cur_val))
         package_control = package_control or bool((cur_val >> 42) & 1)
 
+    epp_mask = 0xFF << 24
     if package_control:
-        cur_pkg = readmsr('IA32_HWP_REQUEST_PKG', cpu=0)
-        new_pkg = (cur_pkg & 0xFFFFFFFF00FFFFFF) | (epp << 24)
-        writemsr('IA32_HWP_REQUEST_PKG', new_pkg, cpu=0)
+        readback = write_msr_field_verified(
+            'IA32_HWP_REQUEST_PKG',
+            0,
+            epp_mask,
+            epp << 24,
+            'HWP package EPP',
+        )
         if args.debug:
-            read_value = readmsr('IA32_HWP_REQUEST_PKG', from_bit=24, to_bit=31, cpu=0)
-            match = OK if epp == read_value else ERR
-            log(f'[D] HWP package - write EPP "{epp:#02x}" - read "{read_value:#02x}" - match {match}')
+            log(f'[D] HWP package - EPP "{(readback >> 24) & 0xFF:#02x}" - match {OK}')
 
     # A CPU that disappears mid-loop is fatal rather than falling back to a broadcast write.
     for cpu, cur_val in requests:
-        new_val = (cur_val & 0xFFFFFFFF00FFFFFF) | (epp << 24)
-        writemsr('IA32_HWP_REQUEST', new_val, cpu=cpu)
+        readback = write_msr_field_verified(
+            'IA32_HWP_REQUEST',
+            cpu,
+            epp_mask,
+            epp << 24,
+            f'HWP CPU {cpu:d} EPP',
+        )
         if args.debug:
-            read_value = readmsr('IA32_HWP_REQUEST', from_bit=24, to_bit=31, cpu=cpu)
-            match = OK if epp == read_value else ERR
-            log(f'[D] HWP CPU {cpu:d} - write EPP "{epp:#02x}" - read "{read_value:#02x}" - match {match}')
+            log(f'[D] HWP CPU {cpu:d} - EPP "{(readback >> 24) & 0xFF:#02x}" - match {OK}')
 
 
 def set_hwp(performance_mode):
@@ -1238,20 +1273,15 @@ def set_turbo(enabled):
     """Set IA32_MISC_ENABLE[38] without disturbing unrelated bits."""
     if enabled is None:
         return
+    mask = 1 << TURBO_DISABLE_BIT
+    desired = 0 if enabled else mask
     for addr in _ensure_msr_module():
         cpu = int(os.path.basename(os.path.dirname(addr)))
-        cur_val = readmsr('IA32_MISC_ENABLE', cpu=cpu)
-        if enabled:
-            new_val = cur_val & ~(1 << TURBO_DISABLE_BIT)
-        else:
-            new_val = cur_val | (1 << TURBO_DISABLE_BIT)
-        if new_val != cur_val:
-            writemsr('IA32_MISC_ENABLE', new_val, cpu=cpu)
+        readback = write_msr_field_verified('IA32_MISC_ENABLE', cpu, mask, desired, 'Turbo Disable')
         if args.debug:
-            read_value = readmsr('IA32_MISC_ENABLE', from_bit=TURBO_DISABLE_BIT, to_bit=TURBO_DISABLE_BIT, cpu=cpu)
+            read_value = (readback >> TURBO_DISABLE_BIT) & 1
             expected = 0 if enabled else 1
-            match = OK if read_value == expected else ERR
-            log(f'[D] Turbo CPU {cpu:d} - write disable={expected:d} - read "{read_value:#02x}" - match {match}')
+            log(f'[D] Turbo CPU {cpu:d} - disable={read_value:d} - match {OK if read_value == expected else ERR}')
 
 
 def set_bdprochot(enabled):
@@ -1259,28 +1289,24 @@ def set_bdprochot(enabled):
     if enabled is None:
         return
     expected = 1 if enabled else 0
+    mask = 1 << BD_PROCHOT_ENABLE_BIT
     for addr in _ensure_msr_module():
         cpu = int(os.path.basename(os.path.dirname(addr)))
         cur_val = readmsr('MSR_POWER_CTL', cpu=cpu)
-        current_enabled = bool((cur_val >> BD_PROCHOT_ENABLE_BIT) & 1)
+        current_enabled = bool(cur_val & mask)
         if ((cur_val >> BD_PROCHOT_LOCK_BIT) & 1) and current_enabled != enabled:
             warning(f'BD PROCHOT is locked on CPU {cpu:d}; requested state change skipped.')
             continue
-        if enabled:
-            new_val = cur_val | (1 << BD_PROCHOT_ENABLE_BIT)
-        else:
-            new_val = cur_val & ~(1 << BD_PROCHOT_ENABLE_BIT)
-        if new_val != cur_val:
-            writemsr('MSR_POWER_CTL', new_val, cpu=cpu)
+        readback = write_msr_field_verified(
+            'MSR_POWER_CTL',
+            cpu,
+            mask,
+            mask if enabled else 0,
+            'BD PROCHOT',
+        )
         if args.debug:
-            read_value = readmsr(
-                'MSR_POWER_CTL',
-                from_bit=BD_PROCHOT_ENABLE_BIT,
-                to_bit=BD_PROCHOT_ENABLE_BIT,
-                cpu=cpu,
-            )
-            match = OK if read_value == expected else ERR
-            log(f'[D] BDPROCHOT CPU {cpu:d} - write "{expected:#02x}" - read "{read_value:#02x}" - match {match}')
+            read_value = 1 if readback & mask else 0
+            log(f'[D] BDPROCHOT CPU {cpu:d} - state "{read_value:#02x}" - match {OK if read_value == expected else ERR}')
 
 
 def set_disable_bdprochot():
@@ -1479,7 +1505,6 @@ def apply_package_power_limit(write_value, mmio_powercap=None, mchbar_mmio=None)
         time_unit = get_time_unit()
 
     msr_changed = False
-    direct_changed = False
     try:
         if msr_before != write_value:
             writemsr('MSR_PKG_POWER_LIMIT', write_value, cpu=0)
@@ -1504,7 +1529,6 @@ def apply_package_power_limit(write_value, mmio_powercap=None, mchbar_mmio=None)
                 raise OSError('MCHBAR package power limit is locked')
             if mmio_current != write_value:
                 mchbar_mmio.write64(0, write_value)
-                direct_changed = True
             mmio_readback = mchbar_mmio.read64(0)
             if mmio_readback != write_value:
                 raise OSError(
@@ -1552,9 +1576,13 @@ def apply_profile_registers(regs, power_source, mmio_powercap=None, mchbar_mmio=
             warning('MSR_TEMPERATURE_TARGET TCC offset is locked; temperature-target write skipped.')
         else:
             offset_mask = 0x3F << 24
-            new_value = (current & ~offset_mask) | (write_value & offset_mask)
-            if new_value != current:
-                writemsr('MSR_TEMPERATURE_TARGET', new_value, cpu=0)
+            write_msr_field_verified(
+                'MSR_TEMPERATURE_TARGET',
+                0,
+                offset_mask,
+                write_value,
+                'Temperature target offset',
+            )
 
     if 'MSR_CONFIG_TDP_CONTROL' in profile_regs:
         write_value = profile_regs['MSR_CONFIG_TDP_CONTROL']
@@ -1562,9 +1590,13 @@ def apply_profile_registers(regs, power_source, mmio_powercap=None, mchbar_mmio=
         if (current >> 31) & 1:
             warning('MSR_CONFIG_TDP_CONTROL is locked; cTDP write skipped.')
         else:
-            new_value = (current & ~0x3) | (write_value & 0x3)
-            if new_value != current:
-                writemsr('MSR_CONFIG_TDP_CONTROL', new_value, cpu=0)
+            write_msr_field_verified(
+                'MSR_CONFIG_TDP_CONTROL',
+                0,
+                0x3,
+                write_value,
+                'cTDP target',
+            )
 
     if 'MSR_PKG_POWER_LIMIT' in profile_regs:
         mmio_powercap, mchbar_mmio = apply_package_power_limit(
