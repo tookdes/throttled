@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 import throttled_ctl as ctl
 
@@ -160,6 +161,37 @@ class MonitorMathTests(unittest.TestCase):
         raw = (1 << 31) | (25 << 16)
         self.assertEqual(ctl.core_temperature(raw, 100), 75)
         self.assertIsNone(ctl.core_temperature(25 << 16, 100))
+
+
+class MailboxTests(unittest.TestCase):
+    class MailboxMsr:
+        def __init__(self, reads):
+            self.reads = list(reads)
+            self.writes = []
+
+        def read(self, cpu, register):
+            self.assertion = (cpu, register)
+            if not self.reads:
+                raise AssertionError("unexpected mailbox read")
+            return self.reads.pop(0)
+
+        def write(self, cpu, register, value):
+            self.writes.append((cpu, register, value))
+
+    def test_mailbox_waits_for_completion_and_accepts_zero_status(self):
+        result = 0x12345678
+        msr = self.MailboxMsr([0, 1 << ctl.OC_MAILBOX_BUSY_BIT, result])
+        with mock.patch.object(ctl.time, "sleep"):
+            returned = ctl.execute_oc_mailbox(msr, 0x8000001000000000)
+        self.assertEqual(returned, result)
+        self.assertEqual(msr.writes, [(0, "MSR_OC_MAILBOX", 0x8000001000000000)])
+
+    def test_mailbox_rejects_nonzero_completion_status(self):
+        result = (0x7 << ctl.OC_MAILBOX_STATUS_SHIFT) | 0x1234
+        msr = self.MailboxMsr([0, result])
+        with self.assertRaises(ctl.ControlError) as caught:
+            ctl.execute_oc_mailbox(msr, 0x8000001000000000)
+        self.assertIn("status 0x07", str(caught.exception))
 
 
 class TransactionTests(unittest.TestCase):
