@@ -1123,6 +1123,11 @@ def command_power(args, msr):
                 )
     except (ControlError, ProbeError, PowercapError, MMIOError, OSError) as exc:
         rollback_errors = []
+        if mmio_zone is not None and powercap_before is not None:
+            try:
+                mmio_zone.restore(powercap_before)
+            except PowercapError as rollback_exc:
+                rollback_errors.append(f"powercap: {rollback_exc}")
         if direct_mapping is not None and direct_before is not None:
             try:
                 if direct_mapping.read64(0) != direct_before:
@@ -1131,11 +1136,6 @@ def command_power(args, msr):
                     rollback_errors.append("direct MCHBAR verify mismatch")
             except (MMIOError, OSError) as rollback_exc:
                 rollback_errors.append(f"direct MCHBAR: {rollback_exc}")
-        if mmio_zone is not None and powercap_before is not None:
-            try:
-                mmio_zone.restore(powercap_before)
-            except PowercapError as rollback_exc:
-                rollback_errors.append(f"powercap: {rollback_exc}")
         if msr_results:
             rollback = [
                 (result["cpu"], result["register"], result["before"])
