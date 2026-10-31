@@ -205,6 +205,33 @@ class ProfileControlTests(unittest.TestCase):
         self.assertEqual(len(write.call_args_list), 2)
         self.assertTrue(all(not (call.args[1] & 1) for call in write.call_args_list))
 
+    def test_set_turbo_rolls_back_first_cpu_when_second_cpu_write_fails(self):
+        throttled = load_throttled()
+        state = {0: 0, 1: 0}
+        writes = []
+
+        def readmsr(name, *args, cpu=None, **kwargs):
+            return state[cpu]
+
+        def writemsr(name, value, cpu=None):
+            writes.append((cpu, value))
+            if cpu == 1 and value & (1 << throttled.TURBO_DISABLE_BIT):
+                raise OSError("synthetic cpu1 write failure")
+            state[cpu] = value
+
+        with mock.patch.object(
+            throttled,
+            "_ensure_msr_module",
+            return_value=["/dev/cpu/0/msr", "/dev/cpu/1/msr"],
+        ):
+            with mock.patch.object(throttled, "readmsr", side_effect=readmsr):
+                with mock.patch.object(throttled, "writemsr", side_effect=writemsr):
+                    with self.assertRaises(OSError):
+                        throttled.set_turbo(False)
+
+        self.assertEqual(state, {0: 0, 1: 0})
+        self.assertTrue(any(cpu == 0 and value == 0 for cpu, value in writes))
+
     def test_set_turbo_skips_identical_register_value(self):
         throttled = load_throttled()
         with mock.patch.object(throttled, "_ensure_msr_module", return_value=["/dev/cpu/0/msr"]):
