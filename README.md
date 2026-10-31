@@ -166,6 +166,7 @@ sudo throttlectl bd-prochot on
 sudo throttlectl speedstep on
 sudo throttlectl clock-mod
 sudo throttlectl multiplier 38
+sudo throttlectl temp-target 90
 
 sudo throttlectl power --pl1 25 --pl2 44 --tau1 28
 sudo throttlectl turbo-ratio --1c 42 --2c 41 --3c 39 --4c 39
@@ -197,8 +198,8 @@ sudo python3 throttled_probe.py --restore-snapshot /root/830g6-stock.json
 sudo python3 throttled_probe.py --restore-snapshot /root/830g6-stock.json --apply-restore
 ```
 
-The snapshot currently covers package power/temperature/BD-PROCHOT/cTDP,
-Turbo Ratio, HWP package request, and per-CPU HWP, Turbo/SpeedStep,
+The snapshot currently covers package power/temperature/cTDP, Turbo Ratio and
+HWP package request, plus per-CPU BD-PROCHOT/POWER_CTL, HWP, Turbo/SpeedStep,
 clock-modulation, and PERF_CTL state. FIVR/IccMax are intentionally excluded
 from the strict stock snapshot because merely querying them requires an OC
 mailbox write. See `docs/elitebook-830-g6.md` for the implementation map and
