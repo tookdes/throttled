@@ -85,6 +85,7 @@ class ProfileControlTests(unittest.TestCase):
             0: 0x0000000011223344,
             2: 0x0000000055667788,
         }
+        original = dict(current)
 
         def readmsr(name, *args, cpu=None, **kwargs):
             if name == "IA32_PM_ENABLE":
@@ -92,16 +93,20 @@ class ProfileControlTests(unittest.TestCase):
             self.assertEqual(name, "IA32_HWP_REQUEST")
             return current[cpu]
 
+        def writemsr(name, value, cpu=None):
+            self.assertEqual(name, "IA32_HWP_REQUEST")
+            current[cpu] = value
+
         with mock.patch.object(throttled, "_ensure_msr_module", return_value=["/dev/cpu/0/msr", "/dev/cpu/2/msr"]):
             with mock.patch.object(throttled, "readmsr", side_effect=readmsr):
-                with mock.patch.object(throttled, "writemsr") as write:
+                with mock.patch.object(throttled, "writemsr", side_effect=writemsr) as write:
                     throttled.set_hwp_epp(0x20)
 
         self.assertEqual(
             write.call_args_list,
             [
-                mock.call("IA32_HWP_REQUEST", (current[0] & 0xFFFFFFFF00FFFFFF) | (0x20 << 24), cpu=0),
-                mock.call("IA32_HWP_REQUEST", (current[2] & 0xFFFFFFFF00FFFFFF) | (0x20 << 24), cpu=2),
+                mock.call("IA32_HWP_REQUEST", (original[0] & 0xFFFFFFFF00FFFFFF) | (0x20 << 24), cpu=0),
+                mock.call("IA32_HWP_REQUEST", (original[2] & 0xFFFFFFFF00FFFFFF) | (0x20 << 24), cpu=2),
             ],
         )
 
@@ -111,18 +116,25 @@ class ProfileControlTests(unittest.TestCase):
             0: (1 << 42) | 0x00112233,
             1: (1 << 42) | 0x00445566,
         }
-        package = 0xABCDEF0012345678
+        state = {"package": 0xABCDEF0012345678}
+        package = state["package"]
 
         def readmsr(name, *args, cpu=None, **kwargs):
             if name == "IA32_PM_ENABLE":
                 return 1
             if name == "IA32_HWP_REQUEST_PKG":
-                return package
+                return state["package"]
             return current[cpu]
+
+        def writemsr(name, value, cpu=None):
+            if name == "IA32_HWP_REQUEST_PKG":
+                state["package"] = value
+            else:
+                current[cpu] = value
 
         with mock.patch.object(throttled, "_ensure_msr_module", return_value=["/dev/cpu/0/msr", "/dev/cpu/1/msr"]):
             with mock.patch.object(throttled, "readmsr", side_effect=readmsr):
-                with mock.patch.object(throttled, "writemsr") as write:
+                with mock.patch.object(throttled, "writemsr", side_effect=writemsr) as write:
                     throttled.set_hwp_epp(0x80)
 
         self.assertEqual(write.call_args_list[0], mock.call(
@@ -164,26 +176,32 @@ class ProfileControlTests(unittest.TestCase):
         def read_turbo(name, *args, cpu=None, **kwargs):
             return cpu_values[cpu]
 
+        def write_turbo(name, value, cpu=None):
+            cpu_values[cpu] = value
+
         with mock.patch.object(throttled, "_ensure_msr_module", return_value=["/dev/cpu/0/msr", "/dev/cpu/1/msr"]):
             with mock.patch.object(throttled, "readmsr", side_effect=read_turbo):
-                with mock.patch.object(throttled, "writemsr") as write:
+                with mock.patch.object(throttled, "writemsr", side_effect=write_turbo) as write:
                     throttled.set_turbo(False)
 
         self.assertTrue(all(call.args[1] & (1 << throttled.TURBO_DISABLE_BIT) for call in write.call_args_list))
 
+        bd_values = {0: 0, 1: 0}
         with mock.patch.object(throttled, "_ensure_msr_module", return_value=["/dev/cpu/0/msr", "/dev/cpu/1/msr"]):
-            with mock.patch.object(throttled, "readmsr", return_value=0):
-                with mock.patch.object(throttled, "writemsr") as write:
+            with mock.patch.object(throttled, "readmsr", side_effect=lambda name, *args, cpu=None, **kwargs: bd_values[cpu]):
+                with mock.patch.object(
+                    throttled, "writemsr", side_effect=lambda name, value, cpu=None: bd_values.__setitem__(cpu, value)
+                ) as write:
                     throttled.set_bdprochot(True)
         self.assertEqual(len(write.call_args_list), 2)
         self.assertTrue(all(call.args[1] & 1 for call in write.call_args_list))
 
         with mock.patch.object(throttled, "_ensure_msr_module", return_value=["/dev/cpu/0/msr", "/dev/cpu/1/msr"]):
-            with mock.patch.object(throttled, "readmsr", return_value=1):
-                with mock.patch.object(throttled, "writemsr") as write:
+            with mock.patch.object(throttled, "readmsr", side_effect=lambda name, *args, cpu=None, **kwargs: bd_values[cpu]):
+                with mock.patch.object(
+                    throttled, "writemsr", side_effect=lambda name, value, cpu=None: bd_values.__setitem__(cpu, value)
+                ) as write:
                     throttled.set_bdprochot(False)
-        # Already disabled? No writes should be needed when bit 0 is clear only;
-        # here the input is 1 so each CPU must be cleared.
         self.assertEqual(len(write.call_args_list), 2)
         self.assertTrue(all(not (call.args[1] & 1) for call in write.call_args_list))
 
