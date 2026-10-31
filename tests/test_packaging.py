@@ -34,6 +34,7 @@ class PackagingTests(unittest.TestCase):
                 'usr/lib/throttled/mmio.py',
                 'usr/lib/throttled/throttled.py',
                 'usr/lib/throttled/throttled_ctl.py',
+                'usr/lib/throttled/throttled_powercap.py',
                 'usr/lib/throttled/throttled_probe.py',
                 'usr/lib/throttled/throttled_version.py',
                 'usr/share/doc/throttled/copyright',
