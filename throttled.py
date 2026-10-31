@@ -20,6 +20,7 @@ from threading import Event, Lock, Thread, current_thread, main_thread
 from time import time
 
 from mmio import MMIO, MMIOError
+from throttled_powercap import PowercapError, find_mmio_package_zone
 from throttled_version import __version__
 
 DEFAULT_SYSFS_POWER_PATH = '/sys/class/power_supply/AC*/online'
@@ -666,6 +667,13 @@ def get_cur_pkg_power_limits():
         'PL2_CLAMP': bool(get_value_for_bits(value, 48, 48)),
         'TW2': get_value_for_bits(value, 49, 55),
     }
+
+
+def decode_time_window_field(field):
+    """Decode a 7-bit RAPL time-window field to seconds."""
+    y = field & 0x1F
+    z = (field >> 5) & 0x3
+    return (2**y) * (1.0 + z / 4.0) * get_time_unit()
 
 
 def calc_time_window_vars(t):
@@ -1376,20 +1384,24 @@ def power_thread(state, exit_event):
 def _power_thread(state, exit_event):
     """Daemon main loop: periodically (re-)apply throttling MSRs."""
     config, regs = state['config'], state['regs']
-    mchbar_base = read_mchbar_base()
+    mmio_powercap = find_mmio_package_zone()
     mchbar_mmio = None
-    if mchbar_base is not None:
-        try:
-            mchbar_mmio = MMIO(
-                mchbar_base + MCHBAR_PACKAGE_POWER_LIMIT_OFFSET,
-                MCHBAR_PACKAGE_POWER_LIMIT_SIZE,
-            )
-        except MMIOError:
-            warning('Unable to open /dev/mem. MMIO package power-limit writes are disabled.')
-            warning(
-                'Check CONFIG_DEVMEM=y and that kernel lockdown is disabled '
-                '(CONFIG_IO_STRICT_DEVMEM can also block this region).'
-            )
+    if mmio_powercap is not None:
+        log(f'[I] Using kernel intel-rapl-mmio zone: {mmio_powercap.path}')
+    else:
+        mchbar_base = read_mchbar_base()
+        if mchbar_base is not None:
+            try:
+                mchbar_mmio = MMIO(
+                    mchbar_base + MCHBAR_PACKAGE_POWER_LIMIT_OFFSET,
+                    MCHBAR_PACKAGE_POWER_LIMIT_SIZE,
+                )
+            except MMIOError:
+                warning('Unable to open /dev/mem. MMIO package power-limit writes are disabled.')
+                warning(
+                    'Check CONFIG_DEVMEM=y and that kernel lockdown is disabled '
+                    '(CONFIG_IO_STRICT_DEVMEM can also block this region).'
+                )
 
     next_hwp_write = 0
     applied_source = power['source']
@@ -1467,8 +1479,24 @@ def _power_thread(state, exit_event):
                 read_value = readmsr('MSR_PKG_POWER_LIMIT', flatten=True)
                 match = OK if write_value == read_value else ERR
                 log(f'[D] MSR PACKAGE_POWER_LIMIT - write {write_value:#x} - read {read_value:#x} - match {match}')
-            if mchbar_mmio is not None:
-                # set MCHBAR register to the same PL1/2 values
+            if mmio_powercap is not None:
+                try:
+                    power_unit = get_power_unit()
+                    pl1_ticks = get_value_for_bits(write_value, 0, 14)
+                    pl2_ticks = get_value_for_bits(write_value, 32, 46)
+                    tw1 = get_value_for_bits(write_value, 17, 23)
+                    tw2 = get_value_for_bits(write_value, 49, 55)
+                    mmio_powercap.write(
+                        pl1_w=pl1_ticks * power_unit,
+                        pl2_w=pl2_ticks * power_unit,
+                        tau1_s=decode_time_window_field(tw1),
+                        tau2_s=decode_time_window_field(tw2),
+                    )
+                except PowercapError as e:
+                    warning(f'Unable to write intel-rapl-mmio power limits ({e}); disabling kernel MMIO writes.')
+                    mmio_powercap = None
+            elif mchbar_mmio is not None:
+                # Fallback for kernels that do not expose intel-rapl-mmio.
                 try:
                     mmio_current = mchbar_mmio.read64(0)
                     if (mmio_current >> PKG_POWER_LIMIT_LOCK_BIT) & 1:
