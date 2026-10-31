@@ -48,7 +48,7 @@ class DBusHelperTests(unittest.TestCase):
                 apply.assert_called_once()
                 self.assertEqual(apply.call_args.args[:3], (config, None, 'AC'))
                 self.assertTrue(apply.call_args.kwargs['apply_mailbox'])
-                self.assertTrue(apply.call_args.kwargs['apply_hwp'])
+                self.assertFalse(apply.call_args.kwargs['apply_hwp'])
 
     def test_dbus_resume_signal_enabled_when_undervolt_or_iccmax_configured(self):
         throttled = load_throttled()
