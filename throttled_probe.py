@@ -19,7 +19,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from throttled_powercap import probe_powercap
+from throttled_powercap import PowercapError, find_mmio_package_zone, probe_powercap
 
 try:
     from mmio import MMIO, MMIOError
@@ -31,6 +31,7 @@ except ImportError:
 
 
 TARGET_DMI_PRODUCT = "HP EliteBook 830 G6"
+SNAPSHOT_SCHEMA_VERSION = 2
 TARGET_CPUIDS = {
     # Intel microcode guidance identifies Whiskey Lake-U as CPUID 806EB/806EC.
     (6, 142, 11): "Whiskey Lake-U (806EB)",
@@ -481,7 +482,7 @@ def cpu_target_status(cpu, dmi):
 
 def collect_snapshot(msr, cpu, dmi):
     snapshot = {
-        "schema_version": 1,
+        "schema_version": SNAPSHOT_SCHEMA_VERSION,
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "target": TARGET_DMI_PRODUCT,
         "cpu": {
@@ -495,14 +496,21 @@ def collect_snapshot(msr, cpu, dmi):
         "dmi": dmi,
         "package_msrs": {},
         "per_cpu_msrs": {},
+        "power_backends": {},
         "notes": [
             "FIVR/OC-mailbox voltage and IccMax state is not captured because querying it requires WRMSR.",
-            "MMIO package power limits are not restored by this milestone.",
+            "Kernel powercap and an MMIO==MSR-validated direct MCHBAR mirror are captured when available.",
         ],
     }
     for name in SNAPSHOT_PACKAGE_REGS:
         value, error = try_read(msr, 0, name)
         snapshot["package_msrs"][name] = {"value": f"0x{value:016x}"} if error is None else {"error": error}
+
+    pkg_item = snapshot["package_msrs"].get("MSR_PKG_POWER_LIMIT", {})
+    pkg_raw = int(pkg_item["value"], 16) if "value" in pkg_item else None
+    powercap_state = probe_powercap()
+    snapshot["power_backends"]["kernel_mmio"] = powercap_state.get("mmio")
+    snapshot["power_backends"]["direct_mchbar"] = probe_mmio(pkg_raw)
 
     current_cpus = msr.cpus()
     for logical_cpu in current_cpus:
@@ -560,9 +568,10 @@ def validate_snapshot_completeness(snapshot, current_cpus):
 def validate_snapshot_schema(snapshot, current_cpus):
     if not isinstance(snapshot, dict):
         raise ProbeError("snapshot root must be a JSON object")
-    if snapshot.get("schema_version") != 1:
+    if snapshot.get("schema_version") != SNAPSHOT_SCHEMA_VERSION:
         raise ProbeError(
-            f"unsupported snapshot schema_version {snapshot.get('schema_version')!r}; expected 1"
+            f"unsupported snapshot schema_version {snapshot.get('schema_version')!r}; "
+            f"expected {SNAPSHOT_SCHEMA_VERSION}"
         )
     if snapshot.get("target") != TARGET_DMI_PRODUCT:
         raise ProbeError(
@@ -688,6 +697,112 @@ def apply_restore_plan(msr, plan):
         raise ProbeError(str(exc) + suffix) from exc
 
     return results
+
+
+def _open_snapshot_mchbar(snapshot, current_msr_raw):
+    direct = (snapshot.get("power_backends") or {}).get("direct_mchbar") or {}
+    if not direct.get("available") or not direct.get("matches_msr"):
+        return None, None
+
+    identity = read_host_bridge_identity()
+    if identity is None:
+        raise ProbeError("snapshot captured direct MCHBAR but current host bridge identity is unavailable")
+    vendor, device = identity
+    if vendor != direct.get("vendor_id") or device != direct.get("device_id"):
+        raise ProbeError(
+            f"snapshot host bridge {direct.get('vendor_id')}:{direct.get('device_id')} "
+            f"does not match current {vendor}:{device}"
+        )
+    base = read_mchbar_base(device)
+    if base is None or MMIO is None:
+        raise ProbeError("snapshot captured direct MCHBAR but current validated mapping is unavailable")
+
+    try:
+        mapping = MMIO(
+            base + MCHBAR_PACKAGE_POWER_LIMIT_OFFSET,
+            MCHBAR_PACKAGE_POWER_LIMIT_SIZE,
+        )
+        current_raw = mapping.read64(0)
+    except (MMIOError, OSError, AttributeError) as exc:
+        raise ProbeError(f"unable to open current direct MCHBAR for restore: {exc}") from exc
+
+    if current_raw != current_msr_raw:
+        mapping.close()
+        raise ProbeError(
+            f"refusing direct MCHBAR restore because current MMIO {current_raw:#x} "
+            f"does not match current MSR {current_msr_raw:#x}"
+        )
+    return mapping, current_raw
+
+
+def _restore_direct_mchbar(mapping, target_raw):
+    current = mapping.read64(0)
+    if ((current >> 63) & 1) and current != target_raw:
+        raise ProbeError("direct MCHBAR package power limit is locked; cannot restore it")
+    if current != target_raw:
+        mapping.write64(0, target_raw)
+    readback = mapping.read64(0)
+    if readback != target_raw:
+        raise ProbeError(
+            f"direct MCHBAR restore verify failed: wrote {target_raw:#x}, read {readback:#x}"
+        )
+
+
+def apply_full_restore(msr, plan, snapshot):
+    """Restore MSRs plus every package-power backend captured by snapshot v2."""
+    current_msr_raw = msr.read(0, "MSR_PKG_POWER_LIMIT")
+    rollback_plan = [(cpu, name, msr.read(cpu, name)) for cpu, name, _ in plan]
+
+    backends = snapshot.get("power_backends") or {}
+    saved_powercap = backends.get("kernel_mmio")
+    powercap_zone = None
+    powercap_before = None
+    if saved_powercap is not None:
+        powercap_zone = find_mmio_package_zone()
+        if powercap_zone is None:
+            raise ProbeError("snapshot captured intel-rapl-mmio but the current kernel exposes no matching zone")
+        powercap_before = powercap_zone.snapshot()
+
+    direct_mapping, direct_before = _open_snapshot_mchbar(snapshot, current_msr_raw)
+    direct_saved = backends.get("direct_mchbar") or {}
+    direct_target = direct_saved.get("pkg_power_limit_raw") if direct_mapping is not None else None
+
+    try:
+        apply_restore_plan(msr, plan)
+
+        if powercap_zone is not None:
+            powercap_zone.restore(saved_powercap)
+
+        if direct_mapping is not None:
+            _restore_direct_mchbar(direct_mapping, direct_target)
+
+        target_msr = int(snapshot["package_msrs"]["MSR_PKG_POWER_LIMIT"]["value"], 16)
+        if msr.read(0, "MSR_PKG_POWER_LIMIT") != target_msr:
+            raise ProbeError("package power MSR changed during backend restore")
+
+        if direct_mapping is not None and direct_mapping.read64(0) != target_msr:
+            raise ProbeError("restored direct MCHBAR mirror does not match restored package power MSR")
+    except (ProbeError, PowercapError, OSError) as exc:
+        rollback_errors = []
+        if direct_mapping is not None and direct_before is not None:
+            try:
+                _restore_direct_mchbar(direct_mapping, direct_before)
+            except (ProbeError, OSError) as rollback_exc:
+                rollback_errors.append(f"MCHBAR: {rollback_exc}")
+        if powercap_zone is not None and powercap_before is not None:
+            try:
+                powercap_zone.restore(powercap_before)
+            except PowercapError as rollback_exc:
+                rollback_errors.append(f"powercap: {rollback_exc}")
+        try:
+            apply_restore_plan(msr, rollback_plan)
+        except ProbeError as rollback_exc:
+            rollback_errors.append(f"MSR: {rollback_exc}")
+        suffix = f"; rollback issues: {'; '.join(rollback_errors)}" if rollback_errors else "; rollback attempted"
+        raise ProbeError(f"full snapshot restore failed: {exc}{suffix}") from exc
+    finally:
+        if direct_mapping is not None:
+            direct_mapping.close()
 
 
 def probe_machine(msr):
@@ -1027,8 +1142,8 @@ def _main(argv=None):
         if not args.apply_restore:
             print("Dry run only. Add --apply-restore to write and verify these values.")
             return 0
-        apply_restore_plan(msr, plan)
-        print("Snapshot restore verified.")
+        apply_full_restore(msr, plan, snapshot)
+        print("Snapshot restore verified across captured MSR/MMIO power backends.")
         return 0
 
     report = probe_machine(msr)
