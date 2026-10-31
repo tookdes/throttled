@@ -1877,6 +1877,8 @@ def build_arg_parser():
         nargs='?',
         help='realtime monitoring of throttling causes (default 1s)',
     )
+    parser.add_argument('--json', action='store_true', help='with --probe: print JSON output')
+    parser.add_argument('--snapshot', metavar='PATH', help='with --probe: save a read-only stock snapshot')
     parser.add_argument('--config', default='/etc/throttled.conf', help='override default config file path')
     parser.add_argument('--force', action='store_true', help='bypass compatibility checks (EXPERTS only)')
     parser.add_argument('--log', metavar='/path/to/file', help='log to file instead of stdout')
@@ -1888,12 +1890,21 @@ def main():
     """Daemon entrypoint: parse args, validate platform, start power thread."""
     global args
 
-    args = build_arg_parser().parse_args()
+    parser = build_arg_parser()
+    args = parser.parse_args()
 
     if getattr(args, 'probe', False):
         from throttled_probe import main as probe_main
 
-        return probe_main([])
+        probe_args = []
+        if args.json:
+            probe_args.append('--json')
+        if args.snapshot:
+            probe_args.extend(('--snapshot', args.snapshot))
+        return probe_main(probe_args)
+
+    if args.json or args.snapshot:
+        parser.error('--json/--snapshot are valid only together with --probe')
 
     if args.log:
         try:
