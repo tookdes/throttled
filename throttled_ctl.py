@@ -21,6 +21,7 @@ import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 from throttled_powercap import PowercapError, find_mmio_package_zone
 from throttled_probe import (
@@ -183,7 +184,11 @@ def encode_power_watts(watts, power_unit):
 
 
 def encode_time_window(seconds, time_unit):
-    """Return the closest representable RAPL time-window field."""
+    """Return the smallest representable RAPL time window not below the request.
+
+    This matches the daemon's conservative policy: a requested Tau is never
+    silently shortened by quantisation.
+    """
     if not math.isfinite(seconds) or seconds <= 0:
         raise ControlError("time window must be finite and greater than zero")
 
@@ -191,8 +196,11 @@ def encode_time_window(seconds, time_unit):
     for y in range(32):
         for z in range(4):
             represented = (2**y) * (1.0 + z / 4.0) * time_unit
-            choices.append((abs(represented - seconds), represented, y | (z << 5)))
-    _, represented, field = min(choices, key=lambda item: (item[0], item[1]))
+            if represented >= seconds:
+                choices.append((represented, y | (z << 5)))
+    if not choices:
+        raise ControlError(f"time window {seconds:g}s exceeds the representable RAPL range")
+    represented, field = min(choices, key=lambda item: item[0])
     return field, represented
 
 
@@ -419,6 +427,23 @@ def daemon_is_active():
         return False
 
 
+def ensure_msr_writes_allowed():
+    """Enable the msr module write policy only for explicit write-capable commands."""
+    path = "/sys/module/msr/parameters/allow_writes"
+    try:
+        current = Path(path).read_text(encoding="ascii").strip().lower()
+    except OSError:
+        return
+    if current in ("on", "1", "y", "yes"):
+        return
+    try:
+        Path(path).write_text("on", encoding="ascii")
+    except OSError as exc:
+        raise ControlError(
+            f"MSR writes are disabled and {path} could not be set to on: {exc}"
+        ) from exc
+
+
 def validate_write_environment(args):
     if os.geteuid() != 0:
         raise ControlError("register writes require root; run with sudo")
@@ -428,6 +453,7 @@ def validate_write_environment(args):
             "throttled.service is active and may overwrite one-shot register changes; "
             "stop it first or pass --allow-daemon-race"
         )
+    ensure_msr_writes_allowed()
 
 
 def apply_transaction(msr, writes):
@@ -448,8 +474,8 @@ def apply_transaction(msr, writes):
             if new_value == original:
                 completed.append((cpu, register, original))
                 continue
-            completed.append((cpu, register, original))
             msr.write(cpu, register, new_value)
+            completed.append((cpu, register, original))
             readback = msr.read(cpu, register)
             if readback != new_value:
                 raise ControlError(
@@ -463,7 +489,7 @@ def apply_transaction(msr, writes):
                 msr.write(cpu, register, original)
                 if msr.read(cpu, register) != original:
                     rollback_errors.append(f"cpu{cpu} {register}: verify mismatch")
-            except ProbeError as rollback_exc:
+            except (ProbeError, ControlError) as rollback_exc:
                 rollback_errors.append(f"cpu{cpu} {register}: {rollback_exc}")
         suffix = f"; rollback issues: {'; '.join(rollback_errors)}" if rollback_errors else "; rollback attempted"
         raise ControlError(str(exc) + suffix) from exc
@@ -540,6 +566,11 @@ def command_bd_prochot(args, msr):
 
 def command_speedstep(args, msr):
     validate_write_environment(args)
+    if bit(msr.read(0, "IA32_PM_ENABLE"), 0):
+        raise ControlError(
+            "SpeedStep/EIST control is not meaningful while HWP/Speed Shift is enabled; "
+            "disable HWP in firmware before using this legacy control"
+        )
     writes = []
     for cpu in msr.cpus():
         raw = msr.read(cpu, "IA32_MISC_ENABLE")
@@ -566,17 +597,20 @@ def command_temp_target(args, msr):
     if not bit(platform, 30):
         raise ControlError("MSR_PLATFORM_INFO reports programmable temperature target is unavailable")
 
-    writes = []
-    for cpu in msr.cpus():
-        raw = msr.read(cpu, "MSR_TEMPERATURE_TARGET")
-        writes.append((cpu, "MSR_TEMPERATURE_TARGET", update_temperature_target(raw, args.celsius)))
-    apply_transaction(msr, writes)
+    raw = msr.read(0, "MSR_TEMPERATURE_TARGET")
+    updated = update_temperature_target(raw, args.celsius)
+    apply_transaction(msr, [(0, "MSR_TEMPERATURE_TARGET", updated)])
     print(f"Temperature target set to {args.celsius} C and verified.")
     return 0
 
 
 def command_multiplier(args, msr):
     validate_write_environment(args)
+    if bit(msr.read(0, "IA32_PM_ENABLE"), 0):
+        raise ControlError(
+            "IA32_PERF_CTL multiplier requests are ignored while HWP/Speed Shift is enabled; "
+            "use EPP/HWP controls instead"
+        )
     platform = msr.read(0, "MSR_PLATFORM_INFO")
     min_ratio = (platform >> 48) & 0xFF
     max_non_turbo = (platform >> 8) & 0xFF
@@ -750,7 +784,7 @@ def command_fivr_set(args, msr):
                 write_mailbox(msr, encode_fivr_write_ticks(plane, original[plane]))
                 if read_mailbox_fivr_ticks(msr, plane) != original[plane]:
                     rollback_errors.append(f"{plane}: verify mismatch")
-            except ProbeError as rollback_exc:
+            except (ProbeError, ControlError) as rollback_exc:
                 rollback_errors.append(f"{plane}: {rollback_exc}")
         suffix = f"; rollback issues: {'; '.join(rollback_errors)}" if rollback_errors else "; rollback attempted"
         raise ControlError(str(exc) + suffix) from exc
@@ -795,7 +829,7 @@ def command_iccmax_set(args, msr):
                 write_mailbox(msr, encode_iccmax_write_field(plane, original[plane]))
                 if read_mailbox_iccmax_field(msr, plane) != original[plane]:
                     rollback_errors.append(f"{plane}: verify mismatch")
-            except ProbeError as rollback_exc:
+            except (ProbeError, ControlError) as rollback_exc:
                 rollback_errors.append(f"{plane}: {rollback_exc}")
         suffix = f"; rollback issues: {'; '.join(rollback_errors)}" if rollback_errors else "; rollback attempted"
         raise ControlError(str(exc) + suffix) from exc
@@ -838,21 +872,31 @@ def command_power(args, msr):
         pl2_clamp=args.pl2_clamp,
     )
 
-    # Package scoped on the target, but the existing daemon intentionally writes
-    # all online logical CPUs. Match that behavior and verify each view.
-    writes = [(cpu, "MSR_PKG_POWER_LIMIT", updated) for cpu in msr.cpus()]
-    msr_results = apply_transaction(msr, writes)
+    bit_control_requested = any(
+        value is not None
+        for value in (args.pl1_enable, args.pl2_enable, args.pl1_clamp, args.pl2_clamp)
+    )
+    if bit_control_requested and not args.no_mmio_sync:
+        raise ControlError(
+            "PL Enable/Clamp bits cannot be synchronized through intel-rapl-mmio. "
+            "For now use --no-mmio-sync only for an explicitly MSR-only validation; "
+            "direct MCHBAR bit control remains gated on read-only mirror validation."
+        )
 
+    # MSR_PKG_POWER_LIMIT is package-scoped on the single-package 830 G6.
+    msr_results = apply_transaction(msr, [(0, "MSR_PKG_POWER_LIMIT", updated)])
+
+    target_decoded = decode_pkg_power_limit(updated, units)
     mmio_zone = None if args.no_mmio_sync else find_mmio_package_zone()
     mmio_requested = any(value is not None for value in (args.pl1, args.pl2, args.tau1, args.tau2))
     mmio_state = None
     if mmio_zone is not None and mmio_requested:
         try:
             mmio_state = mmio_zone.write(
-                pl1_w=args.pl1,
-                pl2_w=args.pl2,
-                tau1_s=args.tau1,
-                tau2_s=args.tau2,
+                pl1_w=target_decoded["pl1"]["watts"] if args.pl1 is not None else None,
+                pl2_w=target_decoded["pl2"]["watts"] if args.pl2 is not None else None,
+                tau1_s=target_decoded["pl1"]["seconds"] if args.tau1 is not None else None,
+                tau2_s=target_decoded["pl2"]["seconds"] if args.tau2 is not None else None,
             )
         except PowercapError as exc:
             rollback = [
@@ -938,7 +982,7 @@ def build_parser():
     limits.add_argument("--fail-on-active", action="store_true", help="return status 1 while any limit is active")
     limits.set_defaults(handler=command_limits)
 
-    monitor = sub.add_parser("monitor", help="live Ratio/Effective MHz/C0%/temperature/limit monitor")
+    monitor = sub.add_parser("monitor", help="live Ratio/Effective MHz/C0%%/temperature/limit monitor")
     monitor.add_argument("--interval", type=positive_finite, default=1.0, metavar="SECONDS")
     monitor.add_argument("--count", type=nonnegative_int, default=0, metavar="N", help="stop after N samples (0 = until Ctrl-C)")
     monitor.set_defaults(handler=command_monitor)
