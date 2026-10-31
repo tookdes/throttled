@@ -34,18 +34,21 @@ class DBusHelperTests(unittest.TestCase):
 
     def test_resume_callback_reapplies_settings_only_after_wake(self):
         throttled = load_throttled()
+        throttled.power['source'] = 'AC'
         config = throttled.configparser.ConfigParser()
         config.add_section('GENERAL')
         config.set('GENERAL', 'Enabled', 'True')
-        calls = []
 
-        with mock.patch.object(throttled, 'undervolt', lambda config: calls.append(('undervolt', config))):
-            with mock.patch.object(throttled, 'set_icc_max', lambda config: calls.append(('iccmax', config))):
+        with mock.patch.object(throttled, 'find_mmio_package_zone', return_value=None):
+            with mock.patch.object(throttled, 'apply_runtime_profile') as apply:
                 throttled.handle_sleep_prepare(True, config)
-                self.assertEqual(calls, [])
+                apply.assert_not_called()
 
                 throttled.handle_sleep_prepare(False, config)
-                self.assertEqual(calls, [('undervolt', config), ('iccmax', config)])
+                apply.assert_called_once()
+                self.assertEqual(apply.call_args.args[:3], (config, None, 'AC'))
+                self.assertTrue(apply.call_args.kwargs['apply_mailbox'])
+                self.assertTrue(apply.call_args.kwargs['apply_hwp'])
 
     def test_dbus_resume_signal_enabled_when_undervolt_or_iccmax_configured(self):
         throttled = load_throttled()
@@ -56,6 +59,22 @@ class DBusHelperTests(unittest.TestCase):
         config.set('UNDERVOLT', 'CORE', '-50')
 
         self.assertIs(throttled.should_listen_for_resume(config), True)
+
+    def test_dbus_resume_signal_enabled_for_tpl_or_temperature_profiles(self):
+        throttled = load_throttled()
+        for option, value in (
+            ('PL1_Tdp_W', '25'),
+            ('PL1_Enable', 'True'),
+            ('Trip_Temp_C', '90'),
+            ('cTDP', '0'),
+        ):
+            with self.subTest(option=option):
+                config = throttled.configparser.ConfigParser()
+                config.read_dict({
+                    'GENERAL': {'Enabled': 'True'},
+                    'AC': {option: value},
+                })
+                self.assertIs(throttled.should_listen_for_resume(config), True)
 
     def test_dbus_resume_signal_disabled_without_undervolt_or_iccmax(self):
         throttled = load_throttled()
