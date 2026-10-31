@@ -1016,7 +1016,7 @@ def load_config():
 
     # config values sanity check
     for power_source in power_profiles:
-        for option in ('Update_Rate_s', 'PL1_Tdp_W', 'PL1_Duration_s', 'PL2_Tdp_W', 'PL2_Duration_S'):
+        for option in ('Update_Rate_s', 'PL1_Tdp_W', 'PL1_Duration_s', 'PL2_Tdp_W', 'PL2_Duration_s'):
             value = None
             # a malformed profile value may mask a second malformed value inherited from [DEFAULT]
             for _ in range(2):
