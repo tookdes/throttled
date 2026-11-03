@@ -25,6 +25,9 @@ from throttled_version import __version__
 DEFAULT_SYSFS_POWER_PATH = '/sys/class/power_supply/AC*/online'
 UPOWER_SERVICE = 'org.freedesktop.UPower'
 UPOWER_PATH = '/org/freedesktop/UPower'
+PPD_SERVICE = 'net.hadess.PowerProfiles'
+PPD_PATH = '/net/hadess/PowerProfiles'
+PPD_INTERFACE = 'net.hadess.PowerProfiles'
 LOGIN1_SERVICE = 'org.freedesktop.login1'
 LOGIN1_PATH = '/org/freedesktop/login1'
 LOGIN1_MANAGER_INTERFACE = 'org.freedesktop.login1.Manager'
@@ -34,10 +37,24 @@ CURRENT_PLANES = {'CORE': 0, 'GPU': 1, 'CACHE': 2}
 TRIP_TEMP_RANGE = [40, 97]
 PKG_POWER_LIMIT_POWER_MASK = (1 << 15) - 1
 PKG_POWER_LIMIT_TIME_WINDOW_MASK = (1 << 7) - 1
-POWER_PROFILES = ('AC', 'BATTERY')
-UNDERVOLT_KEYS = ('UNDERVOLT', 'UNDERVOLT.AC', 'UNDERVOLT.BATTERY')
-ICCMAX_KEYS = ('ICCMAX', 'ICCMAX.AC', 'ICCMAX.BATTERY')
-power = {'source': None, 'method': 'polling'}
+POWER_PROFILES = ('AC', 'BATTERY', 'PERFORMANCE', 'BALANCED', 'POWER_SAVER')
+UNDERVOLT_KEYS = (
+    'UNDERVOLT',
+    'UNDERVOLT.AC',
+    'UNDERVOLT.BATTERY',
+    'UNDERVOLT.PERFORMANCE',
+    'UNDERVOLT.BALANCED',
+    'UNDERVOLT.POWER_SAVER',
+)
+ICCMAX_KEYS = (
+    'ICCMAX',
+    'ICCMAX.AC',
+    'ICCMAX.BATTERY',
+    'ICCMAX.PERFORMANCE',
+    'ICCMAX.BALANCED',
+    'ICCMAX.POWER_SAVER',
+)
+power = {'source': None, 'method': 'polling', 'ppd_profile': None}
 # serializes config publication with the resume callback's read-then-write
 config_lock = Lock()
 MSR_DICT = {
@@ -227,6 +244,8 @@ MCHBAR_ADDRESS_MASKS_BY_PCI_DEVICE = {
     # Kaby Lake-U/R and Coffee Lake-H target systems (T480/T480s/X1C6, P53).
     0x5914: MCHBAR_ADDRESS_MASK_39_15,
     0x3EC4: MCHBAR_ADDRESS_MASK_39_15,
+    # Coffee Lake/Whiskey Lake-U (HP EliteBook 830 G6, etc.)
+    0x3E34: MCHBAR_ADDRESS_MASK_39_15,
     # Comet Lake-H (Intel doc 615212; coreboot PCI_DID_INTEL_CML_H).
     0x9B54: MCHBAR_ADDRESS_MASK_39_15,
     # Comet Lake-U (Intel doc 615229; coreboot PCI_DID_INTEL_CML_U).
@@ -547,6 +566,56 @@ def handle_sleep_prepare(sleeping, config_or_state):
                 set_icc_max(config)
 
 
+def ppd_to_config_section(profile_name):
+    """Normalize a power-profiles-daemon profile name into a config section name."""
+    if not profile_name:
+        return None
+    mapping = {
+        'performance': 'PERFORMANCE',
+        'balanced': 'BALANCED',
+        'power-saver': 'POWER_SAVER',
+        'power_saver': 'POWER_SAVER',
+    }
+    return mapping.get(str(profile_name).lower(), str(profile_name).upper())
+
+
+def resolve_effective_profile(config, source=None, ppd_profile=None):
+    """Resolve the effective section from PPD profile or fallback to AC/BATTERY.
+
+    Precedence order:
+    1. Specific composite section if configured, e.g. PERFORMANCE.AC or PERFORMANCE.BATTERY
+    2. PPD profile section, e.g. PERFORMANCE, BALANCED, POWER_SAVER
+    3. Power source section, e.g. AC or BATTERY
+    4. First available configured profile
+    """
+    src = source or power.get('source') or 'AC'
+    ppd = ppd_profile or power.get('ppd_profile')
+    ppd_sec = ppd_to_config_section(ppd)
+
+    if ppd_sec:
+        composite = f'{ppd_sec}.{src}'
+        if composite in config:
+            return composite
+        if ppd_sec in config:
+            return ppd_sec
+
+    if src in config:
+        return src
+
+    configured = get_configured_power_profiles(config)
+    if configured:
+        return configured[0]
+
+    return src
+
+
+def handle_ppd_properties_changed(if_name, changed, invalidated):
+    if 'ActiveProfile' in changed:
+        new_profile = str(unwrap_dbus_value(changed['ActiveProfile']))
+        power['ppd_profile'] = new_profile
+        log(f'[I] Power profile changed via PPD: {new_profile}')
+
+
 def handle_ac_properties_changed(if_name, changed, invalidated):
     if "OnBattery" in changed:
         power['method'] = 'dbus'
@@ -576,6 +645,18 @@ async def setup_dbus_signal_handlers(config_or_state):
         upower_properties.on_properties_changed(handle_ac_properties_changed)
         context['upower'] = upower
         context['upower_properties'] = upower_properties
+
+        try:
+            ppd_introspection = await bus.introspect(PPD_SERVICE, PPD_PATH)
+            ppd = bus.get_proxy_object(PPD_SERVICE, PPD_PATH, ppd_introspection)
+            ppd_properties = ppd.get_interface(DBUS_PROPERTIES_INTERFACE)
+            ppd_properties.on_properties_changed(handle_ppd_properties_changed)
+            active_profile_variant = await ppd_properties.call_get(PPD_INTERFACE, 'ActiveProfile')
+            power['ppd_profile'] = str(unwrap_dbus_value(active_profile_variant))
+            context['ppd'] = ppd
+            context['ppd_properties'] = ppd_properties
+        except DBusError:
+            pass
 
         resume_required = should_listen_for_resume(config)
         if resume_required or (
@@ -745,8 +826,10 @@ def get_undervolt(plane=None, convert=False):
 
 def undervolt(config, source=None):
     """Apply the undervolt offsets from the config to all voltage planes."""
-    source = source or power['source']
-    section = f'UNDERVOLT.{source}'
+    eff_source = resolve_effective_profile(config, source=source)
+    section = f'UNDERVOLT.{eff_source}'
+    if section not in config:
+        section = f'UNDERVOLT.{source or power.get("source") or "AC"}'
     if (section not in config and 'UNDERVOLT' not in config) or 'UNDERVOLT' in UNSUPPORTED_FEATURES:
         return
     for plane in VOLTAGE_PLANES:
@@ -794,8 +877,15 @@ def calc_icc_max_amp(msr_value):
 
 
 def get_configured_power_profiles(config):
-    """Return the AC/BATTERY power profiles present in the config file."""
-    return [profile for profile in POWER_PROFILES if profile in config]
+    """Return the power profiles present in the config file."""
+    profiles = [profile for profile in POWER_PROFILES if profile in config]
+    for section in config.sections():
+        if (
+            section.startswith(('PERFORMANCE.', 'BALANCED.', 'POWER_SAVER.'))
+            and section not in profiles
+        ):
+            profiles.append(section)
+    return profiles
 
 
 def get_update_rate(config, power_source):
@@ -828,8 +918,10 @@ def set_icc_max(config, source=None):
     """Apply the IccMax limits from the config to all current planes."""
     if 'ICCMAX' in UNSUPPORTED_FEATURES:
         return
-    source = source or power['source']
-    section = f'ICCMAX.{source}'
+    eff_source = resolve_effective_profile(config, source=source)
+    section = f'ICCMAX.{eff_source}'
+    if section not in config:
+        section = f'ICCMAX.{source or power.get("source") or "AC"}'
     for plane in CURRENT_PLANES:
         try:
             write_current_amp = config.getfloat(
@@ -838,7 +930,7 @@ def set_icc_max(config, source=None):
             if write_current_amp <= 0 and any(
                 config.getfloat(key, plane, fallback=-1.0) > 0 for key in ICCMAX_KEYS
             ):
-                warning(f'IccMax {plane:s} is not configured for the {source:s} profile: leaving it untouched.')
+                warning(f'IccMax {plane:s} is not configured for the {eff_source:s} profile: leaving it untouched.')
             if write_current_amp > 0:
                 write_value = calc_icc_max_msr(plane, write_current_amp)
                 writemsr('MSR_OC_MAILBOX', write_value)
@@ -1251,7 +1343,8 @@ def _power_thread(state, exit_event):
             )
 
     next_hwp_write = 0
-    applied_source = power['source']
+    applied_source = None
+    applied_profile = None
     last_config_write_time = (
         get_config_write_time() if config.getboolean('GENERAL', 'Autoreload', fallback=False) else None
     )
@@ -1269,15 +1362,17 @@ def _power_thread(state, exit_event):
         if power['method'] == 'polling':
             power['source'] = 'BATTERY' if is_on_battery(config) else 'AC'
 
-        # snapshot the power source once per iteration: the D-Bus callback can
-        # flip it concurrently and every write below must agree on one profile
+        # snapshot the power source and ppd profile once per iteration
         power_source = power['source']
+        ppd_profile = power.get('ppd_profile')
+        effective_profile = resolve_effective_profile(config, source=power_source, ppd_profile=ppd_profile)
 
         # Enabled=False is a hard write barrier, including the iteration that
         # observes an enabled -> disabled autoreload transition.
         if not config_is_enabled(config):
             applied_source = power_source
-            exit_event.wait(get_update_rate(config, power_source))
+            applied_profile = effective_profile
+            exit_event.wait(get_update_rate(config, effective_profile))
             continue
 
         # log thermal status
@@ -1288,21 +1383,25 @@ def _power_thread(state, exit_event):
                     log(f'[D] core {index} thermal status: {key.replace("_", " ")} = {value}')
 
         # re-apply the one-shot per-profile settings when the power source flips
-        if power_source != applied_source:
-            log(f'[I] Power source changed: {applied_source:s} -> {power_source:s}')
-            undervolt(config, source=power_source)
-            set_icc_max(config, source=power_source)
-            if config.getboolean('AC', 'HWP_Mode', fallback=False):
-                if power_source == 'AC':
+        if power_source != applied_source or effective_profile != applied_profile:
+            log(f'[I] Profile active: {effective_profile:s} (Source: {power_source:s}, PPD: {ppd_profile or "None"})')
+            undervolt(config, source=effective_profile)
+            set_icc_max(config, source=effective_profile)
+            if config.getboolean(effective_profile, 'HWP_Mode', fallback=config.getboolean('AC', 'HWP_Mode', fallback=False)):
+                if power_source == 'AC' or 'BATTERY' not in effective_profile:
                     next_hwp_write = 0
                 else:
                     # restore the default energy/performance preference on battery
                     set_hwp(False)
+            elif applied_source is not None and config.getboolean(applied_profile or applied_source, 'HWP_Mode', fallback=config.getboolean('AC', 'HWP_Mode', fallback=False)):
+                set_hwp(False)
             applied_source = power_source
+            applied_profile = effective_profile
 
         # set temperature trip point
-        if 'MSR_TEMPERATURE_TARGET' in regs[power_source]:
-            write_value = regs[power_source]['MSR_TEMPERATURE_TARGET']
+        reg_profile = effective_profile if effective_profile in regs else power_source
+        if 'MSR_TEMPERATURE_TARGET' in regs[reg_profile]:
+            write_value = regs[reg_profile]['MSR_TEMPERATURE_TARGET']
             writemsr('MSR_TEMPERATURE_TARGET', write_value)
             if args.debug:
                 read_value = readmsr('MSR_TEMPERATURE_TARGET', 24, 29, flatten=True)
@@ -1310,8 +1409,8 @@ def _power_thread(state, exit_event):
                 log(f'[D] TEMPERATURE_TARGET - write {write_value >> 24:#x} - read {read_value:#x} - match {match}')
 
         # set cTDP
-        if 'MSR_CONFIG_TDP_CONTROL' in regs[power_source]:
-            write_value = regs[power_source]['MSR_CONFIG_TDP_CONTROL']
+        if 'MSR_CONFIG_TDP_CONTROL' in regs[reg_profile]:
+            write_value = regs[reg_profile]['MSR_CONFIG_TDP_CONTROL']
             writemsr('MSR_CONFIG_TDP_CONTROL', write_value)
             if args.debug:
                 read_value = readmsr('MSR_CONFIG_TDP_CONTROL', 0, 1, flatten=True)
@@ -1319,8 +1418,8 @@ def _power_thread(state, exit_event):
                 log(f'[D] CONFIG_TDP_CONTROL - write {write_value:#x} - read {read_value:#x} - match {match}')
 
         # set PL1/2 on MSR
-        if 'MSR_PKG_POWER_LIMIT' in regs[power_source]:
-            write_value = regs[power_source]['MSR_PKG_POWER_LIMIT']
+        if 'MSR_PKG_POWER_LIMIT' in regs[reg_profile]:
+            write_value = regs[reg_profile]['MSR_PKG_POWER_LIMIT']
             writemsr('MSR_PKG_POWER_LIMIT', write_value)
             if args.debug:
                 read_value = readmsr('MSR_PKG_POWER_LIMIT', 0, 55, flatten=True)
@@ -1341,14 +1440,22 @@ def _power_thread(state, exit_event):
                     mchbar_mmio = None
 
         # Disable BDPROCHOT
-        disable_bdprochot = config.getboolean(power_source, 'Disable_BDPROCHOT', fallback=None)
+        disable_bdprochot = config.getboolean(
+            effective_profile,
+            'Disable_BDPROCHOT',
+            fallback=config.getboolean(power_source, 'Disable_BDPROCHOT', fallback=None),
+        )
         if disable_bdprochot:
             set_disable_bdprochot()
 
-        wait_t = get_update_rate(config, power_source)
-        enable_hwp_mode = config.getboolean('AC', 'HWP_Mode', fallback=None)
+        wait_t = get_update_rate(config, effective_profile)
+        enable_hwp_mode = config.getboolean(
+            effective_profile,
+            'HWP_Mode',
+            fallback=config.getboolean('AC', 'HWP_Mode', fallback=None),
+        )
         # set HWP less frequently. Just to be safe since (e.g.) TLP might reset this value
-        if enable_hwp_mode and next_hwp_write <= time() and power_source == 'AC':
+        if enable_hwp_mode and next_hwp_write <= time():
             set_hwp(enable_hwp_mode)
             next_hwp_write = time() + HWP_INTERVAL
 

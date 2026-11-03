@@ -46,6 +46,7 @@ laptop brand. See the
 
 - Restores configurable PL1, PL2, time-window, and temperature limits.
 - Uses independent AC and battery profiles and reacts to power-source changes.
+- Supports dynamic `power-profiles-daemon` integration (`[PERFORMANCE]`, `[BALANCED]`, `[POWER_SAVER]`).
 - Re-applies settings after suspend and hibernation through system D-Bus.
 - Supports configurable CPU, cache, GPU, System Agent, and Analog I/O
   undervolting where firmware permits it.
@@ -158,6 +159,18 @@ PL1_Duration_s: 28
 PL2_Tdp_W: 44
 PL2_Duration_S: 0.002
 Trip_Temp_C: 85
+
+## Optional: profiles mapped to power-profiles-daemon active profiles
+[PERFORMANCE]
+Update_Rate_s: 2
+PL1_Tdp_W: 51
+PL1_Duration_s: 56
+PL2_Tdp_W: 51
+PL2_Duration_S: 0.002
+Trip_Temp_C: 98
+HWP_Mode: True
+cTDP: 2
+Disable_BDPROCHOT: True
 ```
 
 These are project defaults, not recommendations for every system. Check your
