@@ -76,6 +76,30 @@ MSR_DICT = {
 HWP_PERFORMANCE_VALUE = 0x20
 HWP_DEFAULT_VALUE = 0x80
 HWP_INTERVAL = 60
+
+
+def set_sysfs_governor_and_epp(performance_mode):
+    """Set cpufreq governor and energy_performance_preference via sysfs."""
+    governor = 'performance' if performance_mode else 'powersave'
+    epp = 'performance' if performance_mode else 'balance_performance'
+    
+    # Update scaling_governor
+    for path in glob.glob('/sys/devices/system/cpu/cpu*/cpufreq/scaling_governor'):
+        try:
+            with open(path, 'w') as f:
+                f.write(governor)
+        except OSError:
+            pass
+
+    # Update energy_performance_preference
+    for path in glob.glob('/sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference'):
+        try:
+            with open(path, 'w') as f:
+                f.write(epp)
+        except OSError:
+            pass
+
+
 UNDERVOLT_TICKS_PER_MV = 1.024
 UNDERVOLT_MIN_TICKS = -(1 << 10)
 UNDERVOLT_MAX_TICKS = 0
@@ -1181,6 +1205,7 @@ def calc_reg_values(platform_info, config):
 
 def set_hwp(performance_mode):
     """Set the IA32_HWP_REQUEST energy/performance preference field."""
+    set_sysfs_governor_and_epp(performance_mode)
     if performance_mode not in (True, False) or 'HWP' in UNSUPPORTED_FEATURES:
         return
     hwp_mode = HWP_PERFORMANCE_VALUE if performance_mode is True else HWP_DEFAULT_VALUE
