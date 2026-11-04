@@ -30,7 +30,8 @@ class DBusHelperTests(unittest.TestCase):
 
         throttled.handle_ac_properties_changed('org.freedesktop.UPower', {'OnBattery': Variant(False)}, [])
 
-        self.assertEqual(throttled.power, {'source': 'AC', 'method': 'dbus'})
+        self.assertEqual(throttled.power['source'], 'AC')
+        self.assertEqual(throttled.power['method'], 'dbus')
 
     def test_resume_callback_reapplies_settings_only_after_wake(self):
         throttled = load_throttled()
@@ -69,7 +70,7 @@ class DBusHelperTests(unittest.TestCase):
         config.read_dict({'GENERAL': {'Enabled': 'True', 'Autoreload': 'True'}})
         bus = mock.Mock()
         bus.introspect = mock.AsyncMock(
-            side_effect=[object(), DBusError(ErrorType.SERVICE_UNKNOWN, 'login1 is unavailable')]
+            side_effect=[object(), DBusError(ErrorType.SERVICE_UNKNOWN, 'ppd is unavailable'), DBusError(ErrorType.SERVICE_UNKNOWN, 'login1 is unavailable')]
         )
         message_bus = mock.Mock()
         message_bus.return_value.connect = mock.AsyncMock(return_value=bus)

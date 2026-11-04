@@ -65,10 +65,12 @@ MSR_DICT = {
     'MSR_TEMPERATURE_TARGET': 0x1A2,
     'MSR_POWER_CTL': 0x1FC,
     'MSR_RAPL_POWER_UNIT': 0x606,
+    'MSR_VR_CURRENT_CONFIG': 0x601,
     'MSR_PKG_POWER_LIMIT': 0x610,
     'MSR_INTEL_PKG_ENERGY_STATUS': 0x611,
     'MSR_DRAM_ENERGY_STATUS': 0x619,
     'MSR_PP1_ENERGY_STATUS': 0x641,
+    'MSR_UNCORE_RATIO_LIMIT': 0x620,
     'MSR_CONFIG_TDP_CONTROL': 0x64B,
     'IA32_HWP_REQUEST': 0x774,
 }
@@ -854,6 +856,8 @@ def undervolt(config, source=None):
     section = f'UNDERVOLT.{eff_source}'
     if section not in config:
         section = f'UNDERVOLT.{source or power.get("source") or "AC"}'
+    if section not in config:
+        section = 'UNDERVOLT'
     if (section not in config and 'UNDERVOLT' not in config) or 'UNDERVOLT' in UNSUPPORTED_FEATURES:
         return
     for plane in VOLTAGE_PLANES:
@@ -946,6 +950,8 @@ def set_icc_max(config, source=None):
     section = f'ICCMAX.{eff_source}'
     if section not in config:
         section = f'ICCMAX.{source or power.get("source") or "AC"}'
+    if section not in config:
+        section = 'ICCMAX'
     for plane in CURRENT_PLANES:
         try:
             write_current_amp = config.getfloat(
@@ -1203,22 +1209,60 @@ def calc_reg_values(platform_info, config):
     return regs
 
 
+def set_vr_current_config(amps=175.0):
+    """Raise MSR_VR_CURRENT_CONFIG (0x601) electrical current ceiling.
+
+    HP 830 G6 firmware locks the OC mailbox IccMax (CACHE stays at 6 A).
+    The actual turbo clip on this platform is bits 12:0 of MSR 0x601
+    (quarter-amperes). Factory value 0x88 (~34 A) pins the package at
+    ~1.7 GHz; raising it restores 3.4–4.0 GHz turbo.
+    """
+    try:
+        field = int(float(amps) * 4) & 0x1FFF
+        writemsr('MSR_VR_CURRENT_CONFIG', field)
+        if args.debug:
+            read_value = readmsr('MSR_VR_CURRENT_CONFIG', flatten=True)
+            log(f'[D] VR_CURRENT_CONFIG - write {field:#x} ({amps:.0f} A) - read {read_value:#x}')
+    except (OSError, ValueError) as e:
+        warning(f'Unable to write MSR_VR_CURRENT_CONFIG ({e}).')
+
+
+def set_uncore_ratio_limit(max_ratio=32, min_ratio=8):
+    """Cap Ring/Uncore ratio so CACHE current does not clip core turbo."""
+    try:
+        writemsr('MSR_UNCORE_RATIO_LIMIT', (int(min_ratio) << 8) | int(max_ratio))
+    except OSError as e:
+        warning(f'Unable to write MSR_UNCORE_RATIO_LIMIT ({e}).')
+
+
 def set_hwp(performance_mode):
-    """Set the IA32_HWP_REQUEST energy/performance preference field."""
+    """Set the IA32_HWP_REQUEST energy/performance preference field and ratio bounds."""
     set_sysfs_governor_and_epp(performance_mode)
     if performance_mode not in (True, False) or 'HWP' in UNSUPPORTED_FEATURES:
         return
-    hwp_mode = HWP_PERFORMANCE_VALUE if performance_mode is True else HWP_DEFAULT_VALUE
+    hwp_mode = 0x00 if performance_mode is True else HWP_DEFAULT_VALUE
+    min_ratio = 30 if performance_mode is True else 8
+    max_ratio = 46
+
+    if performance_mode is True:
+        set_uncore_ratio_limit(32, 8)
+        set_vr_current_config(175.0)
+
     # a CPU that disappears mid-loop is fatal rather than falling back to a broadcast write
     for addr in _ensure_msr_module():
         cpu = int(os.path.basename(os.path.dirname(addr)))
         cur_val = readmsr('IA32_HWP_REQUEST', cpu=cpu)
-        new_val = (cur_val & 0xFFFFFFFF00FFFFFF) | (hwp_mode << 24)
+        # Low 8 bits: Minimum_Performance
+        # Bits 8-15: Maximum_Performance
+        # Bits 16-23: Desired_Performance (0 = autonomous)
+        # Bits 24-31: Energy_Performance_Preference
+        new_val = (cur_val & 0xFFFFFFFF00000000) | (hwp_mode << 24) | (max_ratio << 8) | min_ratio
         writemsr('IA32_HWP_REQUEST', new_val, cpu=cpu)
         if args.debug:
             read_value = readmsr('IA32_HWP_REQUEST', from_bit=24, to_bit=31, cpu=cpu)
             match = OK if hwp_mode == read_value else ERR
-            log(f'[D] HWP CPU {cpu:d} - write "{hwp_mode:#02x}" - read "{read_value:#02x}" - match {match}')
+            log(f'[D] HWP CPU {cpu:d} - write "{hwp_mode:#02x}" - read "{read_value:#x}" - match {match}')
+
 
 
 def _hwp_mode(config):
@@ -1441,6 +1485,10 @@ def _power_thread(state, exit_event):
                 read_value = readmsr('MSR_CONFIG_TDP_CONTROL', 0, 1, flatten=True)
                 match = OK if write_value == read_value else ERR
                 log(f'[D] CONFIG_TDP_CONTROL - write {write_value:#x} - read {read_value:#x} - match {match}')
+
+        if config.getboolean(effective_profile, 'HWP_Mode', fallback=config.getboolean('AC', 'HWP_Mode', fallback=False)):
+            set_vr_current_config(175.0)
+            set_uncore_ratio_limit(32, 8)
 
         # set PL1/2 on MSR
         if 'MSR_PKG_POWER_LIMIT' in regs[reg_profile]:

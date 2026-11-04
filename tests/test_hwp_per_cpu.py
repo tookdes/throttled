@@ -41,14 +41,16 @@ class HWPPerCpuTests(unittest.TestCase):
                     throttled.set_hwp(True)
 
         expected = [
+            mock.call('MSR_UNCORE_RATIO_LIMIT', 0x0820),
+            mock.call('MSR_VR_CURRENT_CONFIG', 700),
             mock.call(
                 'IA32_HWP_REQUEST',
-                (current[0] & 0xFFFFFFFF00FFFFFF) | (throttled.HWP_PERFORMANCE_VALUE << 24),
+                (current[0] & 0xFFFFFFFF00000000) | (0x00 << 24) | (46 << 8) | 30,
                 cpu=0,
             ),
             mock.call(
                 'IA32_HWP_REQUEST',
-                (current[2] & 0xFFFFFFFF00FFFFFF) | (throttled.HWP_PERFORMANCE_VALUE << 24),
+                (current[2] & 0xFFFFFFFF00000000) | (0x00 << 24) | (46 << 8) | 30,
                 cpu=2,
             ),
         ]
